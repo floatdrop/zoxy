@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: lint & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Use the pinned toolchain from the flake so CI matches local dev exactly
+      # (zig_0_16 + zls), served from the Nix binary cache.
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Check formatting
+        run: nix develop --command zig fmt --check src build.zig
+
+      - name: Build
+        run: nix develop --command zig build
+
+      - name: Run tests
+        run: nix develop --command zig build test --summary all
