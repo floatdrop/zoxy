@@ -16,10 +16,14 @@ pub fn add(a: i32, b: i32) i32 {
 /// The completion-based io_uring layer (docs/DESIGN.md "I/O architecture").
 pub const io = @import("io/io.zig");
 
+/// A SO_REUSEPORT TCP listener (docs/DESIGN.md §2).
+pub const Listener = @import("net/listener.zig").Listener;
+
 test "basic add functionality" {
     try std.testing.expect(add(3, 7) == 10);
 }
 
 test {
     _ = io;
+    _ = @import("net/listener.zig");
 }
