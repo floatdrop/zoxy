@@ -119,3 +119,15 @@ test "listener: accepts a loopback connection" {
     try std.testing.expect(h.accepted_fd >= 0);
     _ = linux.close(h.accepted_fd);
 }
+
+test "listener: two workers share one reuseport address" {
+    var a = try Listener.open(Ip4Address.loopback(0), 8);
+    defer a.close();
+    const port = a.boundAddress().port;
+
+    // A second listener binds the same port thanks to SO_REUSEPORT — this is how
+    // every worker shares one address and the kernel balances accepts.
+    var b = try Listener.open(Ip4Address.loopback(port), 8);
+    defer b.close();
+    try std.testing.expectEqual(port, b.boundAddress().port);
+}

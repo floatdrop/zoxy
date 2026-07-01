@@ -1,71 +1,75 @@
+//! zoxy entrypoint. Phase-0: a thread-per-core echo server — one worker per CPU,
+//! each with its own io_uring loop, its own SO_REUSEPORT listener, and its own
+//! connection pool (share-nothing; docs/DESIGN.md §2). The kernel load-balances
+//! accepts across the per-worker listeners.
+
 const std = @import("std");
-const Io = std.Io;
+const linux = std.os.linux;
 
 const zoxy = @import("zoxy");
+const constants = zoxy.constants;
+const IO = zoxy.io.IO;
+const Listener = zoxy.Listener;
+const Pool = zoxy.connection.Pool;
+const EchoServer = zoxy.connection.EchoServer;
+const Ip4Address = std.Io.net.Ip4Address;
 
-pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+const listen_port = 8080;
 
-    // This is appropriate for anything that lives as long as the process.
-    const arena: std.mem.Allocator = init.arena.allocator();
+pub fn main() !void {
+    // Startup allocations (pools) only — nothing here runs on the serving path.
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = debug_allocator.deinit();
+    const gpa = debug_allocator.allocator();
 
-    // Accessing command line arguments:
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+    const worker_count = std.Thread.getCpuCount() catch 1;
+    const address = Ip4Address.unspecified(listen_port);
+
+    // Allocate every pool up front, on this thread, so worker startup touches no
+    // shared allocator (the serving loop then allocates nothing).
+    const pools = try gpa.alloc(Pool, worker_count);
+    defer gpa.free(pools);
+    for (pools) |*pool| pool.* = try Pool.init(gpa, constants.connections_max);
+    defer for (pools) |*pool| pool.deinit(gpa);
+
+    const threads = try gpa.alloc(std.Thread, worker_count);
+    defer gpa.free(threads);
+    for (threads, pools, 0..) |*thread, *pool, cpu| {
+        thread.* = try std.Thread.spawn(.{}, runWorker, .{ address, pool, cpu });
     }
 
-    // In order to do I/O operations need an `Io` instance.
-    const io = init.io;
-
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
-
-    try zoxy.printAnotherMessage(stdout_writer);
-
-    try stdout_writer.flush(); // Don't forget to flush!
+    std.log.info("zoxy echo listening on 0.0.0.0:{d} across {d} worker(s)", .{
+        listen_port,
+        worker_count,
+    });
+    for (threads) |thread| thread.join();
 }
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
+/// One share-nothing worker: its own IO ring, listener, and pool, pinned to a
+/// core. Runs the accept/echo loop forever.
+fn runWorker(address: Ip4Address, pool: *Pool, cpu: usize) void {
+    pinToCpu(cpu);
+
+    var io = IO.init(constants.io_ring_entries, 0) catch |err| return logWorkerError("io init", err);
+    defer io.deinit();
+
+    var listener = Listener.open(address, constants.accept_backlog) catch |err| return logWorkerError("listen", err);
+    defer listener.close();
+
+    var server = EchoServer.init(&io, pool, listener);
+    server.start();
+    while (true) io.run_once() catch |err| return logWorkerError("io run", err);
 }
 
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
+/// Best-effort CPU pinning (Linux only). Failure is non-fatal.
+fn pinToCpu(cpu: usize) void {
+    var set = std.mem.zeroes(linux.cpu_set_t);
+    const bits = @bitSizeOf(usize);
+    if (cpu / bits >= set.len) return; // more CPUs than the affinity mask covers
+    set[cpu / bits] |= @as(usize, 1) << @intCast(cpu % bits);
+    linux.sched_setaffinity(0, &set) catch {};
 }
 
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
-    };
+fn logWorkerError(what: []const u8, err: anyerror) void {
+    std.log.err("zoxy worker {s}: {s}", .{ what, @errorName(err) });
 }
