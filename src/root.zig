@@ -28,6 +28,15 @@ pub const connection = @import("net/connection.zig");
 /// Zero-copy HTTP/1.1 request parser (docs/DESIGN.md §5).
 pub const h1 = @import("http/h1.zig");
 
+/// Static proxy configuration (docs/DESIGN.md §7).
+pub const config = @import("config.zig");
+
+/// Request routing (host/path -> cluster).
+pub const Router = @import("proxy/router.zig").Router;
+
+/// Round-robin load balancing.
+pub const RoundRobin = @import("proxy/balancer.zig").RoundRobin;
+
 test "basic add functionality" {
     try std.testing.expect(add(3, 7) == 10);
 }
@@ -37,4 +46,7 @@ test {
     _ = @import("net/listener.zig");
     _ = connection;
     _ = h1;
+    _ = config;
+    _ = @import("proxy/router.zig");
+    _ = @import("proxy/balancer.zig");
 }
