@@ -65,6 +65,7 @@ const Pipe = struct {
     send_completion: Completion,
 
     fn armRecv(pipe: *Pipe) void {
+        assert(pipe.src_fd >= 0);
         pipe.conn.retain();
         pipe.conn.io.recv(*Pipe, pipe, onRecv, &pipe.recv_completion, pipe.src_fd, &pipe.buf);
     }
@@ -77,6 +78,7 @@ const Pipe = struct {
         assert(n <= pipe.buf.len); // the read can never exceed the fixed buffer
         pipe.filled = n;
         pipe.sent = 0;
+        assert(pipe.sent < pipe.filled); // n > 0, so there is something to send
         pipe.armSend();
     }
 
@@ -104,6 +106,7 @@ const Pipe = struct {
             pipe.conn.metrics.bytes_to_upstream.add(m);
         }
         pipe.sent += m;
+        assert(pipe.sent <= pipe.filled); // never send past what we read
         if (pipe.sent < pipe.filled) return pipe.armSend(); // finish a partial write
         pipe.armRecv();
     }
@@ -185,6 +188,8 @@ pub const ProxyConn = struct {
         metrics.active.add(1);
         conn.armTimeout();
         conn.armRecvHead();
+        assert(conn.timeout_armed); // both the deadline and the first recv are in flight
+        assert(conn.refs >= 1);
     }
 
     fn armTimeout(conn: *ProxyConn) void {
@@ -223,6 +228,7 @@ pub const ProxyConn = struct {
     fn teardown(conn: *ProxyConn) void {
         if (conn.closing) return;
         conn.closing = true;
+        assert(conn.closing); // idempotent: a second call returns above
         // Cancel the ops that shutdown() cannot reach: the deadline timer (no fd)
         // and any in-flight connect (shutdown of a connecting socket is a no-op).
         // A cancel that matches nothing returns ENOENT — harmless.
@@ -264,7 +270,9 @@ pub const ProxyConn = struct {
     // ---- request head -----------------------------------------------------
 
     fn armRecvHead(conn: *ProxyConn) void {
+        assert(conn.down_fd >= 0);
         if (conn.head_filled == conn.head_buf.len) return conn.fail(resp_431);
+        assert(conn.head_filled < conn.head_buf.len); // there is room to read into
         conn.retain();
         conn.io.recv(
             *ProxyConn,
@@ -281,7 +289,9 @@ pub const ProxyConn = struct {
         if (conn.closing) return;
         const n = result catch return conn.teardown();
         if (n == 0) return conn.teardown(); // client closed before completing the head
+        assert(n <= conn.head_buf.len - conn.head_filled); // recv was bounded by the tail
         conn.head_filled += n;
+        assert(conn.head_filled <= conn.head_buf.len);
         const parsed = h1.parse(
             conn.head_buf[0..conn.head_filled],
             &conn.headers_storage,
@@ -298,10 +308,12 @@ pub const ProxyConn = struct {
     }
 
     fn routeAndConnect(conn: *ProxyConn, request: *const h1.Request) void {
+        assert(conn.up_fd < 0); // no upstream socket yet
         const cluster = conn.router.route(request.host(), request.target) orelse
             return conn.fail(resp_404);
         const endpoint = conn.rr.pick(cluster) orelse return conn.fail(resp_503);
         conn.up_fd = createTcpSocket() orelse return conn.fail(resp_502);
+        assert(conn.up_fd >= 0);
         conn.retain();
         conn.io.connect(
             *ProxyConn,
@@ -317,12 +329,14 @@ pub const ProxyConn = struct {
         defer conn.releaseRef();
         if (conn.closing) return;
         result catch return conn.fail(resp_502);
+        assert(conn.up_fd >= 0);
         conn.armPrime();
     }
 
     // ---- forward buffered request bytes, then relay -----------------------
 
     fn armPrime(conn: *ProxyConn) void {
+        assert(conn.up_fd >= 0);
         assert(conn.prime_sent < conn.head_filled);
         conn.retain();
         conn.io.send(
@@ -340,11 +354,14 @@ pub const ProxyConn = struct {
         if (conn.closing) return;
         const m = result catch return conn.teardown();
         conn.prime_sent += m;
+        assert(conn.prime_sent <= conn.head_filled); // never forward past the buffered head
         if (conn.prime_sent < conn.head_filled) return conn.armPrime();
         conn.startRelay();
     }
 
     fn startRelay(conn: *ProxyConn) void {
+        assert(conn.down_fd >= 0);
+        assert(conn.up_fd >= 0);
         conn.outcome = .proxied;
         conn.d2u.conn = conn;
         conn.d2u.src_fd = conn.down_fd;
@@ -366,6 +383,7 @@ pub const ProxyConn = struct {
 
     fn fail(conn: *ProxyConn, response: []const u8) void {
         assert(conn.down_fd >= 0);
+        assert(response.len > 12); // "HTTP/1.1 XXX": status class read at index 9
         conn.outcome = outcomeFor(response);
         // Status class is the first digit of the code at index 9 ("HTTP/1.1 X").
         if (response[9] == '4') {
@@ -437,6 +455,7 @@ pub const ProxyServer = struct {
         result: io_mod.AcceptError!posix.socket_t,
     ) void {
         if (result) |fd| {
+            assert(fd >= 0);
             if (server.pool.acquire()) |conn| {
                 conn.start(
                     server.io,

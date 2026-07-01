@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const assert = std.debug.assert;
 
 const zoxy = @import("zoxy");
 const constants = zoxy.constants;
@@ -37,6 +38,7 @@ pub fn main(init: std.process.Init) !void {
     const router = Router.init(&cfg);
 
     const worker_count = std.Thread.getCpuCount() catch 1;
+    assert(worker_count >= 1); // at least this thread runs a worker
 
     // Shared counters (atomic) and per-worker access logs, reserved up front.
     var metrics: Metrics = .{};
@@ -70,6 +72,7 @@ fn runWorker(
     access: *AccessLog,
     cpu: usize,
 ) void {
+    assert(pool.capacity > 0);
     pinToCpu(cpu);
 
     var io = IO.init(constants.io_ring_entries, 0) catch |err|
@@ -100,7 +103,9 @@ fn runWorker(
 fn pinToCpu(cpu: usize) void {
     var set = std.mem.zeroes(linux.cpu_set_t);
     const bits = @bitSizeOf(usize);
+    assert(bits > 0);
     if (cpu / bits >= set.len) return; // more CPUs than the affinity mask covers
+    assert(cpu / bits < set.len);
     set[cpu / bits] |= @as(usize, 1) << @intCast(cpu % bits);
     linux.sched_setaffinity(0, &set) catch {};
 }

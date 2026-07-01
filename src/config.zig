@@ -4,6 +4,7 @@
 //! Format is JSON (std-only, zero external deps).
 
 const std = @import("std");
+const assert = std.debug.assert;
 const Ip4Address = std.Io.net.Ip4Address;
 
 pub const Endpoint = struct {
@@ -79,6 +80,7 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
     const dto = parsed.value;
 
     const clusters = try a.alloc(Cluster, dto.clusters.len);
+    assert(clusters.len == dto.clusters.len);
     for (dto.clusters, clusters) |dc, *cluster| {
         const endpoints = try a.alloc(Endpoint, dc.endpoints.len);
         for (dc.endpoints, endpoints) |text_addr, *endpoint| {
@@ -88,6 +90,7 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
     }
 
     const routes = try a.alloc(Route, dto.routes.len);
+    assert(routes.len == dto.routes.len);
     for (dto.routes, routes) |dr, *route| {
         route.* = .{
             .host = try a.dupe(u8, dr.host),
@@ -120,6 +123,7 @@ fn findClusterIn(clusters: []const Cluster, name: []const u8) ?*const Cluster {
 /// Parse "host:port" (IPv4) into an address.
 fn parseAddress(text: []const u8) error{InvalidAddress}!Ip4Address {
     const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return error.InvalidAddress;
+    assert(colon < text.len); // lastIndexOfScalar returns an in-bounds index
     const port = std.fmt.parseInt(u16, text[colon + 1 ..], 10) catch return error.InvalidAddress;
     return Ip4Address.parse(text[0..colon], port) catch return error.InvalidAddress;
 }

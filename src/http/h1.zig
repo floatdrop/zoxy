@@ -73,6 +73,8 @@ pub fn parse(input: []const u8, headers: []Header) ParseError!Parsed {
         count += 1;
     }
 
+    assert(count <= headers.len);
+    assert(pos <= input.len);
     return .{ .complete = .{
         .method = line.method,
         .method_text = line.method_text,
@@ -94,11 +96,13 @@ fn parseRequestLine(line: []const u8) ParseError!RequestLine {
     const sp1 = std.mem.indexOfScalar(u8, line, ' ') orelse return error.Malformed;
     const method_text = line[0..sp1];
     if (method_text.len == 0 or !isToken(method_text)) return error.Malformed;
+    assert(method_text.len > 0); // negative space: rejected above
 
     const after_method = line[sp1 + 1 ..];
     const sp2 = std.mem.indexOfScalar(u8, after_method, ' ') orelse return error.Malformed;
     const target = after_method[0..sp2];
     if (target.len == 0) return error.Malformed;
+    assert(target.len > 0);
 
     return .{
         .method = methodFromText(method_text),
@@ -113,6 +117,7 @@ fn parseVersion(version: []const u8) ParseError!u8 {
     if (!std.mem.startsWith(u8, version, prefix)) return error.Malformed;
     const v = version[prefix.len..];
     if (v.len != 3 or v[1] != '.') return error.Malformed;
+    assert(v.len == 3);
     if (v[0] != '1') return error.UnsupportedVersion;
     return switch (v[2]) {
         '0' => 0,
@@ -126,6 +131,7 @@ fn parseHeader(line: []const u8) ParseError!Header {
     const name = line[0..colon];
     // A token name with no whitespace blocks header-smuggling tricks.
     if (name.len == 0 or !isToken(name)) return error.Malformed;
+    assert(name.len > 0);
     return .{ .name = name, .value = trimOws(line[colon + 1 ..]) };
 }
 
@@ -147,6 +153,7 @@ fn methodFromText(text: []const u8) Method {
 /// Read one CRLF-terminated line, advancing `pos` past the CRLF. Returns null
 /// (incomplete) if no CRLF is present yet. The returned slice excludes the CRLF.
 fn readLine(input: []const u8, pos: *usize) ?[]const u8 {
+    assert(pos.* <= input.len);
     const start = pos.*;
     var i = start;
     while (i + 1 < input.len) : (i += 1) {
@@ -172,6 +179,8 @@ fn trimOws(s: []const u8) []const u8 {
     var end: usize = s.len;
     while (start < end and (s[start] == ' ' or s[start] == '\t')) start += 1;
     while (end > start and (s[end - 1] == ' ' or s[end - 1] == '\t')) end -= 1;
+    assert(start <= end);
+    assert(end <= s.len);
     return s[start..end];
 }
 

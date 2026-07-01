@@ -3,6 +3,7 @@
 //! share-nothing), so a plain counter needs no synchronization.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const config = @import("../config.zig");
 const Cluster = config.Cluster;
 const Endpoint = config.Endpoint;
@@ -14,7 +15,9 @@ pub const RoundRobin = struct {
     /// has no endpoints.
     pub fn pick(rr: *RoundRobin, cluster: *const Cluster) ?*const Endpoint {
         if (cluster.endpoints.len == 0) return null;
+        assert(cluster.endpoints.len > 0); // negative space: handled above
         const index = rr.next % cluster.endpoints.len;
+        assert(index < cluster.endpoints.len);
         rr.next +%= 1;
         return &cluster.endpoints[index];
     }

@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const assert = std.debug.assert;
 
 pub const Outcome = enum {
     proxied,
@@ -45,6 +46,7 @@ const line_max = target_display_max + 64;
 /// Format one access-log line into `out`. Never fails: an over-long target is
 /// truncated so the line always fits `line_max`.
 pub fn formatLine(out: []u8, entry: Entry) []const u8 {
+    assert(out.len >= line_max); // the caller must give us a line-sized buffer
     const method = if (entry.method.len == 0) "-" else entry.method;
     const target = if (entry.target.len == 0)
         "-"
@@ -52,12 +54,14 @@ pub fn formatLine(out: []u8, entry: Entry) []const u8 {
         entry.target[0..target_display_max]
     else
         entry.target;
-    return std.fmt.bufPrint(out, "{s} {s} {s} {d}\n", .{
+    const line = std.fmt.bufPrint(out, "{s} {s} {s} {d}\n", .{
         method,
         target,
         entry.outcome.text(),
         entry.bytes_to_client,
-    }) catch unreachable; // bounded inputs always fit
+    }) catch unreachable; // bounded inputs always fit (line_max asserted above)
+    assert(line.len <= line_max);
+    return line;
 }
 
 pub const AccessLog = struct {
@@ -66,15 +70,24 @@ pub const AccessLog = struct {
     buf: [buf_bytes]u8 = undefined,
 
     const buf_bytes = 16 * 1024;
+    comptime {
+        // A single record must always fit the buffer, so record() can flush and
+        // then format unconditionally.
+        assert(buf_bytes >= line_max);
+    }
 
     pub fn record(log: *AccessLog, entry: Entry) void {
+        assert(log.used <= log.buf.len);
         if (log.used + line_max > log.buf.len) log.flush();
+        assert(log.used + line_max <= log.buf.len); // flush guaranteed room
         const line = formatLine(log.buf[log.used..], entry);
         log.used += line.len;
+        assert(log.used <= log.buf.len);
     }
 
     /// Write accumulated lines with a single batched write() and reset.
     pub fn flush(log: *AccessLog) void {
+        assert(log.used <= log.buf.len);
         if (log.used == 0) return;
         _ = linux.write(log.fd, &log.buf, log.used); // best-effort
         log.used = 0;
