@@ -13,6 +13,13 @@ pub fn add(a: i32, b: i32) i32 {
     return a + b;
 }
 
+/// The completion-based io_uring layer (docs/DESIGN.md "I/O architecture").
+pub const io = @import("io/io.zig");
+
 test "basic add functionality" {
     try std.testing.expect(add(3, 7) == 10);
+}
+
+test {
+    _ = io;
 }
