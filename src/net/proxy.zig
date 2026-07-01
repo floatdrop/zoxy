@@ -37,6 +37,14 @@ const resp_503 = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConne
 const resp_505 = "HTTP/1.1 505 HTTP Version Not Supported\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
 /// One direction of the relay: read from `src_fd`, write to `dst_fd`, repeat.
+///
+/// Backpressure (docs/DESIGN.md §8): strict recv -> send -> recv over a single
+/// fixed buffer. We never read the next chunk until the current one is fully
+/// written, so a slow destination stalls the source: its socket receive buffer
+/// fills and TCP flow control throttles the peer. Memory per direction is
+/// therefore bounded to `relay_buf_bytes` regardless of stream size — a stronger
+/// guarantee than watermark read-disable, which only matters when reading ahead
+/// into a growable buffer (a Phase-1 throughput option we deliberately skip).
 const Pipe = struct {
     conn: *ProxyConn,
     src_fd: posix.socket_t,
@@ -57,6 +65,7 @@ const Pipe = struct {
         if (pipe.conn.closing) return;
         const n = result catch return pipe.conn.teardown();
         if (n == 0) return pipe.conn.teardown(); // EOF on this half
+        assert(n <= pipe.buf.len); // the read can never exceed the fixed buffer
         pipe.filled = n;
         pipe.sent = 0;
         pipe.armSend();
@@ -318,6 +327,7 @@ const TestOrigin = struct {
     io: *IO,
     listener: Listener,
     response: []const u8,
+    sent: usize = 0,
     fd: posix.socket_t = -1,
     reqbuf: [1024]u8 = undefined,
     accept_c: Completion = undefined,
@@ -334,9 +344,15 @@ const TestOrigin = struct {
     }
     fn onRecv(origin: *TestOrigin, _: *Completion, result: io_mod.RecvError!usize) void {
         _ = result catch return;
-        origin.io.send(*TestOrigin, origin, onSend, &origin.send_c, origin.fd, origin.response);
+        origin.sent = 0;
+        origin.armSend();
     }
-    fn onSend(origin: *TestOrigin, _: *Completion, _: io_mod.SendError!usize) void {
+    fn armSend(origin: *TestOrigin) void {
+        origin.io.send(*TestOrigin, origin, onSend, &origin.send_c, origin.fd, origin.response[origin.sent..]);
+    }
+    fn onSend(origin: *TestOrigin, _: *Completion, result: io_mod.SendError!usize) void {
+        origin.sent += result catch return;
+        if (origin.sent < origin.response.len) return origin.armSend(); // finish a partial write
         origin.io.close(*TestOrigin, origin, onClose, &origin.close_c, origin.fd);
         origin.fd = -1;
     }
@@ -407,6 +423,81 @@ test "proxy: forwards a request to an upstream and relays the response" {
     try std.testing.expectEqualStrings(response, c.buf[0..c.len]);
 
     // Let the proxy finish tearing the connection down and reclaim its slot.
+    while (pool.free_count != pool.capacity) try io.run_once();
+}
+
+test "proxy: relays a response larger than the relay buffer with bounded memory" {
+    const gpa = std.testing.allocator;
+    // A body several times the relay buffer forces many recv->send cycles; the
+    // proxy still holds at most `relay_buf_bytes` per direction throughout.
+    const body_len = constants.relay_buf_bytes * 4 + 123;
+    const header = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+    const response = try gpa.alloc(u8, header.len + body_len);
+    defer gpa.free(response);
+    @memcpy(response[0..header.len], header);
+    for (response[header.len..], 0..) |*b, i| b.* = @truncate(i);
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    var origin = TestOrigin{ .io = &io, .listener = origin_listener, .response = response };
+    origin.start();
+
+    var json_buf: [256]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
+    , .{origin_listener.boundAddress().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    var server = ProxyServer.init(&io, &pool, proxy_listener, &router);
+    server.start();
+
+    const client = try connectLoopback(proxy_listener.boundAddress().port);
+    defer _ = linux.close(client);
+
+    const Client = struct {
+        io: *IO,
+        fd: posix.socket_t,
+        buf: [4096]u8 = undefined,
+        total: usize = 0,
+        done: bool = false,
+        send_c: Completion = undefined,
+        recv_c: Completion = undefined,
+        fn go(c: *@This()) void {
+            c.armRecv();
+            c.io.send(*@This(), c, onSend, &c.send_c, c.fd, "GET / HTTP/1.1\r\nHost: o\r\n\r\n");
+        }
+        fn armRecv(c: *@This()) void {
+            c.io.recv(*@This(), c, onRecv, &c.recv_c, c.fd, &c.buf);
+        }
+        fn onSend(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
+            _ = c;
+        }
+        fn onRecv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
+            const n = result catch 0;
+            if (n == 0) { // EOF: the whole response has been relayed
+                c.done = true;
+                return;
+            }
+            c.total += n;
+            c.armRecv();
+        }
+    };
+    var c = Client{ .io = &io, .fd = client };
+    c.go();
+
+    try io.run_until_done(&c.done);
+    try std.testing.expectEqual(response.len, c.total);
     while (pool.free_count != pool.capacity) try io.run_once();
 }
 

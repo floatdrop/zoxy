@@ -22,14 +22,24 @@ allocating syscalls.
    `Completion` pattern) directly on `std.os.linux.IoUring` — **not** fibers and
    **not** the new `std.Io` async executor (see §3, §I/O). Each `Completion` is
    embedded inline in the owning connection → zero per-operation allocation.
-3. **Zero-alloc is structural, not incidental.** Fixed `Connection` pool sized to
-   `max_connections`; per-connection buffers carved from a startup slab;
-   provided-buffer rings for recv. Exhaustion → **reject/backpressure, never
-   allocate**. A `FailingAllocator` guards the hot path in debug/test builds.
-4. **Backpressure from day one.** Watermark buffers with ref-counted
-   read-disable, coupling downstream-read to upstream-write. Retrofitting flow
-   control into a proxy is painful; it also *is* the zero-alloc story (bounded
-   buffers push flow control down to TCP).
+3. **Zero-alloc after configuration** (the boundary, TigerBeetle's rule).
+   Allocation is *permitted during startup and (re)configuration* — the config
+   parser may allocate freely, and a config reload builds a new immutable config
+   off the hot path. Once the proxy is configured and serving, **no allocation on
+   the data path, ever.** Concretely: fixed `Connection` pool sized to
+   `connections_max`; per-connection buffers carved from a startup slab.
+   Exhaustion → **reject/backpressure, never allocate**. A `FailingAllocator`
+   guards the serving path in debug/test builds; startup allocators are handed a
+   real `gpa` and then put away before the loop starts.
+4. **Backpressure from day one.** The relay uses a strict single fixed buffer
+   per direction (recv → send → recv): we never read the next chunk until the
+   current one is fully written, so memory is bounded to `relay_buf_bytes` per
+   direction regardless of stream size and TCP flow control throttles the peer.
+   This is *stronger* than watermark read-disable (which only matters when
+   reading ahead into a growable buffer); read-ahead + watermarks is a Phase-1
+   throughput option we deliberately skip. Retrofitting flow control is painful,
+   so it's built in; it also *is* the zero-alloc story (bounded buffers push flow
+   control down to TCP).
 5. **A filter/middleware seam early.** An Envoy-style filter chain (or Tower-style
    Service/Layer) so routing, auth, retries, timeouts compose cleanly.
 6. **TigerStyle governs the code.** See `docs/TIGER_STYLE.md`: static allocation,
@@ -243,12 +253,12 @@ accept → recv (provided buffer) → parse req line + headers (zero-copy slices
        ↕ watermark backpressure couples both directions
 ```
 
-- **Parser:** either `std.http.Server` (transport-agnostic, **no allocator**;
-  `Head` fields are slices into the caller's reader buffer — genuinely zero-alloc
-  after setup) **or** a custom picohttpparser/swerver-style parser (linear
-  buffer, bounded inline `[max_headers]Header` array, memmove refill, separate
-  chunked state machine). Start with `std.http.Server`; drop to custom only if we
-  need pipelining, smuggling hardening, or exotic framing. Reference:
+- **Parser (decided): custom zero-copy parser.** picohttpparser/swerver-style:
+  linear buffer, bounded inline `[headers_max]Header` array, memmove refill,
+  separate chunked state machine — parses directly out of the connection's fixed
+  read buffer (fed by the io_uring read edge, sidestepping the `std.Io.Reader`
+  `WouldBlock` erasure). Full control over zero-copy, limits, and smuggling
+  hardening; no std.Io coupling. Reference:
   `justinGrosvenor/swerver` (explicit zero-heap, Zig 0.16),
   `karlseguin/http.zig` (production-proven allocation pattern).
 - **Header limits:** `max_head_len` fits the fixed buffer; oversize → **431**.
