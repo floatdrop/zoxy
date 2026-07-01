@@ -1,0 +1,6 @@
+.DS_Store
+.direnv
+.zig-cache
+zig-cache
+zig-out
+zig-pkg
