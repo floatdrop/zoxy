@@ -40,6 +40,12 @@ pub const RoundRobin = @import("proxy/balancer.zig").RoundRobin;
 /// The reverse-proxy data path (docs/DESIGN.md §5, §7).
 pub const proxy = @import("net/proxy.zig");
 
+/// Process-wide metrics counters (docs/DESIGN.md §7).
+pub const Metrics = @import("obs/metrics.zig").Metrics;
+
+/// Per-worker access log.
+pub const AccessLog = @import("obs/access_log.zig").AccessLog;
+
 test "basic add functionality" {
     try std.testing.expect(add(3, 7) == 10);
 }
@@ -54,4 +60,6 @@ test {
     _ = @import("proxy/balancer.zig");
     _ = @import("net/pool.zig");
     _ = proxy;
+    _ = @import("obs/metrics.zig");
+    _ = @import("obs/access_log.zig");
 }

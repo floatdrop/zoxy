@@ -24,6 +24,9 @@ const h1 = @import("../http/h1.zig");
 const config = @import("../config.zig");
 const Router = @import("../proxy/router.zig").Router;
 const RoundRobin = @import("../proxy/balancer.zig").RoundRobin;
+const Metrics = @import("../obs/metrics.zig").Metrics;
+const access_log = @import("../obs/access_log.zig");
+const AccessLog = access_log.AccessLog;
 const Ip4Address = std.Io.net.Ip4Address;
 
 const Pool = @import("pool.zig").Pool(ProxyConn);
@@ -49,6 +52,8 @@ const Pipe = struct {
     conn: *ProxyConn,
     src_fd: posix.socket_t,
     dst_fd: posix.socket_t,
+    /// True for the upstream->client direction (drives bytes_to_client metrics).
+    to_client: bool,
     buf: [constants.relay_buf_bytes]u8,
     filled: usize,
     sent: usize,
@@ -81,6 +86,12 @@ const Pipe = struct {
         defer pipe.conn.releaseRef();
         if (pipe.conn.closing) return;
         const m = result catch return pipe.conn.teardown();
+        if (pipe.to_client) {
+            pipe.conn.metrics.bytes_to_client.add(m);
+            pipe.conn.bytes_out += m;
+        } else {
+            pipe.conn.metrics.bytes_to_upstream.add(m);
+        }
         pipe.sent += m;
         if (pipe.sent < pipe.filled) return pipe.armSend(); // finish a partial write
         pipe.armRecv();
@@ -92,6 +103,8 @@ pub const ProxyConn = struct {
     pool: *Pool,
     router: *const Router,
     rr: *RoundRobin,
+    metrics: *Metrics,
+    access: *AccessLog,
 
     down_fd: posix.socket_t,
     up_fd: posix.socket_t,
@@ -106,6 +119,12 @@ pub const ProxyConn = struct {
     head_filled: usize,
     headers_storage: [constants.headers_max]h1.Header,
     prime_sent: usize,
+
+    // Access-log accounting (slices point into head_buf).
+    log_method: []const u8,
+    log_target: []const u8,
+    outcome: access_log.Outcome,
+    bytes_out: u64,
 
     recv_head_completion: Completion,
     connect_completion: Completion,
@@ -127,6 +146,8 @@ pub const ProxyConn = struct {
         pool: *Pool,
         router: *const Router,
         rr: *RoundRobin,
+        metrics: *Metrics,
+        access: *AccessLog,
         down_fd: posix.socket_t,
         timeout_ns: u63,
     ) void {
@@ -135,6 +156,8 @@ pub const ProxyConn = struct {
         conn.pool = pool;
         conn.router = router;
         conn.rr = rr;
+        conn.metrics = metrics;
+        conn.access = access;
         conn.down_fd = down_fd;
         conn.up_fd = -1;
         conn.closing = false;
@@ -143,6 +166,12 @@ pub const ProxyConn = struct {
         conn.timeout_armed = false;
         conn.head_filled = 0;
         conn.prime_sent = 0;
+        conn.log_method = "";
+        conn.log_target = "";
+        conn.outcome = .aborted;
+        conn.bytes_out = 0;
+        metrics.accepted.add(1);
+        metrics.active.add(1);
         conn.armTimeout();
         conn.armRecvHead();
     }
@@ -168,7 +197,16 @@ pub const ProxyConn = struct {
     fn releaseRef(conn: *ProxyConn) void {
         assert(conn.refs > 0);
         conn.refs -= 1;
-        if (conn.closing and conn.refs == 0) conn.pool.release(conn); // fds already closed
+        if (conn.closing and conn.refs == 0) {
+            conn.metrics.active.sub(1);
+            conn.access.record(.{
+                .method = conn.log_method,
+                .target = conn.log_target,
+                .outcome = conn.outcome,
+                .bytes_to_client = conn.bytes_out,
+            });
+            conn.pool.release(conn); // fds already closed
+        }
     }
 
     fn teardown(conn: *ProxyConn) void {
@@ -230,7 +268,12 @@ pub const ProxyConn = struct {
             return conn.fail(responseForParseError(err));
         switch (parsed) {
             .incomplete => conn.armRecvHead(),
-            .complete => |request| conn.routeAndConnect(&request),
+            .complete => |request| {
+                conn.log_method = request.method_text;
+                conn.log_target = request.target;
+                conn.metrics.requests.add(1);
+                conn.routeAndConnect(&request);
+            },
         }
     }
 
@@ -267,14 +310,17 @@ pub const ProxyConn = struct {
     }
 
     fn startRelay(conn: *ProxyConn) void {
+        conn.outcome = .proxied;
         conn.d2u.conn = conn;
         conn.d2u.src_fd = conn.down_fd;
         conn.d2u.dst_fd = conn.up_fd;
+        conn.d2u.to_client = false;
         conn.d2u.filled = 0;
         conn.d2u.sent = 0;
         conn.u2d.conn = conn;
         conn.u2d.src_fd = conn.up_fd;
         conn.u2d.dst_fd = conn.down_fd;
+        conn.u2d.to_client = true;
         conn.u2d.filled = 0;
         conn.u2d.sent = 0;
         conn.d2u.armRecv();
@@ -285,6 +331,9 @@ pub const ProxyConn = struct {
 
     fn fail(conn: *ProxyConn, response: []const u8) void {
         assert(conn.down_fd >= 0);
+        conn.outcome = outcomeFor(response);
+        // Status class is the first digit of the code at index 9 ("HTTP/1.1 X").
+        if (response[9] == '4') conn.metrics.client_errors.add(1) else conn.metrics.upstream_errors.add(1);
         conn.retain();
         conn.io.send(*ProxyConn, conn, onFailSent, &conn.aux_completion, conn.down_fd, response);
     }
@@ -301,16 +350,28 @@ pub const ProxyServer = struct {
     pool: *Pool,
     listener: Listener,
     router: *const Router,
+    metrics: *Metrics,
+    access: *AccessLog,
     rr: RoundRobin,
     timeout_ns: u63,
     accept_completion: Completion,
 
-    pub fn init(io: *IO, pool: *Pool, listener: Listener, router: *const Router, timeout_ns: u63) ProxyServer {
+    pub fn init(
+        io: *IO,
+        pool: *Pool,
+        listener: Listener,
+        router: *const Router,
+        metrics: *Metrics,
+        access: *AccessLog,
+        timeout_ns: u63,
+    ) ProxyServer {
         return .{
             .io = io,
             .pool = pool,
             .listener = listener,
             .router = router,
+            .metrics = metrics,
+            .access = access,
             .rr = .{},
             .timeout_ns = timeout_ns,
             .accept_completion = undefined,
@@ -328,8 +389,9 @@ pub const ProxyServer = struct {
     fn onAccept(server: *ProxyServer, _: *Completion, result: io_mod.AcceptError!posix.socket_t) void {
         if (result) |fd| {
             if (server.pool.acquire()) |conn| {
-                conn.start(server.io, server.pool, server.router, &server.rr, fd, server.timeout_ns);
+                conn.start(server.io, server.pool, server.router, &server.rr, server.metrics, server.access, fd, server.timeout_ns);
             } else {
+                server.metrics.rejected.add(1);
                 _ = linux.close(fd); // backpressure: reject, never allocate
             }
         } else |_| {}
@@ -345,6 +407,15 @@ fn responseForParseError(err: h1.ParseError) []const u8 {
         error.TooManyHeaders => resp_431,
         error.UnsupportedVersion => resp_505,
     };
+}
+
+fn outcomeFor(response: []const u8) access_log.Outcome {
+    if (response.ptr == resp_400.ptr) return .bad_request;
+    if (response.ptr == resp_404.ptr) return .not_found;
+    if (response.ptr == resp_431.ptr) return .too_large;
+    if (response.ptr == resp_502.ptr) return .no_upstream;
+    if (response.ptr == resp_503.ptr) return .unavailable;
+    return .bad_version; // resp_505
 }
 
 fn createTcpSocket() ?posix.socket_t {
@@ -432,7 +503,9 @@ test "proxy: forwards a request to an upstream and relays the response" {
 
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var server = ProxyServer.init(&io, &pool, proxy_listener, &router, constants.connection_timeout_ns);
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(&io, &pool, proxy_listener, &router, &metrics, &access, constants.connection_timeout_ns);
     server.start();
 
     // Client connects to the proxy and drives its request on the same loop.
@@ -502,7 +575,9 @@ test "proxy: relays a response larger than the relay buffer with bounded memory"
 
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var server = ProxyServer.init(&io, &pool, proxy_listener, &router, constants.connection_timeout_ns);
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(&io, &pool, proxy_listener, &router, &metrics, &access, constants.connection_timeout_ns);
     server.start();
 
     const client = try connectLoopback(proxy_listener.boundAddress().port);
@@ -562,7 +637,9 @@ test "proxy: a stalled connection is reclaimed by the deadline" {
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
     const short_timeout: u63 = 50 * std.time.ns_per_ms;
-    var server = ProxyServer.init(&io, &pool, proxy_listener, &router, short_timeout);
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(&io, &pool, proxy_listener, &router, &metrics, &access, short_timeout);
     server.start();
 
     // Slow-loris: connect, send a partial head, then never finish it.

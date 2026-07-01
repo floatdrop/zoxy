@@ -13,7 +13,11 @@ const Listener = zoxy.Listener;
 const Router = zoxy.Router;
 const ProxyServer = zoxy.proxy.ProxyServer;
 const Pool = zoxy.proxy.ConnPool;
+const Metrics = zoxy.Metrics;
+const AccessLog = zoxy.AccessLog;
 const Ip4Address = std.Io.net.Ip4Address;
+
+const stderr_fd = 2;
 
 pub fn main(init: std.process.Init) !void {
     // All allocation here is startup-only; it lives in the process arena.
@@ -34,14 +38,19 @@ pub fn main(init: std.process.Init) !void {
 
     const worker_count = std.Thread.getCpuCount() catch 1;
 
+    // Shared counters (atomic) and per-worker access logs, reserved up front.
+    var metrics: Metrics = .{};
+    const accesses = try gpa.alloc(AccessLog, worker_count);
+    for (accesses) |*access| access.* = .{ .fd = stderr_fd };
+
     // Reserve every worker's pool up front, on this thread, so worker startup
     // touches no shared allocator and the serving loop allocates nothing.
     const pools = try gpa.alloc(Pool, worker_count);
     for (pools) |*pool| pool.* = try Pool.init(gpa, constants.connections_max);
 
     const threads = try gpa.alloc(std.Thread, worker_count);
-    for (threads, pools, 0..) |*thread, *pool, cpu| {
-        thread.* = try std.Thread.spawn(.{}, runWorker, .{ cfg.listen, pool, &router, cpu });
+    for (threads, pools, accesses, 0..) |*thread, *pool, *access, cpu| {
+        thread.* = try std.Thread.spawn(.{}, runWorker, .{ cfg.listen, pool, &router, &metrics, access, cpu });
     }
     std.log.info("zoxy listening on {f} across {d} worker(s)", .{ cfg.listen, worker_count });
     for (threads) |thread| thread.join();
@@ -49,7 +58,7 @@ pub fn main(init: std.process.Init) !void {
 
 /// One share-nothing worker: its own IO ring, SO_REUSEPORT listener, and pool,
 /// pinned to a core. Runs the proxy accept/relay loop forever.
-fn runWorker(listen: Ip4Address, pool: *Pool, router: *const Router, cpu: usize) void {
+fn runWorker(listen: Ip4Address, pool: *Pool, router: *const Router, metrics: *Metrics, access: *AccessLog, cpu: usize) void {
     pinToCpu(cpu);
 
     var io = IO.init(constants.io_ring_entries, 0) catch |err| return logWorkerError("io init", err);
@@ -58,9 +67,12 @@ fn runWorker(listen: Ip4Address, pool: *Pool, router: *const Router, cpu: usize)
     var listener = Listener.open(listen, constants.accept_backlog) catch |err| return logWorkerError("listen", err);
     defer listener.close();
 
-    var server = ProxyServer.init(&io, pool, listener, router, constants.connection_timeout_ns);
+    var server = ProxyServer.init(&io, pool, listener, router, metrics, access, constants.connection_timeout_ns);
     server.start();
-    while (true) io.run_once() catch |err| return logWorkerError("io run", err);
+    while (true) {
+        io.run_once() catch |err| return logWorkerError("io run", err);
+        access.flush(); // batched: one write per event-loop iteration, off the per-connection path
+    }
 }
 
 /// Best-effort CPU pinning (Linux only). Failure is non-fatal.
