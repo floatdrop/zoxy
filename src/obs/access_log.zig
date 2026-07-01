@@ -87,22 +87,42 @@ test "access_log: formats lines by outcome" {
     var buf: [line_max]u8 = undefined;
     try std.testing.expectEqualStrings(
         "GET /a proxied 12\n",
-        formatLine(&buf, .{ .method = "GET", .target = "/a", .outcome = .proxied, .bytes_to_client = 12 }),
+        formatLine(&buf, .{
+            .method = "GET",
+            .target = "/a",
+            .outcome = .proxied,
+            .bytes_to_client = 12,
+        }),
     );
     try std.testing.expectEqualStrings(
         "- - aborted 0\n",
-        formatLine(&buf, .{ .method = "", .target = "", .outcome = .aborted, .bytes_to_client = 0 }),
+        formatLine(&buf, .{
+            .method = "",
+            .target = "",
+            .outcome = .aborted,
+            .bytes_to_client = 0,
+        }),
     );
     try std.testing.expectEqualStrings(
         "POST /x 404 0\n",
-        formatLine(&buf, .{ .method = "POST", .target = "/x", .outcome = .not_found, .bytes_to_client = 0 }),
+        formatLine(&buf, .{
+            .method = "POST",
+            .target = "/x",
+            .outcome = .not_found,
+            .bytes_to_client = 0,
+        }),
     );
 }
 
 test "access_log: accumulates records in the buffer" {
     var log = AccessLog{ .fd = -1 }; // not flushed in this test
     log.record(.{ .method = "GET", .target = "/a", .outcome = .proxied, .bytes_to_client = 5 });
-    log.record(.{ .method = "POST", .target = "/b", .outcome = .no_upstream, .bytes_to_client = 0 });
+    log.record(.{
+        .method = "POST",
+        .target = "/b",
+        .outcome = .no_upstream,
+        .bytes_to_client = 0,
+    });
     const out = log.buf[0..log.used];
     try std.testing.expect(std.mem.indexOf(u8, out, "GET /a proxied 5\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "POST /b 502 0\n") != null);

@@ -35,10 +35,13 @@ const Pool = @import("pool.zig").Pool(ProxyConn);
 // Fixed error responses (Connection: close so the client stops after reading).
 const resp_400 = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const resp_404 = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-const resp_431 = "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const resp_431 = "HTTP/1.1 431 Request Header Fields Too Large\r\n" ++
+    "Content-Length: 0\r\nConnection: close\r\n\r\n";
 const resp_502 = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-const resp_503 = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-const resp_505 = "HTTP/1.1 505 HTTP Version Not Supported\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const resp_503 = "HTTP/1.1 503 Service Unavailable\r\n" ++
+    "Content-Length: 0\r\nConnection: close\r\n\r\n";
+const resp_505 = "HTTP/1.1 505 HTTP Version Not Supported\r\n" ++
+    "Content-Length: 0\r\nConnection: close\r\n\r\n";
 
 /// One direction of the relay: read from `src_fd`, write to `dst_fd`, repeat.
 ///
@@ -80,7 +83,14 @@ const Pipe = struct {
     fn armSend(pipe: *Pipe) void {
         assert(pipe.sent < pipe.filled);
         pipe.conn.retain();
-        pipe.conn.io.send(*Pipe, pipe, onSend, &pipe.send_completion, pipe.dst_fd, pipe.buf[pipe.sent..pipe.filled]);
+        pipe.conn.io.send(
+            *Pipe,
+            pipe,
+            onSend,
+            &pipe.send_completion,
+            pipe.dst_fd,
+            pipe.buf[pipe.sent..pipe.filled],
+        );
     }
 
     fn onSend(pipe: *Pipe, _: *Completion, result: io_mod.SendError!usize) void {
@@ -256,7 +266,14 @@ pub const ProxyConn = struct {
     fn armRecvHead(conn: *ProxyConn) void {
         if (conn.head_filled == conn.head_buf.len) return conn.fail(resp_431);
         conn.retain();
-        conn.io.recv(*ProxyConn, conn, onRecvHead, &conn.recv_head_completion, conn.down_fd, conn.head_buf[conn.head_filled..]);
+        conn.io.recv(
+            *ProxyConn,
+            conn,
+            onRecvHead,
+            &conn.recv_head_completion,
+            conn.down_fd,
+            conn.head_buf[conn.head_filled..],
+        );
     }
 
     fn onRecvHead(conn: *ProxyConn, _: *Completion, result: io_mod.RecvError!usize) void {
@@ -265,8 +282,10 @@ pub const ProxyConn = struct {
         const n = result catch return conn.teardown();
         if (n == 0) return conn.teardown(); // client closed before completing the head
         conn.head_filled += n;
-        const parsed = h1.parse(conn.head_buf[0..conn.head_filled], &conn.headers_storage) catch |err|
-            return conn.fail(responseForParseError(err));
+        const parsed = h1.parse(
+            conn.head_buf[0..conn.head_filled],
+            &conn.headers_storage,
+        ) catch |err| return conn.fail(responseForParseError(err));
         switch (parsed) {
             .incomplete => conn.armRecvHead(),
             .complete => |request| {
@@ -279,11 +298,19 @@ pub const ProxyConn = struct {
     }
 
     fn routeAndConnect(conn: *ProxyConn, request: *const h1.Request) void {
-        const cluster = conn.router.route(request.host(), request.target) orelse return conn.fail(resp_404);
+        const cluster = conn.router.route(request.host(), request.target) orelse
+            return conn.fail(resp_404);
         const endpoint = conn.rr.pick(cluster) orelse return conn.fail(resp_503);
         conn.up_fd = createTcpSocket() orelse return conn.fail(resp_502);
         conn.retain();
-        conn.io.connect(*ProxyConn, conn, onConnect, &conn.connect_completion, conn.up_fd, sockaddrIn(endpoint.address));
+        conn.io.connect(
+            *ProxyConn,
+            conn,
+            onConnect,
+            &conn.connect_completion,
+            conn.up_fd,
+            sockaddrIn(endpoint.address),
+        );
     }
 
     fn onConnect(conn: *ProxyConn, _: *Completion, result: io_mod.ConnectError!void) void {
@@ -298,7 +325,14 @@ pub const ProxyConn = struct {
     fn armPrime(conn: *ProxyConn) void {
         assert(conn.prime_sent < conn.head_filled);
         conn.retain();
-        conn.io.send(*ProxyConn, conn, onPrimeSent, &conn.aux_completion, conn.up_fd, conn.head_buf[conn.prime_sent..conn.head_filled]);
+        conn.io.send(
+            *ProxyConn,
+            conn,
+            onPrimeSent,
+            &conn.aux_completion,
+            conn.up_fd,
+            conn.head_buf[conn.prime_sent..conn.head_filled],
+        );
     }
 
     fn onPrimeSent(conn: *ProxyConn, _: *Completion, result: io_mod.SendError!usize) void {
@@ -334,7 +368,11 @@ pub const ProxyConn = struct {
         assert(conn.down_fd >= 0);
         conn.outcome = outcomeFor(response);
         // Status class is the first digit of the code at index 9 ("HTTP/1.1 X").
-        if (response[9] == '4') conn.metrics.client_errors.add(1) else conn.metrics.upstream_errors.add(1);
+        if (response[9] == '4') {
+            conn.metrics.client_errors.add(1);
+        } else {
+            conn.metrics.upstream_errors.add(1);
+        }
         conn.retain();
         conn.io.send(*ProxyConn, conn, onFailSent, &conn.aux_completion, conn.down_fd, response);
     }
@@ -384,13 +422,32 @@ pub const ProxyServer = struct {
     }
 
     fn armAccept(server: *ProxyServer) void {
-        server.io.accept(*ProxyServer, server, onAccept, &server.accept_completion, server.listener.fd);
+        server.io.accept(
+            *ProxyServer,
+            server,
+            onAccept,
+            &server.accept_completion,
+            server.listener.fd,
+        );
     }
 
-    fn onAccept(server: *ProxyServer, _: *Completion, result: io_mod.AcceptError!posix.socket_t) void {
+    fn onAccept(
+        server: *ProxyServer,
+        _: *Completion,
+        result: io_mod.AcceptError!posix.socket_t,
+    ) void {
         if (result) |fd| {
             if (server.pool.acquire()) |conn| {
-                conn.start(server.io, server.pool, server.router, &server.rr, server.metrics, server.access, fd, server.timeout_ns);
+                conn.start(
+                    server.io,
+                    server.pool,
+                    server.router,
+                    &server.rr,
+                    server.metrics,
+                    server.access,
+                    fd,
+                    server.timeout_ns,
+                );
             } else {
                 server.metrics.rejected.add(1);
                 _ = linux.close(fd); // backpressure: reject, never allocate
@@ -453,7 +510,11 @@ const TestOrigin = struct {
     fn start(origin: *TestOrigin) void {
         origin.io.accept(*TestOrigin, origin, onAccept, &origin.accept_c, origin.listener.fd);
     }
-    fn onAccept(origin: *TestOrigin, _: *Completion, result: io_mod.AcceptError!posix.socket_t) void {
+    fn onAccept(
+        origin: *TestOrigin,
+        _: *Completion,
+        result: io_mod.AcceptError!posix.socket_t,
+    ) void {
         origin.fd = result catch return;
         origin.io.recv(*TestOrigin, origin, onRecv, &origin.recv_c, origin.fd, &origin.reqbuf);
     }
@@ -463,7 +524,14 @@ const TestOrigin = struct {
         origin.armSend();
     }
     fn armSend(origin: *TestOrigin) void {
-        origin.io.send(*TestOrigin, origin, onSend, &origin.send_c, origin.fd, origin.response[origin.sent..]);
+        origin.io.send(
+            *TestOrigin,
+            origin,
+            onSend,
+            &origin.send_c,
+            origin.fd,
+            origin.response[origin.sent..],
+        );
     }
     fn onSend(origin: *TestOrigin, _: *Completion, result: io_mod.SendError!usize) void {
         origin.sent += result catch return;
@@ -506,7 +574,15 @@ test "proxy: forwards a request to an upstream and relays the response" {
     defer proxy_listener.close();
     var metrics = Metrics{};
     var access = AccessLog{ .fd = -1 };
-    var server = ProxyServer.init(&io, &pool, proxy_listener, &router, &metrics, &access, constants.connection_timeout_ns);
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.connection_timeout_ns,
+    );
     server.start();
 
     // Client connects to the proxy and drives its request on the same loop.
@@ -523,7 +599,14 @@ test "proxy: forwards a request to an upstream and relays the response" {
         recv_c: Completion = undefined,
         fn go(c: *@This()) void {
             c.io.recv(*@This(), c, onRecv, &c.recv_c, c.fd, &c.buf);
-            c.io.send(*@This(), c, onSend, &c.send_c, c.fd, "GET / HTTP/1.1\r\nHost: origin\r\n\r\n");
+            c.io.send(
+                *@This(),
+                c,
+                onSend,
+                &c.send_c,
+                c.fd,
+                "GET / HTTP/1.1\r\nHost: origin\r\n\r\n",
+            );
         }
         fn onSend(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
             _ = c;
@@ -578,7 +661,15 @@ test "proxy: relays a response larger than the relay buffer with bounded memory"
     defer proxy_listener.close();
     var metrics = Metrics{};
     var access = AccessLog{ .fd = -1 };
-    var server = ProxyServer.init(&io, &pool, proxy_listener, &router, &metrics, &access, constants.connection_timeout_ns);
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.connection_timeout_ns,
+    );
     server.start();
 
     const client = try connectLoopback(proxy_listener.boundAddress().port);
@@ -640,7 +731,15 @@ test "proxy: a stalled connection is reclaimed by the deadline" {
     const short_timeout: u63 = 50 * std.time.ns_per_ms;
     var metrics = Metrics{};
     var access = AccessLog{ .fd = -1 };
-    var server = ProxyServer.init(&io, &pool, proxy_listener, &router, &metrics, &access, short_timeout);
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        short_timeout,
+    );
     server.start();
 
     // Slow-loris: connect, send a partial head, then never finish it.
@@ -685,7 +784,15 @@ test "proxy: the serving path allocates nothing after startup (zero-alloc gate)"
     var access = AccessLog{ .fd = -1 };
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var server = ProxyServer.init(&io, &pool, proxy_listener, &router, &metrics, &access, constants.connection_timeout_ns);
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.connection_timeout_ns,
+    );
     server.start();
 
     const client = try connectLoopback(proxy_listener.boundAddress().port);
@@ -731,6 +838,8 @@ fn connectLoopback(port: u16) !posix.socket_t {
     try std.testing.expect(posix.errno(rc) == .SUCCESS);
     const fd: posix.socket_t = @intCast(rc);
     const sa = sockaddrIn(Ip4Address.loopback(port));
-    try std.testing.expect(posix.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) == .SUCCESS);
+    try std.testing.expect(
+        posix.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) == .SUCCESS,
+    );
     return fd;
 }

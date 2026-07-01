@@ -27,7 +27,9 @@ test "balancer: round-robin cycles endpoints" {
         \\{
         \\  "listen": "0.0.0.0:80",
         \\  "routes": [{ "cluster": "c" }],
-        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:1", "127.0.0.1:2", "127.0.0.1:3"] }]
+        \\  "clusters": [
+        \\    { "name": "c", "endpoints": ["127.0.0.1:1", "127.0.0.1:2", "127.0.0.1:3"] }
+        \\  ]
         \\}
     );
     defer cfg.deinit();
@@ -42,7 +44,8 @@ test "balancer: round-robin cycles endpoints" {
 
 test "balancer: empty cluster yields null" {
     var cfg = try config.parse(std.testing.allocator,
-        \\{ "listen": "0.0.0.0:80", "routes": [{ "cluster": "c" }], "clusters": [{ "name": "c", "endpoints": [] }] }
+        \\{ "listen": "0.0.0.0:80", "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": [] }] }
     );
     defer cfg.deinit();
     var rr: RoundRobin = .{};

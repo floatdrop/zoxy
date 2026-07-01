@@ -116,10 +116,20 @@ pub const EchoServer = struct {
     }
 
     fn armAccept(server: *EchoServer) void {
-        server.io.accept(*EchoServer, server, onAccept, &server.accept_completion, server.listener.fd);
+        server.io.accept(
+            *EchoServer,
+            server,
+            onAccept,
+            &server.accept_completion,
+            server.listener.fd,
+        );
     }
 
-    fn onAccept(server: *EchoServer, _: *Completion, result: io_mod.AcceptError!posix.socket_t) void {
+    fn onAccept(
+        server: *EchoServer,
+        _: *Completion,
+        result: io_mod.AcceptError!posix.socket_t,
+    ) void {
         if (result) |fd| {
             if (server.pool.acquire()) |conn| {
                 conn.start(server.io, server.pool, fd);
@@ -144,7 +154,9 @@ fn connectLoopback(port: u16) !posix.socket_t {
         .port = std.mem.nativeToBig(u16, port),
         .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
     };
-    try std.testing.expect(posix.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) == .SUCCESS);
+    try std.testing.expect(
+        posix.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) == .SUCCESS,
+    );
     return fd;
 }
 

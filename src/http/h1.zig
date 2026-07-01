@@ -203,7 +203,10 @@ test "h1: trims OWS around header values" {
 
 test "h1: incomplete input asks for more" {
     var headers: [4]Header = undefined;
-    try std.testing.expectEqual(Parsed.incomplete, try parse("GET / HTTP/1.1\r\nHost: x\r\n", &headers));
+    try std.testing.expectEqual(
+        Parsed.incomplete,
+        try parse("GET / HTTP/1.1\r\nHost: x\r\n", &headers),
+    );
     try std.testing.expectEqual(Parsed.incomplete, try parse("GET / HTT", &headers));
     try std.testing.expectEqual(Parsed.incomplete, try parse("", &headers));
 }
@@ -212,16 +215,31 @@ test "h1: rejects malformed requests" {
     var headers: [8]Header = undefined;
     try std.testing.expectError(error.Malformed, parse("GET\r\n\r\n", &headers));
     try std.testing.expectError(error.Malformed, parse("GET /\r\n\r\n", &headers));
-    try std.testing.expectError(error.Malformed, parse("GET / HTTP/1.1\r\nBadHeader\r\n\r\n", &headers));
-    try std.testing.expectError(error.Malformed, parse("GET / HTTP/1.1\r\nBad Name: v\r\n\r\n", &headers));
+    try std.testing.expectError(
+        error.Malformed,
+        parse("GET / HTTP/1.1\r\nBadHeader\r\n\r\n", &headers),
+    );
+    try std.testing.expectError(
+        error.Malformed,
+        parse("GET / HTTP/1.1\r\nBad Name: v\r\n\r\n", &headers),
+    );
     try std.testing.expectError(error.Malformed, parse("GET / WHAT/1.1\r\n\r\n", &headers));
 }
 
 test "h1: rejects unsupported versions" {
     var headers: [4]Header = undefined;
-    try std.testing.expectError(error.UnsupportedVersion, parse("GET / HTTP/2.0\r\n\r\n", &headers));
-    try std.testing.expectError(error.UnsupportedVersion, parse("GET / HTTP/1.9\r\n\r\n", &headers));
-    try std.testing.expectEqual(@as(u8, 0), (try parse("GET / HTTP/1.0\r\n\r\n", &headers)).complete.version_minor);
+    try std.testing.expectError(
+        error.UnsupportedVersion,
+        parse("GET / HTTP/2.0\r\n\r\n", &headers),
+    );
+    try std.testing.expectError(
+        error.UnsupportedVersion,
+        parse("GET / HTTP/1.9\r\n\r\n", &headers),
+    );
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        (try parse("GET / HTTP/1.0\r\n\r\n", &headers)).complete.version_minor,
+    );
 }
 
 test "h1: rejects too many headers" {

@@ -50,7 +50,11 @@ pub fn main(init: std.process.Init) !void {
 
     const threads = try gpa.alloc(std.Thread, worker_count);
     for (threads, pools, accesses, 0..) |*thread, *pool, *access, cpu| {
-        thread.* = try std.Thread.spawn(.{}, runWorker, .{ cfg.listen, pool, &router, &metrics, access, cpu });
+        thread.* = try std.Thread.spawn(
+            .{},
+            runWorker,
+            .{ cfg.listen, pool, &router, &metrics, access, cpu },
+        );
     }
     std.log.info("zoxy listening on {f} across {d} worker(s)", .{ cfg.listen, worker_count });
     for (threads) |thread| thread.join();
@@ -58,16 +62,33 @@ pub fn main(init: std.process.Init) !void {
 
 /// One share-nothing worker: its own IO ring, SO_REUSEPORT listener, and pool,
 /// pinned to a core. Runs the proxy accept/relay loop forever.
-fn runWorker(listen: Ip4Address, pool: *Pool, router: *const Router, metrics: *Metrics, access: *AccessLog, cpu: usize) void {
+fn runWorker(
+    listen: Ip4Address,
+    pool: *Pool,
+    router: *const Router,
+    metrics: *Metrics,
+    access: *AccessLog,
+    cpu: usize,
+) void {
     pinToCpu(cpu);
 
-    var io = IO.init(constants.io_ring_entries, 0) catch |err| return logWorkerError("io init", err);
+    var io = IO.init(constants.io_ring_entries, 0) catch |err|
+        return logWorkerError("io init", err);
     defer io.deinit();
 
-    var listener = Listener.open(listen, constants.accept_backlog) catch |err| return logWorkerError("listen", err);
+    var listener = Listener.open(listen, constants.accept_backlog) catch |err|
+        return logWorkerError("listen", err);
     defer listener.close();
 
-    var server = ProxyServer.init(&io, pool, listener, router, metrics, access, constants.connection_timeout_ns);
+    var server = ProxyServer.init(
+        &io,
+        pool,
+        listener,
+        router,
+        metrics,
+        access,
+        constants.connection_timeout_ns,
+    );
     server.start();
     while (true) {
         io.run_once() catch |err| return logWorkerError("io run", err);

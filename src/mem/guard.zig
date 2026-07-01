@@ -39,12 +39,24 @@ pub const CountingAllocator = struct {
         self.allocations += 1;
         return self.backing.rawAlloc(len, alignment, ret_addr);
     }
-    fn resize(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) bool {
+    fn resize(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) bool {
         const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
         self.resizes += 1;
         return self.backing.rawResize(memory, alignment, new_len, ret_addr);
     }
-    fn remap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+    fn remap(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) ?[*]u8 {
         const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
         self.remaps += 1;
         return self.backing.rawRemap(memory, alignment, new_len, ret_addr);

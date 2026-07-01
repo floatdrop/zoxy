@@ -59,7 +59,10 @@ test "router: matches host + path prefix, first match wins" {
     const router = Router.init(&cfg);
 
     // Host+prefix match (port in Host header is ignored).
-    try std.testing.expectEqualStrings("api", router.route("api.example.com:8080", "/v1/users").?.name);
+    try std.testing.expectEqualStrings(
+        "api",
+        router.route("api.example.com:8080", "/v1/users").?.name,
+    );
     // Same host but non-matching prefix falls through to the wildcard route.
     try std.testing.expectEqualStrings("default", router.route("api.example.com", "/other").?.name);
     // Unknown host still matches the wildcard route.
