@@ -4,7 +4,7 @@
 
 /// Maximum concurrent downstream connections per worker. Beyond this, new
 /// connections are rejected (backpressure), never queued via allocation.
-pub const connections_max: u32 = 1024;
+pub const connections_max: u32 = 256;
 
 /// Per-connection read buffer. Must hold a full HTTP request head (see later
 /// `head_bytes_max`) plus a useful chunk of body.
@@ -19,3 +19,6 @@ pub const accept_backlog: u32 = 1024;
 /// Maximum request header lines. Beyond this a request is rejected (431),
 /// never grown. The head must also fit within `read_buf_bytes`.
 pub const headers_max: usize = 64;
+
+/// Per-direction relay buffer for streaming request bodies and responses.
+pub const relay_buf_bytes: usize = 16 * 1024;

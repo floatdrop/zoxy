@@ -43,6 +43,15 @@ pub const SendError = error{
     Unexpected,
 };
 
+pub const ConnectError = error{
+    ConnectionRefused,
+    ConnectionResetByPeer,
+    ConnectionTimedOut,
+    NetworkUnreachable,
+    Canceled,
+    Unexpected,
+};
+
 pub const CloseError = error{Unexpected};
 
 pub const TimeoutError = error{ Canceled, Unexpected };
@@ -53,6 +62,7 @@ const Operation = union(enum) {
     accept: struct { socket: posix.socket_t },
     recv: struct { socket: posix.socket_t, buffer: []u8 },
     send: struct { socket: posix.socket_t, buffer: []const u8 },
+    connect: struct { socket: posix.socket_t, addr: linux.sockaddr.in },
     close: struct { fd: posix.fd_t },
     timeout: struct { expires: linux.kernel_timespec },
 };
@@ -165,6 +175,20 @@ pub const IO = struct {
         });
     }
 
+    pub fn connect(
+        io: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (context: Context, completion: *Completion, result: ConnectError!void) void,
+        completion: *Completion,
+        socket: posix.socket_t,
+        addr: linux.sockaddr.in,
+    ) void {
+        io.submit(Context, context, ConnectError!void, callback, completion, .{
+            .connect = .{ .socket = socket, .addr = addr },
+        });
+    }
+
     pub fn close(
         io: *IO,
         comptime Context: type,
@@ -229,6 +253,7 @@ pub const IO = struct {
             .accept => |op| _ = try io.ring.accept(user_data, op.socket, null, null, 0),
             .recv => |op| _ = try io.ring.recv(user_data, op.socket, .{ .buffer = op.buffer }, 0),
             .send => |op| _ = try io.ring.send(user_data, op.socket, op.buffer, 0),
+            .connect => |*op| _ = try io.ring.connect(user_data, op.socket, @ptrCast(&op.addr), @sizeOf(linux.sockaddr.in)),
             .close => |op| _ = try io.ring.close(user_data, op.fd),
             .timeout => |*op| _ = try io.ring.timeout(user_data, &op.expires, 0, 0),
         }
@@ -317,6 +342,10 @@ pub const IO = struct {
                 const result = decode_send(completion.result);
                 completion.callback(completion.context, completion, &result);
             },
+            .connect => {
+                const result = decode_connect(completion.result);
+                completion.callback(completion.context, completion, &result);
+            },
             .close => {
                 const result = decode_close(completion.result);
                 completion.callback(completion.context, completion, &result);
@@ -365,6 +394,18 @@ fn decode_send(result: i32) SendError!usize {
         .PIPE => error.BrokenPipe,
         .CONNRESET => error.ConnectionResetByPeer,
         .NOBUFS, .NOMEM => error.SystemResources,
+        .CANCELED => error.Canceled,
+        else => error.Unexpected,
+    };
+}
+
+fn decode_connect(result: i32) ConnectError!void {
+    if (result >= 0) return;
+    return switch (to_errno(result)) {
+        .CONNREFUSED => error.ConnectionRefused,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .TIMEDOUT => error.ConnectionTimedOut,
+        .NETUNREACH, .HOSTUNREACH => error.NetworkUnreachable,
         .CANCELED => error.Canceled,
         else => error.Unexpected,
     };

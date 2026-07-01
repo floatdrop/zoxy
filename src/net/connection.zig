@@ -13,6 +13,7 @@ const IO = io_mod.IO;
 const Completion = io_mod.Completion;
 const constants = @import("../constants.zig");
 const Listener = @import("listener.zig").Listener;
+const Pool = @import("pool.zig").Pool(Connection);
 
 /// One downstream connection. Owns its io_uring completions and read buffer
 /// inline, so a submitted operation allocates nothing. Lives inside `Pool`.
@@ -95,56 +96,6 @@ pub const Connection = struct {
         result catch {}; // best-effort; the fd is gone regardless
         conn.fd = -1;
         conn.pool.release(conn);
-    }
-};
-
-/// Fixed-capacity pool of `Connection`s backed by one startup allocation, with
-/// an intrusive free list. Acquire/release never allocate.
-pub const Pool = struct {
-    connections: []Connection,
-    free_head: ?*Connection,
-    free_count: u32,
-    capacity: u32,
-
-    pub fn init(gpa: std.mem.Allocator, capacity: u32) !Pool {
-        assert(capacity > 0);
-        const connections = try gpa.alloc(Connection, capacity);
-        var pool: Pool = .{
-            .connections = connections,
-            .free_head = null,
-            .free_count = 0,
-            .capacity = capacity,
-        };
-        // Build the free list so acquire() hands out slot 0 first.
-        var i: u32 = capacity;
-        while (i > 0) {
-            i -= 1;
-            pool.release(&connections[i]);
-        }
-        assert(pool.free_count == capacity);
-        return pool;
-    }
-
-    pub fn deinit(pool: *Pool, gpa: std.mem.Allocator) void {
-        gpa.free(pool.connections);
-        pool.* = undefined;
-    }
-
-    /// Take a free connection, or null when exhausted (caller applies backpressure).
-    pub fn acquire(pool: *Pool) ?*Connection {
-        const conn = pool.free_head orelse return null;
-        pool.free_head = conn.free_next;
-        conn.free_next = null;
-        assert(pool.free_count > 0);
-        pool.free_count -= 1;
-        return conn;
-    }
-
-    pub fn release(pool: *Pool, conn: *Connection) void {
-        assert(pool.free_count < pool.capacity);
-        conn.free_next = pool.free_head;
-        pool.free_head = conn;
-        pool.free_count += 1;
     }
 };
 

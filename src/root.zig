@@ -37,6 +37,9 @@ pub const Router = @import("proxy/router.zig").Router;
 /// Round-robin load balancing.
 pub const RoundRobin = @import("proxy/balancer.zig").RoundRobin;
 
+/// The reverse-proxy data path (docs/DESIGN.md §5, §7).
+pub const proxy = @import("net/proxy.zig");
+
 test "basic add functionality" {
     try std.testing.expect(add(3, 7) == 10);
 }
@@ -49,4 +52,6 @@ test {
     _ = config;
     _ = @import("proxy/router.zig");
     _ = @import("proxy/balancer.zig");
+    _ = @import("net/pool.zig");
+    _ = proxy;
 }

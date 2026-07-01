@@ -15,6 +15,7 @@ pub const Completion = impl.Completion;
 pub const AcceptError = impl.AcceptError;
 pub const RecvError = impl.RecvError;
 pub const SendError = impl.SendError;
+pub const ConnectError = impl.ConnectError;
 pub const CloseError = impl.CloseError;
 pub const TimeoutError = impl.TimeoutError;
 

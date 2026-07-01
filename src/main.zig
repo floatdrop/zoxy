@@ -1,7 +1,7 @@
-//! zoxy entrypoint. Phase-0: a thread-per-core echo server — one worker per CPU,
-//! each with its own io_uring loop, its own SO_REUSEPORT listener, and its own
-//! connection pool (share-nothing; docs/DESIGN.md §2). The kernel load-balances
-//! accepts across the per-worker listeners.
+//! zoxy entrypoint. Loads a static JSON config, then runs a share-nothing
+//! thread-per-core reverse proxy: one worker per CPU, each with its own
+//! io_uring loop, SO_REUSEPORT listener, and connection pool (docs/DESIGN.md
+//! §2, §7). Config parsing allocates at startup; the serving loop does not.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -10,53 +10,55 @@ const zoxy = @import("zoxy");
 const constants = zoxy.constants;
 const IO = zoxy.io.IO;
 const Listener = zoxy.Listener;
-const Pool = zoxy.connection.Pool;
-const EchoServer = zoxy.connection.EchoServer;
+const Router = zoxy.Router;
+const ProxyServer = zoxy.proxy.ProxyServer;
+const Pool = zoxy.proxy.ConnPool;
 const Ip4Address = std.Io.net.Ip4Address;
 
-const listen_port = 8080;
+pub fn main(init: std.process.Init) !void {
+    // All allocation here is startup-only; it lives in the process arena.
+    const gpa = init.arena.allocator();
 
-pub fn main() !void {
-    // Startup allocations (pools) only — nothing here runs on the serving path.
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = debug_allocator.deinit();
-    const gpa = debug_allocator.allocator();
+    const args = try init.minimal.args.toSlice(gpa);
+    const config_path = if (args.len > 1) args[1] else "zoxy.json";
+
+    const text = std.Io.Dir.cwd().readFileAlloc(init.io, config_path, gpa, .unlimited) catch |err| {
+        std.log.err("zoxy: cannot read config {s}: {s}", .{ config_path, @errorName(err) });
+        return err;
+    };
+    var cfg = zoxy.config.parse(gpa, text) catch |err| {
+        std.log.err("zoxy: invalid config {s}: {s}", .{ config_path, @errorName(err) });
+        return err;
+    };
+    const router = Router.init(&cfg);
 
     const worker_count = std.Thread.getCpuCount() catch 1;
-    const address = Ip4Address.unspecified(listen_port);
 
-    // Allocate every pool up front, on this thread, so worker startup touches no
-    // shared allocator (the serving loop then allocates nothing).
+    // Reserve every worker's pool up front, on this thread, so worker startup
+    // touches no shared allocator and the serving loop allocates nothing.
     const pools = try gpa.alloc(Pool, worker_count);
-    defer gpa.free(pools);
     for (pools) |*pool| pool.* = try Pool.init(gpa, constants.connections_max);
-    defer for (pools) |*pool| pool.deinit(gpa);
 
     const threads = try gpa.alloc(std.Thread, worker_count);
-    defer gpa.free(threads);
     for (threads, pools, 0..) |*thread, *pool, cpu| {
-        thread.* = try std.Thread.spawn(.{}, runWorker, .{ address, pool, cpu });
+        thread.* = try std.Thread.spawn(.{}, runWorker, .{ cfg.listen, pool, &router, cpu });
     }
-
-    std.log.info("zoxy echo listening on 0.0.0.0:{d} across {d} worker(s)", .{
-        listen_port,
-        worker_count,
-    });
+    std.log.info("zoxy listening on {f} across {d} worker(s)", .{ cfg.listen, worker_count });
     for (threads) |thread| thread.join();
 }
 
-/// One share-nothing worker: its own IO ring, listener, and pool, pinned to a
-/// core. Runs the accept/echo loop forever.
-fn runWorker(address: Ip4Address, pool: *Pool, cpu: usize) void {
+/// One share-nothing worker: its own IO ring, SO_REUSEPORT listener, and pool,
+/// pinned to a core. Runs the proxy accept/relay loop forever.
+fn runWorker(listen: Ip4Address, pool: *Pool, router: *const Router, cpu: usize) void {
     pinToCpu(cpu);
 
     var io = IO.init(constants.io_ring_entries, 0) catch |err| return logWorkerError("io init", err);
     defer io.deinit();
 
-    var listener = Listener.open(address, constants.accept_backlog) catch |err| return logWorkerError("listen", err);
+    var listener = Listener.open(listen, constants.accept_backlog) catch |err| return logWorkerError("listen", err);
     defer listener.close();
 
-    var server = EchoServer.init(&io, pool, listener);
+    var server = ProxyServer.init(&io, pool, listener, router);
     server.start();
     while (true) io.run_once() catch |err| return logWorkerError("io run", err);
 }
