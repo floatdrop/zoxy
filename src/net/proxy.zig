@@ -27,6 +27,7 @@ const RoundRobin = @import("../proxy/balancer.zig").RoundRobin;
 const Metrics = @import("../obs/metrics.zig").Metrics;
 const access_log = @import("../obs/access_log.zig");
 const AccessLog = access_log.AccessLog;
+const guard = @import("../mem/guard.zig");
 const Ip4Address = std.Io.net.Ip4Address;
 
 const Pool = @import("pool.zig").Pool(ProxyConn);
@@ -653,6 +654,76 @@ test "proxy: a stalled connection is reclaimed by the deadline" {
     try std.testing.expectEqual(pool.capacity - 1, pool.free_count);
     // ...and the deadline must reclaim it; without the timer this would hang.
     while (pool.free_count != pool.capacity) try io.run_once();
+}
+
+test "proxy: the serving path allocates nothing after startup (zero-alloc gate)" {
+    var counting = guard.CountingAllocator{ .backing = std.testing.allocator };
+    const gpa = counting.allocator();
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHELLO";
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    var origin = TestOrigin{ .io = &io, .listener = origin_listener, .response = response };
+    origin.start();
+
+    var json_buf: [256]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
+    , .{origin_listener.boundAddress().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    var server = ProxyServer.init(&io, &pool, proxy_listener, &router, &metrics, &access, constants.connection_timeout_ns);
+    server.start();
+
+    const client = try connectLoopback(proxy_listener.boundAddress().port);
+    defer _ = linux.close(client);
+
+    const Client = struct {
+        io: *IO,
+        fd: posix.socket_t,
+        buf: [512]u8 = undefined,
+        len: usize = 0,
+        done: bool = false,
+        send_c: Completion = undefined,
+        recv_c: Completion = undefined,
+        fn go(c: *@This()) void {
+            c.io.recv(*@This(), c, onRecv, &c.recv_c, c.fd, &c.buf);
+            c.io.send(*@This(), c, onSend, &c.send_c, c.fd, "GET / HTTP/1.1\r\nHost: o\r\n\r\n");
+        }
+        fn onSend(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
+            _ = c;
+        }
+        fn onRecv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
+            c.len = result catch 0;
+            c.done = true;
+        }
+    };
+    var c = Client{ .io = &io, .fd = client };
+    c.go();
+
+    // Snapshot after every startup allocation (config, pool) is done.
+    const baseline = counting.allocationCount();
+
+    try io.run_until_done(&c.done);
+    try std.testing.expectEqualStrings(response, c.buf[0..c.len]);
+    while (pool.free_count != pool.capacity) try io.run_once();
+
+    // The full accept -> parse -> route -> connect -> relay -> log path must not
+    // have touched the allocator.
+    try std.testing.expectEqual(baseline, counting.allocationCount());
 }
 
 fn connectLoopback(port: u16) !posix.socket_t {

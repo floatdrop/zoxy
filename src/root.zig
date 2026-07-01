@@ -46,6 +46,9 @@ pub const Metrics = @import("obs/metrics.zig").Metrics;
 /// Per-worker access log.
 pub const AccessLog = @import("obs/access_log.zig").AccessLog;
 
+/// Allocation guard for the zero-alloc acceptance gate (docs/DESIGN.md §4).
+pub const guard = @import("mem/guard.zig");
+
 test "basic add functionality" {
     try std.testing.expect(add(3, 7) == 10);
 }
@@ -62,4 +65,5 @@ test {
     _ = proxy;
     _ = @import("obs/metrics.zig");
     _ = @import("obs/access_log.zig");
+    _ = guard;
 }
