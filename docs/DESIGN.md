@@ -1,0 +1,364 @@
+# zoxy — zero-allocation edge proxy (design)
+
+An L7 edge/mesh proxy in the spirit of Envoy/Linkerd, written in Zig 0.16, with a
+hard constraint: **all memory is reserved at startup; nothing allocates on the
+hot path.** Steady-state operation issues zero heap allocations and zero
+allocating syscalls.
+
+> Status: design/plan. Nothing here is built yet. Every Zig-0.16 API name below
+> was gathered from release notes + `master` std (0.16 is barely tagged) and
+> must be verified against the pinned toolchain before coding.
+
+---
+
+## 1. Guiding decisions (lock these early — expensive to retrofit)
+
+1. **Share-nothing, thread-per-core.** N worker threads = CPU cores. Each owns
+   its own listener (`SO_REUSEPORT`), its own event loop, its own memory pools.
+   A connection is **pinned to its accepting worker for its whole life**. No
+   shared mutable state on the data path → no locks in steady state. (Envoy and
+   NGINX both do this.)
+2. **io_uring via caller-owned completion callbacks** (TigerBeetle's `IO` /
+   `Completion` pattern) directly on `std.os.linux.IoUring` — **not** fibers and
+   **not** the new `std.Io` async executor (see §3, §I/O). Each `Completion` is
+   embedded inline in the owning connection → zero per-operation allocation.
+3. **Zero-alloc is structural, not incidental.** Fixed `Connection` pool sized to
+   `max_connections`; per-connection buffers carved from a startup slab;
+   provided-buffer rings for recv. Exhaustion → **reject/backpressure, never
+   allocate**. A `FailingAllocator` guards the hot path in debug/test builds.
+4. **Backpressure from day one.** Watermark buffers with ref-counted
+   read-disable, coupling downstream-read to upstream-write. Retrofitting flow
+   control into a proxy is painful; it also *is* the zero-alloc story (bounded
+   buffers push flow control down to TCP).
+5. **A filter/middleware seam early.** An Envoy-style filter chain (or Tower-style
+   Service/Layer) so routing, auth, retries, timeouts compose cleanly.
+6. **TigerStyle governs the code.** See `docs/TIGER_STYLE.md`: static allocation,
+   a limit on everything, ≥2 assertions/function, ≤70-line functions, no
+   recursion, callbacks-not-coroutines, all errors handled. This is not
+   cosmetic — the callback I/O model (below) exists partly *because* TigerStyle
+   requires functions to run to completion without suspending so assertions hold.
+
+---
+
+## I/O architecture — the Completion-callback model
+
+We copy TigerBeetle's `IO`/`Completion` design (the origin of Zig's own
+`std.os.linux.IoUring`). It is the proven zero-alloc answer to "async over
+io_uring", and it resolves the fiber-vs-manual-loop dilemma from §3.
+
+- **Caller-owned `Completion`, embedded inline.** Each connection statically owns
+  its `recv_completion`, `send_completion`, `timeout_completion` fields. Submit
+  calls write the op in place — `completion.* = .{ … }` — and never allocate. The
+  io_uring `user_data` *is* the `*Completion`; the callback recovers the owning
+  connection with `@fieldParentPtr`.
+
+  ```zig
+  io.recv(*Connection, conn, Connection.on_recv, &conn.recv_completion, conn.fd, conn.read_buf);
+  // on_recv(conn: *Connection, c: *Completion, result: RecvError!usize) void { … }
+  ```
+- **Type-erase the generic callback once** (TB's `erase_types`) so the ring stores
+  a single `*anyopaque` context + opaque fn-ptr. `Context` must be a pointer.
+- **Completions never run inline.** Drained CQEs are pushed onto an intrusive
+  `completed` FIFO and run one-per-`run_callback` — bounds stack usage, keeps
+  traces clean, and lets a callback safely enqueue more work.
+- **Drive with `run_for_ns(deadline)`**: skip kernel-blocking while callbacks are
+  pending (they may enqueue more), else block until the next event/deadline.
+  `next_tick` schedules a deferred callback with no kernel I/O (timers, retries).
+- **Concurrency is bounded by a fixed `Completion` pool, not the ring.** You can
+  never start more ops than you pre-allocated Completions/buffers at startup →
+  the ring can't be overrun by app logic; pool exhaustion is the backpressure
+  signal. Handle SQ-full defensively (flush + retry). Batch CQE reaping (≤256 at
+  a time, like TB).
+- **Swappable `IO` interface → deterministic testing later.** Because the data
+  path talks to an `IO` interface, we can drop in a seeded mock `IO` and run a
+  deterministic simulator (TigerBeetle's VOPR approach). Design for this now even
+  if we build it in a later phase.
+- **Kernel floor: Linux ≥ 5.11** if we adopt the `IORING_ENTER_EXT_ARG` timeout
+  trick (pass the loop deadline into `io_uring_enter`, no separate timeout SQE).
+
+### Start plain; optimize later (verified against TB `src/io/linux.zig`)
+TigerBeetle itself uses **plain `prep_recv`/`prep_send`/`prep_read`/`prep_write`**
+— **no** registered/fixed buffers, **no** buffer rings, **no** `send_zc`, **no**
+`splice`, **no** multishot. So those are **Phase-later optimizations**, not
+foundations. Ship the plain path first, measure, then reach for registered
+buffers / `splice` on the relay fast path only if the envelope says it pays.
+
+---
+
+## 2. Concurrency & I/O model
+
+Each core runs **its own single-threaded TigerBeetle-style callback loop** —
+own `IO`, own `Completion`/buffer/connection pools, share-nothing. This is
+TB's single-threaded determinism model *replicated per core*, which is also the
+Envoy/NGINX thread-per-core model. No locks on the data path.
+
+```
+                per core (thread-per-core, share-nothing)
+  ┌─────────────────────────────────────────────────────────────┐
+  │  SO_REUSEPORT listen fd  ──io.accept──►  single-threaded loop │
+  │                                                               │
+  │  io.recv ─► parse ─► route ─► io.connect/io.send (upstream)   │
+  │   (Completion embedded in Connection)   │                     │
+  │   callbacks drained one-by-one from     └─ per-core H1 pool   │
+  │   an intrusive `completed` FIFO                               │
+  └─────────────────────────────────────────────────────────────┘
+     × getCpuCount(), each pinned via sched_setaffinity (Linux)
+```
+
+Baseline (what we build first — matches TB's actual backend):
+
+- **Accept:** each worker binds its *own* listen fd with `SO_REUSEPORT` set
+  **before** `bind` (via `std.posix`, since `std.net.Server` doesn't expose it),
+  then `io.accept(&accept_completion, …)`, re-arming in the callback. Kernel
+  load-balances across workers.
+- **Read/write:** plain `io.recv`/`io.send`/`io.read`/`io.write` into the
+  connection's fixed buffers. Each op uses the connection's inline `Completion`.
+- **Kernel floor:** Linux ≥ 5.11 (`IORING_ENTER_EXT_ARG` timeout trick).
+
+Deferred optimizations (only if the envelope justifies — TB does **not** use
+these; add behind measurement):
+
+- `accept_multishot` / `recv_multishot` + provided **buffer rings**
+  (`setup_buf_ring`, `BufferGroup`) — kernel-picked buffers, fewer re-arms
+  (≥ 5.19).
+- `send_zc` (zero-copy send) and **`splice`** (fd→pipe→fd) for the pure L4 relay
+  fast path (≥ 6.0).
+- `register_buffers` + `read_fixed`/`write_fixed`, `register_files_sparse` for
+  direct descriptors. Feature-probe with `get_probe()` / `ring.features`.
+
+### Portability seam — comptime, not a runtime `Reactor`
+The `IO` type **is** the seam (TigerBeetle pattern); there is **no** separate
+`Reactor` interface or vtable. `io/io.zig` selects the backend at comptime —
+`switch (builtin.target.os.tag) { .linux => @import("linux.zig"), .macos =>
+@import("darwin.zig"), … }` — and every backend exposes the same method set
+structurally (no interface file, no runtime dispatch, fully inlined). Linux =
+`std.os.linux.IoUring`; macOS/BSD dev = a kqueue backend.
+
+- **Test substitution is also comptime:** make hot-path structs generic over the
+  `IO` type so the deterministic simulator can pass `io/test_io.zig` (mock IO).
+- **No runtime backend fallback.** Hard-require io_uring (Linux ≥ 5.11). If a
+  runtime `--io-backend` fallback (e.g. epoll on old kernels) ever becomes a real
+  requirement, add a *localized* vtable at the loop boundary then — not
+  preemptively.
+- We do **not** depend on libxev or `std.Io.Evented`; the TB-style `IO` layer
+  replaces both. (libxev remains a reference for zero-alloc proactor design.)
+
+---
+
+## 3. What NOT to build on (traps confirmed by research)
+
+- **`std.Io.Threaded`** (the only complete `std.Io` backend) is
+  **thread-per-task and allocates per task** — ~10k sleeping tasks ≈ 20s, ~50k
+  hits OS thread limits. Not a many-connection core.
+- **The evented executor (`std.Io.Uring` / `std.Io.Kqueue`) has stubbed
+  networking in 0.16.0 — verified against the pinned toolchain.** In
+  `lib/std/Io/Uring.zig` the `Io` vtable wires `netListenIp`/`netAccept`/
+  `netConnectIp`/`netListenUnix`/`netConnectUnix`/`netSend` to `*Unavailable`
+  stubs that `return error.NetworkDown` (or `AddressFamilyUnsupported`). `bind`,
+  `socket`, `getsockname` and all file/process ops are real, but **you cannot
+  accept or dial a TCP connection through it today.** Don't build the data path
+  on it yet. Worth tracking: its design is good (see below).
+- The evented executor's *design* is promising once net ops land: `init` takes
+  an **injectable `backing_allocator`**; fibers are **pooled on a per-thread
+  `free_queue`** (cross-thread work-stealing), `destroy` recycles rather than
+  frees, and `create` only allocates on a new concurrency high-water-mark → after
+  warmup, **steady state is zero-alloc**; pool exhaustion = natural backpressure.
+  Two frictions with our thesis: (a) each fiber reserves **`min_stack_size =
+  60 MiB` virtual** stack (mmap/lazy-commit) → must back it with `page_allocator`
+  or a capped mmap-slab, **not** a flat `FixedBufferAllocator`; high fan-out means
+  large virtual reservations (watch `vm.max_map_count`/overcommit). (b) It is a
+  **work-stealing scheduler** (fibers migrate cores) which conflicts with our
+  share-nothing per-core pinning, and the `Io` interface **hides the ring** so
+  `send_zc`/`splice`/registered-buffers/buffer-rings aren't reachable through it.
+  → Plan: write handlers *colorless* against the `Io` interface but run them on a
+  working backend now (manual io_uring, or `zio` — Lalinský's drop-in `std.Io`
+  io_uring backend); swap to `std.Io.Uring` when its net ops land. Keep manual
+  io_uring for the zero-copy data path if that control is load-bearing.
+- **`std.Thread.Pool.spawn`** allocates a closure per task → never call it
+  per-connection. Spawn workers **once**, run per-worker loops.
+- **`std.Io.Reader` erases `error.WouldBlock` → `error.ReadFailed`**
+  ([ziglang/zig#25047]). On non-blocking sockets, do the socket-edge reads with
+  **`std.posix.recv`/`read` directly**, then feed the fixed buffer into a
+  `std.Io.Reader` for *parsing* only.
+- **TLS termination is impossible in std.** `std.crypto.tls` is **client-only**
+  (no `tls.Server`, tracking issue [#14171] unstarted; no private-key/PEM
+  loading). → TLS termination needs C FFI (see §6).
+
+---
+
+## 4. Memory architecture (the zero-alloc core)
+
+Everything below is allocated **once** at startup from a general allocator, then
+the general allocator is put away.
+
+```
+Startup budget (asserted at init):
+  max_connections * (sizeof(Connection)
+                     + read_buf_bytes + write_buf_bytes)
+  + buffer_ring_bytes
+  + route_table + cluster_table + endpoint_tables
+  + config double-buffer
+```
+
+- **Connection pool:** `MemoryPoolExtra(Connection, .{ .growable = false })`
+  preheated to `max_connections`, **or** a flat `[max_connections]Connection`
+  slab + an intrusive free list (`std.SinglyLinkedList`, node embedded in
+  `Connection`, recovered via `@fieldParentPtr`). `create()` → `OutOfMemory`
+  ⇒ **close the new socket** (backpressure), never grow.
+- **Per-connection buffers:** one contiguous slab `max_connections * buf_size`;
+  each connection's read/write windows are slices indexed by slot (better
+  locality, single allocation). Buffers live in **static/heap-slab storage, never
+  as function-local arrays** (large `[N]u8` locals blow the thread stack).
+- **Ring/FIFO:** per-direction linear buffer with memmove-compaction (a linear
+  buffer keeps zero-copy header slices contiguous; a byte-ring breaks that).
+- **Scratch per request:** `ArenaAllocator` over a `FixedBufferAllocator` over a
+  fixed slab; `arena.reset(.retain_capacity)` between requests — zero-cost reuse,
+  can never exceed its FBA budget.
+- **Tables:** `StaticStringMap` for comptime-fixed routes; for runtime-but-bounded
+  tables, `*Unmanaged` hash maps with `ensureTotalCapacity(max)` at startup, then
+  **only** `putAssumeCapacity` (any growth = rehash = allocation → forbidden).
+- **Cross-thread work** (rare): hand-rolled SPSC ring (`[N]T` power-of-two +
+  atomic head/tail, acquire/release) or intrusive MPSC; nodes live in the items.
+- **Config reload:** build a new immutable `Config` off the hot path, publish via
+  `@atomicStore(*const Config, .release)`; readers `@atomicLoad(.acquire)`.
+  RCU-style, lock-free; reclaim old config after a grace period. (Envoy's
+  thread-local-slot swap; NGINX's fork-new-workers.)
+- **The guard:** wrap the hot-path allocator in `std.testing.FailingAllocator`
+  (`fail_index = 0`) in tests; run the whole request path under it. Any
+  accidental allocation becomes a hard, testable failure.
+
+Hidden-allocation watchlist: `std.http.Client` (allocates — use the *Server*
+side only), `std.crypto.tls` record buffers, `std.fmt`/`std.json` string
+building (use `bufPrint`, not `allocPrint`), any `HashMap.put` that rehashes.
+
+---
+
+## 5. Data path (HTTP/1.1 first)
+
+```
+accept → recv (provided buffer) → parse req line + headers (zero-copy slices)
+       → route (host + path prefix → cluster)
+       → LB pick endpoint → per-worker H1 conn pool (no pipelining)
+       → forward headers+body → stream response back (encoder reverse order)
+       ↕ watermark backpressure couples both directions
+```
+
+- **Parser:** either `std.http.Server` (transport-agnostic, **no allocator**;
+  `Head` fields are slices into the caller's reader buffer — genuinely zero-alloc
+  after setup) **or** a custom picohttpparser/swerver-style parser (linear
+  buffer, bounded inline `[max_headers]Header` array, memmove refill, separate
+  chunked state machine). Start with `std.http.Server`; drop to custom only if we
+  need pipelining, smuggling hardening, or exotic framing. Reference:
+  `justinGrosvenor/swerver` (explicit zero-heap, Zig 0.16),
+  `karlseguin/http.zig` (production-proven allocation pattern).
+- **Header limits:** `max_head_len` fits the fixed buffer; oversize → **431**.
+  Bounded `max_headers`; overflow → reject, don't grow.
+- **Lifetime rule:** header slices are valid only while the buffer is unmodified
+  → any thread hand-off requires a copy (we avoid hand-off: connection-pinned).
+
+---
+
+## 6. TLS (Phase 2 — deferred, needs FFI)
+
+std cannot terminate TLS. Options, ranked by our constraints:
+
+| Path | Alloc control | Server maturity | Notes |
+|------|---------------|-----------------|-------|
+| **OpenSSL** FFI | ✅ `CRYPTO_set_mem_functions` (global alloc hook) | mature | best allocation control; `allyourcodebase/openssl` builds on 0.16 |
+| **BoringSSL** FFI | ❌ (upstream refuses hook) | mature | Bun-grade lean fixed-alloc path; memory-BIO sans-io |
+| **ianic/tls.zig** | pure Zig | TLS 1.3 server exists | most mature pure-Zig termination; vet maturity |
+| `rustls-ffi` | ❌ global Rust alloc | experimental server | best sans-io ergonomics; extra cargo dep |
+
+All are **sans-io**: shuttle ciphertext through in-memory buffers (BIO pairs /
+`read_tls`+`write_tls`), which maps cleanly onto io_uring registered buffers.
+**Lean toward OpenSSL FFI** for the allocator hook. SNI selects cert (from
+ClientHello), ALPN negotiates `h2`/`http/1.1`. **MVP runs plaintext** (or a TLS
+terminator in front).
+
+HTTP/2 & HTTP/3: nothing usable in pure Zig. H2 → `nghttp2` FFI when needed;
+H3/QUIC → `quiche`/`ngtcp2`. Pure-Zig H3 is blocked on QUIC-aware TLS 1.3.
+
+---
+
+## 7. Phased build plan
+
+### Phase 0 — Minimal viable proxy
+- Thread-per-core + `SO_REUSEPORT`, per-worker `io_uring` loop, connection-pinned.
+- Static config file: one listener, inline route (host `*` + path prefix →
+  cluster), one STATIC cluster with inline endpoints, round-robin LB.
+- HTTP/1.1: accept → parse → route → per-worker H1 pool → forward → stream back.
+- **Watermark backpressure + ref-counted read-disable** (day one).
+- Timeouts: connect, per-request, idle.
+- Counters (requests, active conns, upstream failures) + access log on a
+  dedicated flusher thread (off the data path).
+- **Zero-alloc harness:** whole request path runs green under `FailingAllocator`.
+
+### Phase 1 — Resilience
+- P2C weighted-least-request LB; active health checks + passive outlier
+  detection; circuit breaking (max conns/pending/requests); retries with
+  fully-jittered exponential backoff + retry budget; per-try timeout.
+
+### Phase 2 — Protocol depth
+- TLS termination (OpenSSL FFI: SNI cert select + ALPN), then upstream
+  re-encryption.
+- HTTP/2 downstream+upstream: per-stream state machines, **dual-level flow
+  control** (stream + connection windows) wired into the existing watermark
+  system, HPACK decode/re-encode, H2 pool with multiplexing + GOAWAY draining.
+
+### Phase 3 — Operability
+- Graceful drain + hot restart (FD passing over a unix socket, à la HAProxy
+  `SCM_RIGHTS`; drain via `Connection: close` / GOAWAY; transfer stats).
+- Consistent-hash LB (ring-hash / Maglev). Distributed tracing (B3/W3C
+  propagation) + Prometheus metrics.
+
+### Phase 4 — Dynamic config
+- xDS-style streaming client (CDS→EDS→LDS→RDS make-before-break ordering) or a
+  simpler custom control-plane protocol. Apply via RCU pointer swap so the data
+  path stays lock-free.
+
+---
+
+## 8. Proposed module layout
+
+```
+src/
+  main.zig            entry: parse config, size budget, spawn workers
+  config.zig          static config model + file parser; immutable Config
+  io/
+    io.zig            comptime-selected IO backend + Completion (TB pattern)
+    linux.zig         io_uring backend on std.os.linux.IoUring
+    darwin.zig        kqueue backend (dev on macOS/BSD)
+    test_io.zig       deterministic seeded mock IO (for the simulator)
+  net/
+    listener.zig      SO_REUSEPORT socket setup (std.posix)
+    connection.zig    Connection struct, pooled, buffer slices, state machine
+    pool.zig          fixed Connection pool + intrusive free list
+    watermark.zig     bounded buffers + ref-counted read-disable
+  http/
+    h1.zig            HTTP/1.1 parse/serialize (std.http.Server or custom)
+    request.zig       zero-copy Head/Header views
+  proxy/
+    router.zig        host/path → cluster (StaticStringMap / bounded map)
+    cluster.zig       cluster + endpoint tables
+    balancer.zig      RR → P2C EWMA
+    upstream_pool.zig per-worker/cluster H1 connection pool
+    resilience.zig    health checks, outlier detection, circuit breaker, retries
+  obs/
+    metrics.zig       fixed counter/gauge/histogram registry
+    access_log.zig    ring → flusher thread
+  mem/
+    slab.zig          startup slab + buffer carving
+    guard.zig         FailingAllocator hot-path guard (debug/test)
+```
+
+---
+
+## 9. Key references
+
+- Zig: [0.16 release notes], [0.15.1 "Writergate"], `std.os.linux.IoUring`,
+  [ziglang/zig#25047] (WouldBlock erasure), [#14171] (no TLS server).
+- libxev (mitchellh), `justinGrosvenor/swerver`, `karlseguin/http.zig`,
+  `ianic/tls.zig`, `tardy-org/zzz`.
+- Envoy: life_of_a_request, threading_model, flow_control.md, connection_pooling.
+- Linkerd2-proxy: under-the-hood, protocol-detection, P2C+peak-EWMA.
+- TigerBeetle: "A Database Without Dynamic Memory" (static-allocation discipline).
