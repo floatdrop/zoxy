@@ -45,3 +45,9 @@ jobs:
 
       - name: Run tests
         run: nix develop --command zig build test --summary all
+
+      # Deterministic simulation: the real data path on the simulation IO
+      # backend under seeded adversarial schedules. Fixed seed range so any
+      # failure reproduces locally with `zig build sim -- <seed> 1`.
+      - name: Run simulator (seeds 0..300)
+        run: nix develop --command zig build sim -- 0 300

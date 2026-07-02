@@ -40,4 +40,20 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // The deterministic simulator: the real data path on the simulation IO
+    // backend (src/sim.zig declares `zoxy_io = .simulation`). Debug/safe
+    // builds only make sense here — the asserts are the test oracle.
+    const sim_exe = b.addExecutable(.{
+        .name = "sim",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_sim = b.addRunArtifact(sim_exe);
+    if (b.args) |args| run_sim.addArgs(args);
+    const sim_step = b.step("sim", "Run the deterministic simulator (args: [seed] [iterations])");
+    sim_step.dependOn(&run_sim.step);
 }

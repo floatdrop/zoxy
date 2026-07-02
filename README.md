@@ -38,8 +38,14 @@ With Nix (recommended):
 nix develop            # zig 0.16, zls, kcov
 zig build              # build zig-out/bin/zoxy
 zig build test         # run the test suite
+zig build sim -- 0 500 # deterministic simulator: [seed] [iterations]
 zig build run          # run using ./zoxy.json
 ```
+
+The simulator runs the real data path against a deterministic IO backend —
+virtual sockets, a virtual clock, seeded adversarial schedules with partial
+reads/writes and misbehaving origins. A failure prints its seed;
+`zig build sim -- <seed> 1` replays the exact schedule.
 
 Or point it at a config file:
 

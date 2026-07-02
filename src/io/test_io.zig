@@ -153,7 +153,10 @@ const Socket = struct {
     read_shutdown: bool = false,
     write_shutdown: bool = false,
 
-    const State = enum { free, listener, stream };
+    /// `.closed` keeps the stream's flags alive: like io_uring (where ops
+    /// hold a file reference), ops pending at close time still complete if a
+    /// shutdown woke them — and still hang if it did not.
+    const State = enum { free, listener, stream, closed };
 };
 
 pub const IO = struct {
@@ -224,18 +227,26 @@ pub const IO = struct {
         if (socket.peer_fd >= 0) io.socket_at(socket.peer_fd).remote_closed = true;
     }
 
-    /// Frees the fd and FINs the peer. Ops already pending on the fd are NOT
-    /// completed — exactly like an io_uring close — so a missing shutdown
-    /// becomes a detectable hang.
+    /// Closes the fd and FINs the peer. Ops already pending on the fd are
+    /// NOT woken by the close itself — exactly like an io_uring close — so a
+    /// missing shutdown becomes a detectable hang; ops a *prior* shutdown
+    /// woke still complete (in-flight io_uring ops hold a file reference, so
+    /// close ordering must not strand them).
     pub fn close_now(io: *IO, fd: posix.socket_t) void {
         const socket = io.socket_at(fd);
         assert(socket.state != .free); // double close
-        if (socket.state == .stream and socket.peer_fd >= 0) {
+        assert(socket.state != .closed); // double close
+        if (socket.state == .listener) {
+            socket.* = .{ .state = .free };
+            return;
+        }
+        if (socket.peer_fd >= 0) {
             const peer = io.socket_at(socket.peer_fd);
             peer.remote_closed = true;
             peer.peer_fd = -1; // writes there now fail
         }
-        socket.* = .{ .state = .free };
+        socket.state = .closed; // flags stay; the slot is never reused
+        socket.peer_fd = -1;
     }
 
     // ---- submission (same shape as the io_uring backend) -------------------
@@ -346,12 +357,26 @@ pub const IO = struct {
         operation: Operation,
     ) void {
         comptime assert(@typeInfo(Context) == .pointer);
+        // Re-submitting a completion that is still in flight silently
+        // truncates intrusive queues (and corrupts a real ring the same
+        // way) — catch the guilty call site loudly instead.
+        assert(!io.in_queue(&io.pending, completion));
+        assert(!io.in_queue(&io.completed, completion));
         completion.* = .{
             .operation = operation,
             .context = @ptrCast(context),
             .callback = erase(Context, Result, callback),
         };
         io.pending.push(completion);
+    }
+
+    fn in_queue(io: *IO, queue: *const CompletionQueue, completion: *const Completion) bool {
+        _ = io;
+        var current = queue.head;
+        while (current) |node| : (current = node.next) {
+            if (node == completion) return true;
+        }
+        return false;
     }
 
     // ---- the deterministic scheduler ---------------------------------------
@@ -418,12 +443,12 @@ pub const IO = struct {
             },
             .recv => |op| {
                 const socket = io.socket_at(op.socket);
-                if (socket.state != .stream) return false; // closed under the op: hangs
+                if (socket.state != .stream and socket.state != .closed) return false;
                 return socket.buffer_len > 0 or socket.remote_closed or socket.read_shutdown;
             },
             .send => |op| {
                 const socket = io.socket_at(op.socket);
-                if (socket.state != .stream) return false; // closed under the op: hangs
+                if (socket.state != .stream and socket.state != .closed) return false;
                 if (socket.write_shutdown or socket.peer_fd < 0) return true; // fails now
                 const peer = io.socket_at(socket.peer_fd);
                 return peer.buffer_len < peer.buffer.len; // room to make progress
@@ -467,7 +492,7 @@ pub const IO = struct {
 
     fn perform_recv(io: *IO, fd: posix.socket_t, buffer: []u8) i32 {
         const socket = io.socket_at(fd);
-        assert(socket.state == .stream);
+        assert(socket.state == .stream or socket.state == .closed);
         if (socket.buffer_len == 0) {
             assert(socket.remote_closed or socket.read_shutdown);
             return 0; // EOF
@@ -487,7 +512,7 @@ pub const IO = struct {
 
     fn perform_send(io: *IO, fd: posix.socket_t, buffer: []const u8) i32 {
         const socket = io.socket_at(fd);
-        assert(socket.state == .stream);
+        assert(socket.state == .stream or socket.state == .closed);
         if (socket.write_shutdown) return -@as(i32, @intFromEnum(linux.E.PIPE));
         if (socket.peer_fd < 0) return -@as(i32, @intFromEnum(linux.E.PIPE));
         const peer = io.socket_at(socket.peer_fd);
@@ -541,6 +566,46 @@ pub const IO = struct {
             return 0;
         }
         return -@as(i32, @intFromEnum(linux.E.NOENT)); // nothing to cancel
+    }
+
+    /// Diagnostic: what is pending and why it is not ready.
+    pub fn dump_pending(io: *IO) void {
+        var current = io.pending.head;
+        while (current) |completion| : (current = completion.next) {
+            switch (completion.operation) {
+                .accept => |op| std.debug.print("  pending accept fd={d}\n", .{op.socket}),
+                .recv => |op| {
+                    const socket = io.socket_at(op.socket);
+                    std.debug.print(
+                        "  pending recv fd={d} state={s} buffered={d} remote_closed={} " ++
+                            "read_shutdown={}\n",
+                        .{
+                            op.socket,            @tagName(socket.state), socket.buffer_len,
+                            socket.remote_closed, socket.read_shutdown,
+                        },
+                    );
+                },
+                .send => |op| {
+                    const socket = io.socket_at(op.socket);
+                    std.debug.print(
+                        "  pending send fd={d} state={s} peer={d} write_shutdown={}\n",
+                        .{
+                            op.socket,
+                            @tagName(socket.state),
+                            socket.peer_fd,
+                            socket.write_shutdown,
+                        },
+                    );
+                },
+                .connect => |op| std.debug.print("  pending connect fd={d}\n", .{op.socket}),
+                .close => |op| std.debug.print("  pending close fd={d}\n", .{op.fd}),
+                .timeout => |op| std.debug.print(
+                    "  pending timeout expires_at={d} now={d}\n",
+                    .{ op.expires_at_ns, io.now },
+                ),
+                .cancel => std.debug.print("  pending cancel\n", .{}),
+            }
+        }
     }
 
     // ---- result delivery (mirrors the io_uring backend) ---------------------
@@ -668,6 +733,7 @@ const TestPeer = struct {
     received: usize = 0,
     sent: usize = 0,
     message: []const u8 = "",
+    fin_after_send: bool = true,
     eof: bool = false,
     accept_c: Completion = undefined,
     recv_c: Completion = undefined,
@@ -701,7 +767,7 @@ const TestPeer = struct {
     fn on_send(peer: *TestPeer, _: *Completion, result: SendError!usize) void {
         peer.sent += result catch unreachable;
         if (peer.sent < peer.message.len) return peer.arm_send();
-        peer.io.shutdown_socket(peer.fd); // FIN: the receiver sees EOF
+        if (peer.fin_after_send) peer.io.shutdown_socket(peer.fd); // FIN: receiver sees EOF
     }
 };
 
@@ -745,7 +811,8 @@ test "test_io: close without shutdown leaves a pending recv hanging" {
     var server = TestPeer{ .io = &io };
     io.accept(*TestPeer, &server, TestPeer.on_accept, &server.accept_c, listener);
 
-    var client = TestPeer{ .io = &io, .message = "x" };
+    // The client never FINs, so nothing external will wake the server's recv.
+    var client = TestPeer{ .io = &io, .message = "x", .fin_after_send = false };
     client.fd = io.open_tcp_socket().?;
     io.connect(*TestPeer, &client, TestPeer.on_connect, &client.connect_c, client.fd, .{
         .family = linux.AF.INET,
@@ -755,8 +822,8 @@ test "test_io: close without shutdown leaves a pending recv hanging" {
     while (server.received < 1) try io.run_once();
 
     // The server arms another recv, then closes its own fd without shutdown:
-    // that recv can never complete — io_uring semantics — and with no timers
-    // the loop reports the deadlock instead of spinning.
+    // the close does not complete that recv — io_uring semantics — and with
+    // no timers the loop reports the deadlock instead of spinning.
     io.close_now(server.fd);
     try std.testing.expectError(error.WouldBlockForever, io.run_once());
 }
