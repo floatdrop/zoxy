@@ -33,14 +33,28 @@ pub const Request = struct {
 
     /// Case-insensitive header lookup; returns the first match.
     pub fn header(request: *const Request, name: []const u8) ?[]const u8 {
-        for (request.headers) |h| {
-            if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
-        }
-        return null;
+        return findHeader(request.headers, name);
     }
 
     pub fn host(request: *const Request) ?[]const u8 {
         return request.header("host");
+    }
+};
+
+/// A parsed response head. All slices point into the input buffer and are
+/// valid only while that buffer is unmodified. The reason phrase is ignored.
+pub const Response = struct {
+    status: u16,
+    /// Minor version: 0 for HTTP/1.0, 1 for HTTP/1.1.
+    version_minor: u8,
+    headers: []const Header,
+    /// Bytes consumed by the head, including the terminating CRLF CRLF. The
+    /// body (if any) begins at `input[head_len..]`.
+    head_len: usize,
+
+    /// Case-insensitive header lookup; returns the first match.
+    pub fn header(response: *const Response, name: []const u8) ?[]const u8 {
+        return findHeader(response.headers, name);
     }
 };
 
@@ -59,6 +73,12 @@ pub const Parsed = union(enum) {
     incomplete,
 };
 
+pub const ParsedResponse = union(enum) {
+    complete: Response,
+    /// The head is not yet fully present; read more and parse again.
+    incomplete,
+};
+
 /// Parse a request head out of `input`, filling `headers` with header lines.
 pub fn parse(input: []const u8, headers: []Header) ParseError!Parsed {
     assert(headers.len > 0);
@@ -67,17 +87,7 @@ pub fn parse(input: []const u8, headers: []Header) ParseError!Parsed {
     const request_line = readLine(input, &pos) orelse return .incomplete;
     const line = try parseRequestLine(request_line);
 
-    var count: usize = 0;
-    while (true) {
-        const line_start = pos;
-        const header_line = readLine(input, &pos) orelse return .incomplete;
-        if (header_line.len == 0) break; // blank line terminates the head
-        if (count == headers.len) return error.TooManyHeaders;
-        headers[count] = try parseHeader(header_line);
-        headers[count].line = input[line_start..pos];
-        count += 1;
-    }
-
+    const count = (try readHeaders(input, &pos, headers)) orelse return .incomplete;
     assert(count <= headers.len);
     assert(pos <= input.len);
     return .{ .complete = .{
@@ -88,6 +98,48 @@ pub fn parse(input: []const u8, headers: []Header) ParseError!Parsed {
         .headers = headers[0..count],
         .head_len = pos,
     } };
+}
+
+/// Parse a response head out of `input`, filling `headers` with header lines.
+pub fn parseResponse(input: []const u8, headers: []Header) ParseError!ParsedResponse {
+    assert(headers.len > 0);
+    var pos: usize = 0;
+
+    const status_line = readLine(input, &pos) orelse return .incomplete;
+    const line = try parseStatusLine(status_line);
+
+    const count = (try readHeaders(input, &pos, headers)) orelse return .incomplete;
+    assert(count <= headers.len);
+    assert(pos <= input.len);
+    return .{ .complete = .{
+        .status = line.status,
+        .version_minor = line.version_minor,
+        .headers = headers[0..count],
+        .head_len = pos,
+    } };
+}
+
+/// Read header lines up to and including the blank line, returning how many
+/// were stored. Null means the head is not yet complete.
+fn readHeaders(input: []const u8, pos: *usize, headers: []Header) ParseError!?usize {
+    var count: usize = 0;
+    while (true) {
+        const line_start = pos.*;
+        const header_line = readLine(input, pos) orelse return null;
+        if (header_line.len == 0) return count; // blank line terminates the head
+        if (count == headers.len) return error.TooManyHeaders;
+        headers[count] = try parseHeader(header_line);
+        headers[count].line = input[line_start..pos.*];
+        count += 1;
+    }
+}
+
+/// Case-insensitive lookup over parsed headers; returns the first match.
+fn findHeader(headers: []const Header, name: []const u8) ?[]const u8 {
+    for (headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+    }
+    return null;
 }
 
 const RequestLine = struct {
@@ -115,6 +167,30 @@ fn parseRequestLine(line: []const u8) ParseError!RequestLine {
         .target = target,
         .version_minor = try parseVersion(after_method[sp2 + 1 ..]),
     };
+}
+
+const StatusLine = struct {
+    status: u16,
+    version_minor: u8,
+};
+
+/// Parse "HTTP/1.x NNN[ reason]". The reason phrase may be absent (some
+/// servers send none) and is ignored either way.
+fn parseStatusLine(line: []const u8) ParseError!StatusLine {
+    const version_len = "HTTP/1.1".len;
+    if (line.len < version_len + 4) return error.Malformed; // SP + three digits
+    const version_minor = try parseVersion(line[0..version_len]);
+    if (line[version_len] != ' ') return error.Malformed;
+    var status: u16 = 0;
+    for (line[version_len + 1 ..][0..3]) |c| {
+        if (c < '0' or c > '9') return error.Malformed;
+        status = status * 10 + (c - '0');
+    }
+    if (status < 100) return error.Malformed;
+    assert(status <= 999); // three digits
+    // Anything after the code must be a space-separated reason phrase.
+    if (line.len > version_len + 4 and line[version_len + 4] != ' ') return error.Malformed;
+    return .{ .status = status, .version_minor = version_minor };
 }
 
 fn parseVersion(version: []const u8) ParseError!u8 {
@@ -300,6 +376,47 @@ test "h1: rejects unsupported versions" {
     try std.testing.expectEqual(
         @as(u8, 0),
         (try parse("GET / HTTP/1.0\r\n\r\n", &headers)).complete.version_minor,
+    );
+}
+
+test "h1: parses a complete response head" {
+    var headers: [8]Header = undefined;
+    const raw = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHELLO";
+    const response = (try parseResponse(raw, &headers)).complete;
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try std.testing.expectEqual(@as(u8, 1), response.version_minor);
+    try std.testing.expectEqualStrings("5", response.header("content-length").?);
+    try std.testing.expectEqualStrings("HELLO", raw[response.head_len..]);
+}
+
+test "h1: response reason phrase is optional and may contain spaces" {
+    var headers: [4]Header = undefined;
+    const no_reason = (try parseResponse("HTTP/1.1 204\r\n\r\n", &headers)).complete;
+    try std.testing.expectEqual(@as(u16, 204), no_reason.status);
+    const spaced = (try parseResponse("HTTP/1.0 404 Not Found\r\n\r\n", &headers)).complete;
+    try std.testing.expectEqual(@as(u16, 404), spaced.status);
+    try std.testing.expectEqual(@as(u8, 0), spaced.version_minor);
+}
+
+test "h1: incomplete response asks for more" {
+    var headers: [4]Header = undefined;
+    try std.testing.expectEqual(
+        ParsedResponse.incomplete,
+        try parseResponse("HTTP/1.1 200 OK\r\nA: b\r\n", &headers),
+    );
+    try std.testing.expectEqual(ParsedResponse.incomplete, try parseResponse("HTTP/1.", &headers));
+}
+
+test "h1: rejects malformed and unsupported responses" {
+    var headers: [4]Header = undefined;
+    try std.testing.expectError(error.Malformed, parseResponse("HTTP/1.1 20\r\n\r\n", &headers));
+    try std.testing.expectError(error.Malformed, parseResponse("HTTP/1.1 2x0\r\n\r\n", &headers));
+    try std.testing.expectError(error.Malformed, parseResponse("HTTP/1.1 099\r\n\r\n", &headers));
+    try std.testing.expectError(error.Malformed, parseResponse("HTTP/1.1 200OK\r\n\r\n", &headers));
+    try std.testing.expectError(error.Malformed, parseResponse("ICY 200 OK\r\n\r\n", &headers));
+    try std.testing.expectError(
+        error.UnsupportedVersion,
+        parseResponse("HTTP/2.0 200 OK\r\n\r\n", &headers),
     );
 }
 
