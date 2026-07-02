@@ -287,7 +287,10 @@ pub const IO = struct {
         switch (completion.operation) {
             .accept => |op| _ = try io.ring.accept(user_data, op.socket, null, null, 0),
             .recv => |op| _ = try io.ring.recv(user_data, op.socket, .{ .buffer = op.buffer }, 0),
-            .send => |op| _ = try io.ring.send(user_data, op.socket, op.buffer, 0),
+            // MSG_NOSIGNAL: a send to a peer-closed socket must surface EPIPE,
+            // not raise SIGPIPE. Zig's start code ignores SIGPIPE by default,
+            // but that is an invisible dependency (keep_sigpipe flips it).
+            .send => |op| _ = try io.ring.send(user_data, op.socket, op.buffer, linux.MSG.NOSIGNAL),
             .connect => |*op| _ = try io.ring.connect(
                 user_data,
                 op.socket,
