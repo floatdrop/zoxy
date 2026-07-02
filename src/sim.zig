@@ -8,11 +8,16 @@
 //!     zig build sim                 # seeds 0..50
 //!     zig build sim -- 1234 200     # seeds 1234..1434
 //!
+//! Each iteration draws a fault profile: no faults (half the time, so the
+//! traffic-flow invariant stays strong), a drizzle of RSTs, an RST storm, or
+//! connect refusals — abrupt connection death at every possible point of
+//! the state machine, not just polite FINs.
+//!
 //! Checked invariants, every iteration:
 //! - progress: the loop never deadlocks (`error.WouldBlockForever`) and
 //!   never exceeds the step cap;
 //! - every byte stream a client receives parses as an HTTP/1.1 response and
-//!   frames correctly (RFC 9112 §6.3) — whatever the origin did;
+//!   frames correctly (RFC 9112 §6.3) — whatever the origin or network did;
 //! - all connection slots return to the pool, and `metrics.active` is zero,
 //!   once every client is gone: no leaks under any schedule.
 
@@ -23,6 +28,7 @@ const posix = std.posix;
 const assert = std.debug.assert;
 
 const io_mod = @import("io/io.zig");
+const test_io = @import("io/test_io.zig"); // same file the seam selects here
 const IO = io_mod.IO;
 const Completion = io_mod.Completion;
 const constants = @import("constants.zig");
@@ -79,6 +85,7 @@ fn run_iteration(seed: u64) !u64 {
 
     var io = try IO.init_simulation(arena, seed);
     var workload = Workload{ .prng = std.Random.DefaultPrng.init(seed +% 0x9E3779B97F4A7C15) };
+    io.faults = workload.fault_profile();
 
     var cfg = try config_mod.parse(arena,
         \\{ "listen": "127.0.0.1:8080",
@@ -185,6 +192,17 @@ fn clients_unfinished(clients: []Client) u64 {
 /// Seeded workload decisions, separate from the scheduler's PRNG.
 const Workload = struct {
     prng: std.Random.DefaultPrng,
+
+    /// Half the iterations are fault-free (keeps the traffic-flow invariant
+    /// meaningful); the rest see RST drizzle, an RST storm, or refusals.
+    fn fault_profile(workload: *Workload) test_io.Faults {
+        return switch (workload.prng.random().intRangeLessThan(u32, 0, 4)) {
+            0, 1 => .{},
+            2 => .{ .reset_ppm = 2_000, .connect_refuse_ppm = 5_000 },
+            3 => .{ .reset_ppm = 30_000, .connect_refuse_ppm = 30_000 },
+            else => unreachable,
+        };
+    }
 
     fn origin_behavior(workload: *Workload) Origin.Behavior {
         const all = comptime std.enums.values(Origin.Behavior);

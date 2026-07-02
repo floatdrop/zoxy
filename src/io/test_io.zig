@@ -70,6 +70,20 @@ pub const TimeoutError = error{ Canceled, Unexpected };
 
 pub const CancelError = error{Unexpected};
 
+/// Fault-injection knobs. Probabilities are per million, evaluated once per
+/// eligible operation completion with the scheduler's PRNG — a seed replays
+/// its faults exactly.
+pub const Faults = struct {
+    /// A stream recv/send completes with ECONNRESET instead of its normal
+    /// result, and the connection is dead in both directions from then on —
+    /// a TCP RST: peer crash, middlebox state timeout, close with unread
+    /// data, SO_LINGER(0).
+    reset_ppm: u32 = 0,
+    /// A connect completes with ECONNREFUSED even though the listener
+    /// exists — a transiently unreachable upstream.
+    connect_refuse_ppm: u32 = 0,
+};
+
 const Operation = union(enum) {
     accept: struct { socket: posix.socket_t },
     recv: struct { socket: posix.socket_t, buffer: []u8 },
@@ -150,6 +164,8 @@ const Socket = struct {
     buffer_len: usize = 0,
     /// The peer sent FIN (or vanished): reads drain the buffer, then 0.
     remote_closed: bool = false,
+    /// The connection took an (injected) RST: every op fails ECONNRESET.
+    reset: bool = false,
     read_shutdown: bool = false,
     write_shutdown: bool = false,
 
@@ -162,6 +178,7 @@ const Socket = struct {
 pub const IO = struct {
     prng: std.Random.DefaultPrng,
     now: u64 = 0,
+    faults: Faults = .{},
     sockets: []Socket,
     /// Next never-used slot (slots are not reused; see the module comment).
     socket_count: u32 = 0,
@@ -444,11 +461,13 @@ pub const IO = struct {
             .recv => |op| {
                 const socket = io.socket_at(op.socket);
                 if (socket.state != .stream and socket.state != .closed) return false;
+                if (socket.reset) return true; // fails ECONNRESET now
                 return socket.buffer_len > 0 or socket.remote_closed or socket.read_shutdown;
             },
             .send => |op| {
                 const socket = io.socket_at(op.socket);
                 if (socket.state != .stream and socket.state != .closed) return false;
+                if (socket.reset) return true; // fails ECONNRESET now
                 if (socket.write_shutdown or socket.peer_fd < 0) return true; // fails now
                 const peer = io.socket_at(socket.peer_fd);
                 return peer.buffer_len < peer.buffer.len; // room to make progress
@@ -463,9 +482,20 @@ pub const IO = struct {
     fn perform(io: *IO, completion: *Completion) i32 {
         switch (completion.operation) {
             .accept => |op| return io.perform_accept(op.socket),
-            .recv => |op| return io.perform_recv(op.socket, op.buffer),
-            .send => |op| return io.perform_send(op.socket, op.buffer),
-            .connect => |op| return io.perform_connect(op.socket, op.addr),
+            .recv => |op| {
+                if (io.reset_hit(op.socket)) return -@as(i32, @intFromEnum(linux.E.CONNRESET));
+                return io.perform_recv(op.socket, op.buffer);
+            },
+            .send => |op| {
+                if (io.reset_hit(op.socket)) return -@as(i32, @intFromEnum(linux.E.CONNRESET));
+                return io.perform_send(op.socket, op.buffer);
+            },
+            .connect => |op| {
+                if (io.roll(io.faults.connect_refuse_ppm)) {
+                    return -@as(i32, @intFromEnum(linux.E.CONNREFUSED));
+                }
+                return io.perform_connect(op.socket, op.addr);
+            },
             .close => |op| {
                 io.close_now(op.fd);
                 return 0;
@@ -473,6 +503,25 @@ pub const IO = struct {
             .timeout => return -@as(i32, @intFromEnum(linux.E.TIME)), // normal expiry
             .cancel => |op| return io.perform_cancel(op.target),
         }
+    }
+
+    /// True when this op dies by RST: either the connection is already
+    /// reset, or the injection coin lands — which kills both directions
+    /// (the peer's next op fails too, exactly like a real RST).
+    fn reset_hit(io: *IO, fd: posix.socket_t) bool {
+        const socket = io.socket_at(fd);
+        if (socket.state != .stream) return false; // closed fds fail their own way
+        if (socket.reset) return true;
+        if (!io.roll(io.faults.reset_ppm)) return false;
+        socket.reset = true;
+        if (socket.peer_fd >= 0) io.socket_at(socket.peer_fd).reset = true;
+        return true;
+    }
+
+    fn roll(io: *IO, ppm: u32) bool {
+        if (ppm == 0) return false;
+        assert(ppm <= 1_000_000);
+        return io.prng.random().intRangeLessThan(u32, 0, 1_000_000) < ppm;
     }
 
     fn perform_accept(io: *IO, listener_fd: posix.socket_t) i32 {
@@ -826,6 +875,91 @@ test "test_io: close without shutdown leaves a pending recv hanging" {
     // no timers the loop reports the deadlock instead of spinning.
     io.close_now(server.fd);
     try std.testing.expectError(error.WouldBlockForever, io.run_once());
+}
+
+test "test_io: an injected RST fails ops on both ends of the connection" {
+    const gpa = std.testing.allocator;
+    var io = try IO.init_simulation(gpa, 11);
+    defer io.deinit_simulation(gpa);
+
+    // Error-tolerant harness: faults are the expected outcome here.
+    const Harness = struct {
+        io: *IO,
+        fd: posix.socket_t = -1,
+        reset_seen: bool = false,
+        accept_c: Completion = undefined,
+        connect_c: Completion = undefined,
+        send_c: Completion = undefined,
+        recv_c: Completion = undefined,
+        buf: [16]u8 = undefined,
+
+        fn on_accept(h: *@This(), _: *Completion, result: AcceptError!posix.socket_t) void {
+            h.fd = result catch unreachable;
+        }
+        fn on_connect(_: *@This(), _: *Completion, result: ConnectError!void) void {
+            result catch unreachable;
+        }
+        fn on_send(h: *@This(), _: *Completion, result: SendError!usize) void {
+            _ = result catch |err| {
+                h.reset_seen = h.reset_seen or err == error.ConnectionResetByPeer;
+                return;
+            };
+        }
+        fn on_recv(h: *@This(), _: *Completion, result: RecvError!usize) void {
+            _ = result catch |err| {
+                h.reset_seen = h.reset_seen or err == error.ConnectionResetByPeer;
+                return;
+            };
+        }
+    };
+
+    const listener = io.open_listener(7070);
+    var server = Harness{ .io = &io };
+    var client = Harness{ .io = &io };
+    io.accept(*Harness, &server, Harness.on_accept, &server.accept_c, listener);
+    client.fd = io.open_tcp_socket().?;
+    io.connect(*Harness, &client, Harness.on_connect, &client.connect_c, client.fd, .{
+        .family = linux.AF.INET,
+        .port = std.mem.nativeToBig(u16, 7070),
+        .addr = 0,
+    });
+    while (server.fd < 0) try io.run_once();
+
+    // Every eligible op now takes the RST.
+    io.faults = .{ .reset_ppm = 1_000_000 };
+    io.send(*Harness, &client, Harness.on_send, &client.send_c, client.fd, "doomed");
+    io.recv(*Harness, &server, Harness.on_recv, &server.recv_c, server.fd, &server.buf);
+    while (!client.reset_seen or !server.reset_seen) try io.run_once();
+    try std.testing.expect(client.reset_seen);
+    try std.testing.expect(server.reset_seen); // the RST killed both directions
+}
+
+test "test_io: injected connect refusal reaches the callback" {
+    const gpa = std.testing.allocator;
+    var io = try IO.init_simulation(gpa, 12);
+    defer io.deinit_simulation(gpa);
+    io.faults = .{ .connect_refuse_ppm = 1_000_000 };
+
+    _ = io.open_listener(6060); // exists, but the fault wins
+    const Harness = struct {
+        refused: bool = false,
+        fn on_connect(h: *@This(), _: *Completion, result: ConnectError!void) void {
+            result catch |err| {
+                h.refused = err == error.ConnectionRefused;
+                return;
+            };
+        }
+    };
+    var h = Harness{};
+    var connect_c: Completion = undefined;
+    const fd = io.open_tcp_socket().?;
+    io.connect(*Harness, &h, Harness.on_connect, &connect_c, fd, .{
+        .family = linux.AF.INET,
+        .port = std.mem.nativeToBig(u16, 6060),
+        .addr = 0,
+    });
+    while (!h.refused) try io.run_once();
+    try std.testing.expect(h.refused);
 }
 
 test "test_io: timers fire in virtual time order" {
