@@ -303,6 +303,56 @@ pub const IO = struct {
         }
     }
 
+    // ---- synchronous helpers (seam-uniform with the simulator) ------------
+
+    /// Nanosecond monotonic clock. Deadline arithmetic must go through the
+    /// IO seam so the simulator can substitute a virtual clock.
+    pub fn now_ns(io: *IO) u64 {
+        _ = io;
+        var ts: linux.timespec = undefined;
+        _ = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
+        return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    }
+
+    /// A non-blocking TCP socket with TCP_NODELAY set, or null on failure.
+    pub fn open_tcp_socket(io: *IO) ?posix.socket_t {
+        const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK;
+        const rc = linux.socket(linux.AF.INET, flags, 0);
+        if (posix.errno(rc) != .SUCCESS) return null;
+        const fd: posix.socket_t = @intCast(rc);
+        io.set_tcp_no_delay(fd);
+        return fd;
+    }
+
+    /// Disable Nagle. Heads are written as several small sends; on a warm
+    /// (pooled) connection Nagle holds the later ones hostage to the peer's
+    /// delayed ACK — a hard ~40ms stall per request. A proxy always wants
+    /// its writes on the wire immediately. Best-effort: losing the option
+    /// costs latency, not correctness.
+    pub fn set_tcp_no_delay(io: *IO, fd: posix.socket_t) void {
+        _ = io;
+        assert(fd >= 0);
+        const on: c_int = 1;
+        posix.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, std.mem.asBytes(&on)) catch {};
+    }
+
+    /// shutdown(SHUT_RDWR): forces any op still pending on the fd to
+    /// complete (an io_uring close does not) — the mandatory prelude to an
+    /// async close of a busy fd.
+    pub fn shutdown_socket(io: *IO, fd: posix.socket_t) void {
+        _ = io;
+        assert(fd >= 0);
+        _ = linux.shutdown(fd, linux.SHUT.RDWR);
+    }
+
+    /// Synchronous close for fds with no operation pending (pool parking,
+    /// accept-path rejection). Anything in flight needs shutdown + async close.
+    pub fn close_now(io: *IO, fd: posix.socket_t) void {
+        _ = io;
+        assert(fd >= 0);
+        _ = linux.close(fd);
+    }
+
     // ---- driving the loop -------------------------------------------------
 
     /// Submit queued work and run every ready callback without blocking.

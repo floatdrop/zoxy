@@ -323,12 +323,12 @@ pub const ProxyConn = struct {
     /// Move the current phase's deadline; the ticking timer picks it up.
     fn setDeadline(conn: *ProxyConn, timeout_ns: u63) void {
         assert(timeout_ns > 0);
-        conn.deadline_ns = monotonicNanos() + timeout_ns;
+        conn.deadline_ns = conn.io.now_ns() + timeout_ns;
     }
 
     fn armTimeout(conn: *ProxyConn) void {
         assert(!conn.timeout_armed);
-        const now = monotonicNanos();
+        const now = conn.io.now_ns();
         // Sleep to the deadline, but at most one tick: if the deadline moves
         // closer meanwhile (request phase -> idle phase), enforcement is late
         // by at most the tick.
@@ -344,7 +344,7 @@ pub const ProxyConn = struct {
         defer conn.releaseRef();
         conn.timeout_armed = false;
         if (conn.closing) return; // fired late / we cancelled it
-        if (monotonicNanos() >= conn.deadline_ns) return conn.teardown(); // deadline exceeded
+        if (conn.io.now_ns() >= conn.deadline_ns) return conn.teardown(); // deadline exceeded
         conn.armTimeout(); // still time left (or the deadline moved); keep watching
     }
 
@@ -417,13 +417,13 @@ pub const ProxyConn = struct {
         // io_uring. shutdown() forces those to complete so the refcount drains;
         // then we close the fd.
         if (conn.down_fd >= 0) {
-            _ = linux.shutdown(conn.down_fd, linux.SHUT.RDWR);
+            conn.io.shutdown_socket(conn.down_fd);
             conn.retain();
             conn.io.close(*ProxyConn, conn, onClosed, &conn.close_down_completion, conn.down_fd);
             conn.down_fd = -1;
         }
         if (conn.up_fd >= 0) {
-            _ = linux.shutdown(conn.up_fd, linux.SHUT.RDWR);
+            conn.io.shutdown_socket(conn.up_fd);
             conn.retain();
             conn.io.close(*ProxyConn, conn, onClosed, &conn.close_up_completion, conn.up_fd);
             conn.up_fd = -1;
@@ -535,7 +535,7 @@ pub const ProxyConn = struct {
     fn connectUpstream(conn: *ProxyConn) void {
         assert(conn.up_fd < 0);
         conn.upstream_pooled = false;
-        conn.up_fd = createTcpSocket() orelse return conn.fail(resp_502);
+        conn.up_fd = conn.io.open_tcp_socket() orelse return conn.fail(resp_502);
         assert(conn.up_fd >= 0);
         conn.retain();
         conn.io.connect(
@@ -571,7 +571,7 @@ pub const ProxyConn = struct {
         conn.upstream_retry_used = true;
         conn.metrics.upstream_retried.add(1);
         // Drop the dead fd; its prime/recv ops have already completed.
-        _ = linux.shutdown(conn.up_fd, linux.SHUT.RDWR);
+        conn.io.shutdown_socket(conn.up_fd);
         conn.up_close_pending = true;
         conn.retain();
         conn.io.close(
@@ -829,7 +829,7 @@ pub const ProxyConn = struct {
         assert(conn.endpoint_address.port != 0); // set when the request routed
         // Nothing is pending on the fd: the response was fully received and
         // fully forwarded before this point.
-        conn.upstream_pool.checkin(conn.endpoint_address, conn.up_fd);
+        conn.upstream_pool.checkin(conn.io, conn.endpoint_address, conn.up_fd);
         conn.up_fd = -1;
     }
 
@@ -862,7 +862,7 @@ pub const ProxyConn = struct {
         if (conn.up_fd >= 0) {
             // Same discipline as teardown: shutdown so any straggler op on
             // the fd completes, then close.
-            _ = linux.shutdown(conn.up_fd, linux.SHUT.RDWR);
+            conn.io.shutdown_socket(conn.up_fd);
             conn.up_close_pending = true;
             conn.retain();
             conn.io.close(
@@ -983,7 +983,7 @@ pub const ProxyServer = struct {
 
     /// Close every pooled upstream connection (tests; workers run forever).
     pub fn deinit(server: *ProxyServer) void {
-        server.upstream_pool.drain();
+        server.upstream_pool.drain(server.io);
     }
 
     pub fn start(server: *ProxyServer) void {
@@ -1007,7 +1007,7 @@ pub const ProxyServer = struct {
     ) void {
         if (result) |fd| {
             assert(fd >= 0);
-            setTcpNoDelay(fd); // response heads are small writes too
+            server.io.set_tcp_no_delay(fd); // response heads are small writes too
             if (server.pool.acquire()) |conn| {
                 conn.start(
                     server.io,
@@ -1023,7 +1023,7 @@ pub const ProxyServer = struct {
                 );
             } else {
                 server.metrics.rejected.add(1);
-                _ = linux.close(fd); // backpressure: reject, never allocate
+                server.io.close_now(fd); // backpressure: reject, never allocate
             }
             server.armAccept();
         } else |err| switch (err) {
@@ -1103,26 +1103,6 @@ fn connectionListNames(headers: []const h1.Header, token: []const u8) bool {
 fn keepAliveRequested(request: *const h1.Request) bool {
     if (request.version_minor != 1) return false;
     return !connectionListNames(request.headers, "close");
-}
-
-fn createTcpSocket() ?posix.socket_t {
-    const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK;
-    const rc = linux.socket(linux.AF.INET, flags, 0);
-    if (posix.errno(rc) != .SUCCESS) return null;
-    const fd: posix.socket_t = @intCast(rc);
-    setTcpNoDelay(fd);
-    return fd;
-}
-
-/// Disable Nagle. The head is primed as several small writes; on a warm
-/// (pooled) connection Nagle holds the later ones hostage to the peer's
-/// delayed ACK — a hard ~40ms stall per request. A proxy always wants its
-/// writes on the wire immediately. Best-effort: losing the option costs
-/// latency, not correctness.
-fn setTcpNoDelay(fd: posix.socket_t) void {
-    assert(fd >= 0);
-    const on: c_int = 1;
-    posix.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, std.mem.asBytes(&on)) catch {};
 }
 
 fn sockaddrIn(address: Ip4Address) linux.sockaddr.in {

@@ -7,10 +7,10 @@
 //! once on a fresh connection.
 
 const std = @import("std");
-const linux = std.os.linux;
 const posix = std.posix;
 const assert = std.debug.assert;
 const constants = @import("../constants.zig");
+const IO = @import("../io/io.zig").IO;
 const Ip4Address = std.Io.net.Ip4Address;
 
 pub const UpstreamPool = struct {
@@ -40,7 +40,7 @@ pub const UpstreamPool = struct {
 
     /// Park an idle connection, or close it when the pool is full. The fd
     /// must have no operation pending on it.
-    pub fn checkin(pool: *UpstreamPool, address: Ip4Address, fd: posix.socket_t) void {
+    pub fn checkin(pool: *UpstreamPool, io: *IO, address: Ip4Address, fd: posix.socket_t) void {
         assert(fd >= 0);
         for (&pool.slots) |*slot| {
             if (slot.fd >= 0) continue;
@@ -51,14 +51,14 @@ pub const UpstreamPool = struct {
             return;
         }
         assert(pool.count == constants.upstream_idle_max);
-        _ = linux.close(fd); // every slot taken: not worth keeping
+        io.close_now(fd); // every slot taken: not worth keeping
     }
 
     /// Close every parked connection (worker/test shutdown).
-    pub fn drain(pool: *UpstreamPool) void {
+    pub fn drain(pool: *UpstreamPool, io: *IO) void {
         for (&pool.slots) |*slot| {
             if (slot.fd < 0) continue;
-            _ = linux.close(slot.fd);
+            io.close_now(slot.fd);
             slot.fd = -1;
             assert(pool.count > 0);
             pool.count -= 1;
@@ -74,6 +74,10 @@ fn addressEqual(a: Ip4Address, b: Ip4Address) bool {
 // ---- tests ----------------------------------------------------------------
 
 test "upstream_pool: checkout matches the endpoint and empties the slot" {
+    const linux = std.os.linux;
+    var io = try IO.init(8, 0);
+    defer io.deinit();
+
     var pool = UpstreamPool{};
     const address_a = Ip4Address.loopback(1);
     const address_b = Ip4Address.loopback(2);
@@ -83,8 +87,8 @@ test "upstream_pool: checkout matches the endpoint and empties the slot" {
     const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &pair);
     try std.testing.expectEqual(@as(usize, 0), rc);
 
-    pool.checkin(address_a, pair[0]);
-    pool.checkin(address_b, pair[1]);
+    pool.checkin(&io, address_a, pair[0]);
+    pool.checkin(&io, address_b, pair[1]);
     try std.testing.expectEqual(@as(u32, 2), pool.count);
 
     // No connection parked for an unrelated endpoint.
@@ -94,7 +98,7 @@ test "upstream_pool: checkout matches the endpoint and empties the slot" {
     try std.testing.expect(pool.checkout(address_a) == null);
     try std.testing.expectEqual(@as(u32, 1), pool.count);
 
-    pool.drain(); // closes pair[1]
+    pool.drain(&io); // closes pair[1]
     try std.testing.expectEqual(@as(u32, 0), pool.count);
     _ = linux.close(pair[0]);
 }
