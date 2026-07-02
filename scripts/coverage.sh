@@ -30,6 +30,12 @@ echo "== simulator (seeds 0..$SIM_SEEDS) under kcov =="
 kcov --include-path="$ROOT/src" "$OUT/sim" zig-out/bin/coverage_sim 0 "$SIM_SEEDS"
 kcov --merge "$OUT/merged" "$OUT/tests" "$OUT/sim"
 
+# kcov writes an absolute <source> root; Coveralls resolves file paths by
+# joining source + filename and then fetching them from GitHub, so the root
+# must be repo-relative ("src") or every file shows "source not available".
+sed -i "s|<source>$ROOT/src/*</source>|<source>src</source>|" \
+    "$OUT/merged/kcov-merged/cobertura.xml"
+
 JSON="$OUT/merged/kcov-merged/coverage.json"
 TOTAL=$(grep -o '"percent_covered": "[0-9.]*"' "$JSON" | tail -1 | grep -o '[0-9.]*')
 echo
