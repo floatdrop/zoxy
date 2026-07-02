@@ -79,6 +79,20 @@ in order; the first whose host (`*` or an exact, port-insensitive match) and
 load-balanced round-robin. `admin` (optional) serves Prometheus-style counters —
 `curl http://127.0.0.1:9901/metrics` — on a dedicated thread, off the data path.
 
+## Benchmarking
+
+```sh
+bench/run.sh                 # 30k req/s for 10s over 64 connections
+bench/run.sh -R 40000 -d 30s # find the saturation point
+```
+
+Stands up an nginx origin and zoxy on loopback, then drives both a direct
+baseline (with `Connection: close`, matching zoxy's one-request-per-connection
+model) and the proxied path at the same constant rate with
+[zrk](https://github.com/floatdrop/zrk), so the corrected latency of the proxy
+hop is directly comparable. Falls back to closed-loop `wrk` (via nix, with a
+warning) when zrk is not installed.
+
 ## Architecture
 
 ```
