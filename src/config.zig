@@ -32,6 +32,8 @@ pub const Config = struct {
     gpa: std.mem.Allocator,
     arena: *std.heap.ArenaAllocator,
     listen: Ip4Address,
+    /// Address of the admin/metrics endpoint; null disables it.
+    admin: ?Ip4Address,
     routes: []const Route,
     clusters: []const Cluster,
 
@@ -58,6 +60,7 @@ pub const ParseError = error{
 /// JSON shape mirrored 1:1 for decoding, then lowered into `Config`.
 const Dto = struct {
     listen: []const u8,
+    admin: ?[]const u8 = null,
     routes: []const RouteDto,
     clusters: []const ClusterDto,
 
@@ -120,6 +123,7 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
         .gpa = gpa,
         .arena = arena,
         .listen = try parseAddress(dto.listen),
+        .admin = if (dto.admin) |text_addr| try parseAddress(text_addr) else null,
         .routes = routes,
         .clusters = clusters,
     };
@@ -172,6 +176,20 @@ test "config: parses listen, routes, clusters" {
     try std.testing.expectEqual(@as(usize, 2), api.endpoints.len);
     try std.testing.expectEqual(@as(u16, 9002), api.endpoints[1].address.port);
     try std.testing.expect(config.findCluster("nope") == null);
+}
+
+test "config: admin endpoint is optional and parses when present" {
+    var without = try parse(std.testing.allocator, test_config);
+    defer without.deinit();
+    try std.testing.expect(without.admin == null);
+
+    var with = try parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "admin": "127.0.0.1:9901",
+        \\  "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    );
+    defer with.deinit();
+    try std.testing.expectEqual(@as(u16, 9901), with.admin.?.port);
 }
 
 test "config: rejects a route to an unknown cluster" {

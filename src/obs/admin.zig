@@ -1,0 +1,172 @@
+//! Minimal admin plane: a blocking TCP listener, served by one dedicated
+//! thread, that answers every HTTP request with the Prometheus-style metrics
+//! exposition. Deliberately not on the io_uring data path — the workers never
+//! touch it, it holds no locks the workers see (counters are atomics), and it
+//! allocates nothing: both the response head and body live in fixed buffers.
+
+const std = @import("std");
+const linux = std.os.linux;
+const posix = std.posix;
+const assert = std.debug.assert;
+
+const Metrics = @import("metrics.zig").Metrics;
+const Ip4Address = std.Io.net.Ip4Address;
+
+/// Sized for every counter in `Metrics` (8 lines of ~40 bytes today); the
+/// comptime check in `serveOne` keeps this honest as counters are added.
+const body_bytes_max = 4096;
+const head_bytes_max = 256;
+const accept_backlog = 8;
+
+pub const Admin = struct {
+    fd: posix.socket_t,
+    metrics: *const Metrics,
+
+    pub const OpenError = error{
+        SocketCreateFailed,
+        SetSockOptFailed,
+        BindFailed,
+        ListenFailed,
+    };
+
+    /// Open a *blocking* listener (unlike the data-path listeners: this one
+    /// is drained by a dedicated thread, not an io_uring loop).
+    pub fn open(address: Ip4Address, metrics: *const Metrics) OpenError!Admin {
+        const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+        if (posix.errno(rc) != .SUCCESS) return error.SocketCreateFailed;
+        const fd: posix.socket_t = @intCast(rc);
+        assert(fd >= 0);
+        errdefer _ = linux.close(fd);
+
+        const on: c_int = 1;
+        posix.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&on)) catch
+            return error.SetSockOptFailed;
+
+        var sa = sockaddrIn(address);
+        if (posix.errno(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
+            return error.BindFailed;
+        }
+        if (posix.errno(linux.listen(fd, accept_backlog)) != .SUCCESS) {
+            return error.ListenFailed;
+        }
+        return .{ .fd = fd, .metrics = metrics };
+    }
+
+    pub fn close(admin: *Admin) void {
+        _ = linux.close(admin.fd);
+        admin.* = undefined;
+    }
+
+    /// The bound address, resolving an ephemeral port assigned by the kernel.
+    pub fn boundAddress(admin: Admin) Ip4Address {
+        var sa: linux.sockaddr.in = undefined;
+        var len: posix.socklen_t = @sizeOf(linux.sockaddr.in);
+        const rc = linux.getsockname(admin.fd, @ptrCast(&sa), &len);
+        assert(posix.errno(rc) == .SUCCESS);
+        assert(sa.family == linux.AF.INET);
+        return .{ .bytes = @bitCast(sa.addr), .port = std.mem.bigToNative(u16, sa.port) };
+    }
+
+    /// Serve forever, one connection at a time. The admin plane is best-effort
+    /// by design: per-connection errors are dropped, never fatal.
+    pub fn run(admin: *Admin) void {
+        while (true) admin.serveOne();
+    }
+
+    /// Accept one connection, answer it with the metrics exposition, close it.
+    pub fn serveOne(admin: *Admin) void {
+        const rc = linux.accept4(admin.fd, null, null, linux.SOCK.CLOEXEC);
+        if (posix.errno(rc) != .SUCCESS) return;
+        const fd: posix.socket_t = @intCast(rc);
+        assert(fd >= 0);
+        defer _ = linux.close(fd);
+
+        // Best-effort drain of the request head so the peer is not reset
+        // mid-write; the response is the same whatever was asked.
+        var request_buf: [1024]u8 = undefined;
+        _ = linux.read(fd, &request_buf, request_buf.len);
+
+        var body_buf: [body_bytes_max]u8 = undefined;
+        comptime { // every counter line must fit: name prefix + u64 digits + newline
+            const fields = @typeInfo(Metrics).@"struct".fields;
+            assert(fields.len * 64 <= body_bytes_max);
+        }
+        var body_writer = std.Io.Writer.fixed(&body_buf);
+        admin.metrics.writeText(&body_writer) catch return;
+        const body = body_writer.buffered();
+        assert(body.len > 0);
+        assert(body.len <= body_bytes_max);
+
+        var head_buf: [head_bytes_max]u8 = undefined;
+        const head = std.fmt.bufPrint(&head_buf, "HTTP/1.0 200 OK\r\n" ++
+            "Content-Type: text/plain; version=0.0.4\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "Connection: close\r\n\r\n", .{body.len}) catch return;
+        writeAll(fd, head);
+        writeAll(fd, body);
+    }
+};
+
+/// Blocking best-effort write of the whole buffer; gives up on any error.
+fn writeAll(fd: posix.socket_t, bytes: []const u8) void {
+    assert(bytes.len > 0);
+    var sent: usize = 0;
+    while (sent < bytes.len) { // bounded: every iteration sends >= 1 byte or returns
+        const rc = linux.write(fd, bytes[sent..].ptr, bytes.len - sent);
+        if (posix.errno(rc) != .SUCCESS) return;
+        if (rc == 0) return;
+        sent += rc;
+        assert(sent <= bytes.len);
+    }
+}
+
+fn sockaddrIn(address: Ip4Address) linux.sockaddr.in {
+    return .{
+        .family = linux.AF.INET,
+        .port = std.mem.nativeToBig(u16, address.port),
+        .addr = @bitCast(address.bytes),
+    };
+}
+
+// ---- tests ----------------------------------------------------------------
+
+test "admin: serves the metrics exposition over HTTP" {
+    var metrics = Metrics{};
+    metrics.requests.add(7);
+    metrics.accepted.add(2);
+
+    var admin = try Admin.open(Ip4Address.loopback(0), &metrics);
+    defer admin.close();
+    const port = admin.boundAddress().port;
+
+    // Blocking loopback client: connect, send a request, then let serveOne
+    // (same thread) accept and respond before we read the reply back.
+    const client: posix.socket_t = blk: {
+        const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+        try std.testing.expect(posix.errno(rc) == .SUCCESS);
+        break :blk @intCast(rc);
+    };
+    defer _ = linux.close(client);
+    var sa = sockaddrIn(Ip4Address.loopback(port));
+    try std.testing.expect(
+        posix.errno(linux.connect(client, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) == .SUCCESS,
+    );
+    const request = "GET /metrics HTTP/1.0\r\n\r\n";
+    _ = linux.write(client, request, request.len);
+
+    admin.serveOne();
+
+    var response_buf: [body_bytes_max + head_bytes_max]u8 = undefined;
+    var response_len: usize = 0;
+    while (true) { // read to EOF (serveOne closed its end)
+        const rc = linux.read(client, response_buf[response_len..].ptr, 512);
+        try std.testing.expect(posix.errno(rc) == .SUCCESS);
+        if (rc == 0) break;
+        response_len += rc;
+    }
+    const response = response_buf[0..response_len];
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.0 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, response, "zoxy_requests 7\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "zoxy_accepted 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "zoxy_rejected 0\n") != null);
+}

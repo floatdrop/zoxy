@@ -46,6 +46,9 @@ pub const Metrics = @import("obs/metrics.zig").Metrics;
 /// Per-worker access log.
 pub const AccessLog = @import("obs/access_log.zig").AccessLog;
 
+/// Admin/metrics endpoint (blocking, on its own thread, off the data path).
+pub const Admin = @import("obs/admin.zig").Admin;
+
 /// Allocation guard for the zero-alloc acceptance gate (docs/DESIGN.md §4).
 pub const guard = @import("mem/guard.zig");
 
@@ -65,5 +68,6 @@ test {
     _ = proxy;
     _ = @import("obs/metrics.zig");
     _ = @import("obs/access_log.zig");
+    _ = @import("obs/admin.zig");
     _ = guard;
 }

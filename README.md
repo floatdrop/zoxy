@@ -63,6 +63,7 @@ in order; the first whose host (`*` or an exact, port-insensitive match) and
 ```json
 {
   "listen": "127.0.0.1:8080",
+  "admin": "127.0.0.1:9901",
   "routes": [
     { "host": "api.example.com", "path_prefix": "/v1", "cluster": "api" },
     { "cluster": "default" }
@@ -75,7 +76,8 @@ in order; the first whose host (`*` or an exact, port-insensitive match) and
 ```
 
 `host` defaults to `"*"` and `path_prefix` to `"/"`. Endpoints in a cluster are
-load-balanced round-robin.
+load-balanced round-robin. `admin` (optional) serves Prometheus-style counters —
+`curl http://127.0.0.1:9901/metrics` — on a dedicated thread, off the data path.
 
 ## Architecture
 

@@ -58,6 +58,23 @@ pub fn main(init: std.process.Init) !void {
             .{ cfg.listen, pool, &router, &metrics, access, cpu },
         );
     }
+
+    // Admin/metrics plane: blocking, on its own detached thread, off the data
+    // path. Arena-allocated so it outlives this scope.
+    if (cfg.admin) |admin_address| {
+        const admin = try gpa.create(zoxy.Admin);
+        admin.* = zoxy.Admin.open(admin_address, &metrics) catch |err| {
+            std.log.err("zoxy: cannot open admin endpoint {f}: {s}", .{
+                admin_address,
+                @errorName(err),
+            });
+            return err;
+        };
+        const admin_thread = try std.Thread.spawn(.{}, zoxy.Admin.run, .{admin});
+        admin_thread.detach();
+        std.log.info("zoxy admin/metrics on {f}", .{admin_address});
+    }
+
     std.log.info("zoxy listening on {f} across {d} worker(s)", .{ cfg.listen, worker_count });
     for (threads) |thread| thread.join();
 }
