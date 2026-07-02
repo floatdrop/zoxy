@@ -269,7 +269,14 @@ pub const ProxyConn = struct {
     connect_completion: Completion,
     aux_completion: Completion, // prime send / error-response send
     close_down_completion: Completion,
+    /// Per-request upstream closes (finishRequest / stale retry), guarded by
+    /// `up_close_pending`. Teardown must NOT reuse this one: a previous
+    /// request's close may still be in flight on it, and re-submitting a
+    /// Completion that is in flight corrupts the ring (double callback,
+    /// double releaseRef). Found by the simulator, seed 1693.
     close_up_completion: Completion,
+    /// Teardown's own upstream close (teardown runs at most once).
+    teardown_close_up_completion: Completion,
     timeout_completion: Completion,
     timeout_cancel_completion: Completion,
     connect_cancel_completion: Completion,
@@ -425,7 +432,13 @@ pub const ProxyConn = struct {
         if (conn.up_fd >= 0) {
             conn.io.shutdown_socket(conn.up_fd);
             conn.retain();
-            conn.io.close(*ProxyConn, conn, onClosed, &conn.close_up_completion, conn.up_fd);
+            conn.io.close(
+                *ProxyConn,
+                conn,
+                onClosed,
+                &conn.teardown_close_up_completion,
+                conn.up_fd,
+            );
             conn.up_fd = -1;
         }
     }
@@ -825,6 +838,12 @@ pub const ProxyConn = struct {
     fn maybePoolUpstream(conn: *ProxyConn) void {
         if (!conn.upstream_reusable) return;
         if (conn.u2d_overflow) return;
+        // The request must be fully forwarded with nothing in flight: if the
+        // upstream answered while the client was still uploading, a d2u send
+        // may still be pending on this very fd — parking it would strand the
+        // operation and leak stray body bytes into a pooled connection.
+        // (Found by the simulator, seed 1693.)
+        if (!conn.request_forwarded) return;
         if (conn.up_fd < 0) return;
         assert(conn.endpoint_address.port != 0); // set when the request routed
         // Nothing is pending on the fd: the response was fully received and
