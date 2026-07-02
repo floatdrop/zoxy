@@ -17,6 +17,9 @@ pub fn Pool(comptime T: type) type {
         pub fn init(gpa: std.mem.Allocator, capacity: u32) !Self {
             assert(capacity > 0);
             const items = try gpa.alloc(T, capacity);
+            // Fresh items are uninitialized; null the links so release() can
+            // assert an item is not already on the free list.
+            for (items) |*item| item.free_next = null;
             var self: Self = .{
                 .items = items,
                 .free_head = null,
@@ -49,6 +52,10 @@ pub fn Pool(comptime T: type) type {
 
         pub fn release(self: *Self, item: *T) void {
             assert(self.free_count < self.capacity);
+            // Negative space: a double release would link the item into the
+            // free list twice and hand the same slot to two connections.
+            assert(item.free_next == null);
+            assert(item != self.free_head);
             item.free_next = self.free_head;
             self.free_head = item;
             self.free_count += 1;
