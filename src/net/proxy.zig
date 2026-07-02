@@ -433,6 +433,9 @@ pub const ProxyConn = struct {
         defer conn.releaseRef();
         if (conn.closing) return;
         const m = result catch return conn.teardown();
+        // The primed head is upstream traffic too — without this, a GET-only
+        // workload reports zero bytes_to_upstream (only the relay pipe counts).
+        conn.metrics.bytes_to_upstream.add(m);
         const segment = conn.prime_segments[conn.prime_segment_index];
         conn.prime_sent += m;
         assert(conn.prime_sent <= segment.len); // never forward past the segment
@@ -809,6 +812,13 @@ test "proxy: forwards a request to an upstream and relays the response" {
 
     // Let the proxy finish tearing the connection down and reclaim its slot.
     while (pool.free_count != pool.capacity) try io.run_once();
+
+    // Every byte the proxy sent upstream (the spliced head — the client sent
+    // no body) must be counted; the origin received exactly what was sent.
+    try std.testing.expectEqual(
+        @as(u64, origin.request_len),
+        metrics.bytes_to_upstream.load(),
+    );
 }
 
 test "proxy: strips hop-by-hop headers and forces Connection: close upstream" {
