@@ -24,6 +24,7 @@ zig build run          # run using ./zoxy.json
 zig build sim -- 0 500 # deterministic simulator: [seed] [iterations]
 zig build sim -- fuzz  # random seeds forever (Ctrl-C; each seed replayable)
 zig fmt --check src build.zig   # lint (CI gate)
+scripts/coverage.sh    # kcov line coverage (tests + sim), HTML + cobertura
 ```
 
 A simulator failure prints its seed; `zig build sim -- <seed> 1` replays that
@@ -108,6 +109,8 @@ Consequences that bite if you forget them:
 - `std.crypto.random` is gone; entropy comes through the Io interface:
   `init.io.random(&buf)` (infallible, CSPRNG) or `io.randomSecure(&buf)`
   (strict, always a syscall).
+- **kcov cannot read the self-hosted Debug backend's DWARF** (finds 0 lines);
+  coverage builds must pass `-fllvm` (see `scripts/coverage.sh`).
 - `std.time.Timer`/`Instant` are gone; the idiomatic replacement is
   `std.Io.Clock` — `std.Io.Clock.awake.now(io)` (CLOCK_MONOTONIC on Linux)
   returns an `Io.Timestamp` with `durationTo`/`fromNow` arithmetic. Our

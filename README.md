@@ -1,6 +1,7 @@
 # zoxy
 
 [![CI](https://github.com/floatdrop/zoxy/actions/workflows/ci.yml/badge.svg)](https://github.com/floatdrop/zoxy/actions/workflows/ci.yml)
+[![Coverage Status](https://coveralls.io/repos/github/floatdrop/zoxy/badge.svg?branch=main)](https://coveralls.io/github/floatdrop/zoxy?branch=main)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A zero-allocation L7 edge proxy in Zig, in the spirit of Envoy and Linkerd.

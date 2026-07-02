@@ -51,3 +51,26 @@ jobs:
       # failure reproduces locally with `zig build sim -- <seed> 1`.
       - name: Run simulator (seeds 0..300)
         run: nix develop --command zig build sim -- 0 300
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # kcov over the unit tests + a simulator sweep (see scripts/coverage.sh
+      # for the -fllvm gotcha).
+      - name: Measure coverage (kcov)
+        run: nix develop --command scripts/coverage.sh
+
+      - name: Upload to Coveralls
+        uses: coverallsapp/github-action@v2
+        with:
+          file: zig-out/coverage/merged/kcov-merged/cobertura.xml
+          format: cobertura
