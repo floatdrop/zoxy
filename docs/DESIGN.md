@@ -265,6 +265,18 @@ accept → recv (provided buffer) → parse req line + headers (zero-copy slices
   Bounded `max_headers`; overflow → reject, don't grow.
 - **Lifetime rule:** header slices are valid only while the buffer is unmodified
   → any thread hand-off requires a copy (we avoid hand-off: connection-pinned).
+- **One request per connection (Phase-0 contract):** the head is forwarded with
+  hop-by-hop headers stripped (`Connection` + everything it names, `Keep-Alive`,
+  `Proxy-Connection`) and `Connection: close` injected — zero-copy, as bounded
+  segmented sends of the parse buffer. A compliant upstream then closes after
+  one response, so a keep-alive client can neither pin a pool slot until the
+  deadline nor smuggle a second, differently-routed request through the first
+  request's tunnel (routing bypass). `Upgrade` requests cannot survive the
+  forced close and are refused with 501. Responses are relayed verbatim — the
+  client may see `keep-alive` then FIN, which is legal and clients handle.
+  Real keep-alive requires response framing (status line + Content-Length /
+  chunked) and arrives with Phase 2's protocol work; the forced close then
+  remains the fallback for unframeable responses.
 
 ---
 

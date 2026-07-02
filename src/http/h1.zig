@@ -13,6 +13,9 @@ pub const Method = enum { get, head, post, put, delete, patch, options, connect,
 pub const Header = struct {
     name: []const u8,
     value: []const u8,
+    /// The raw header line including its terminating CRLF, as a slice of the
+    /// input — lets a forwarder skip or splice whole lines without copying.
+    line: []const u8 = "",
 };
 
 /// A parsed request head. All slices point into the input buffer and are valid
@@ -66,10 +69,12 @@ pub fn parse(input: []const u8, headers: []Header) ParseError!Parsed {
 
     var count: usize = 0;
     while (true) {
+        const line_start = pos;
         const header_line = readLine(input, &pos) orelse return .incomplete;
         if (header_line.len == 0) break; // blank line terminates the head
         if (count == headers.len) return error.TooManyHeaders;
         headers[count] = try parseHeader(header_line);
+        headers[count].line = input[line_start..pos];
         count += 1;
     }
 
@@ -202,6 +207,14 @@ test "h1: parses a complete request with headers" {
     // Case-insensitive lookup, and body is left unconsumed.
     try std.testing.expectEqualStrings("example.com", req.header("HOST").?);
     try std.testing.expectEqualStrings("BODYBYTES", raw[req.head_len..]);
+}
+
+test "h1: header lines expose their raw span including the CRLF" {
+    var headers: [4]Header = undefined;
+    const raw = "GET / HTTP/1.1\r\nHost: x\r\nAccept: */*\r\n\r\n";
+    const req = (try parse(raw, &headers)).complete;
+    try std.testing.expectEqualStrings("Host: x\r\n", req.headers[0].line);
+    try std.testing.expectEqualStrings("Accept: */*\r\n", req.headers[1].line);
 }
 
 test "h1: trims OWS around header values" {

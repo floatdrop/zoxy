@@ -7,8 +7,17 @@
 //! Lifetime: `refs` counts in-flight io_uring operations for a connection.
 //! `teardown` flips `closing` and closes both fds; the resulting (and any other
 //! pending) completions decrement `refs`, and the last one releases the slot.
-//! Phase-0 tears the whole connection down on the first EOF in either direction
-//! (no keep-alive reuse, no half-close propagation — those are later refinements).
+//!
+//! Phase-0 contract: **one request per connection.** The head is primed
+//! upstream with hop-by-hop headers stripped and `Connection: close` injected
+//! (zero-copy, as bounded segmented sends), so a compliant upstream closes
+//! after its response; the first EOF in either direction tears the whole
+//! connection down. Without the forced close, a keep-alive client could pin a
+//! pool slot until the deadline and relay further pipelined requests through
+//! the tunnel picked by the *first* request's route — a routing bypass.
+//! Responses are relayed verbatim; real keep-alive needs response framing
+//! (Phase 2). `Upgrade` requests cannot survive a forced close and are
+//! refused with 501.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -37,11 +46,22 @@ const resp_400 = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: c
 const resp_404 = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const resp_431 = "HTTP/1.1 431 Request Header Fields Too Large\r\n" ++
     "Content-Length: 0\r\nConnection: close\r\n\r\n";
+const resp_501 = "HTTP/1.1 501 Not Implemented\r\n" ++
+    "Content-Length: 0\r\nConnection: close\r\n\r\n";
 const resp_502 = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const resp_503 = "HTTP/1.1 503 Service Unavailable\r\n" ++
     "Content-Length: 0\r\nConnection: close\r\n\r\n";
 const resp_505 = "HTTP/1.1 505 HTTP Version Not Supported\r\n" ++
     "Content-Length: 0\r\nConnection: close\r\n\r\n";
+
+/// Injected in place of the request's hop-by-hop headers when priming the
+/// upstream, terminating the head: one request per connection, so the upstream
+/// closes after its response (see the module comment).
+const connection_close_header = "Connection: close\r\n\r\n";
+
+/// Upper bound on prime segments: one kept run around each skipped header line
+/// plus the `Connection: close` injection and any buffered body bytes.
+const prime_segments_max = constants.headers_max + 3;
 
 /// One direction of the relay: read from `src_fd`, write to `dst_fd`, repeat.
 ///
@@ -132,6 +152,13 @@ pub const ProxyConn = struct {
     head_buf: [constants.read_buf_bytes]u8,
     head_filled: usize,
     headers_storage: [constants.headers_max]h1.Header,
+
+    // The upstream-bound head as slices of `head_buf` (plus the static
+    // `Connection: close` injection), laid out by `buildPrimeSegments`.
+    prime_segments: [prime_segments_max][]const u8,
+    prime_segment_count: usize,
+    prime_segment_index: usize,
+    /// Bytes sent of the current segment.
     prime_sent: usize,
 
     // Fixed error response in flight (`fail`); empty when unused.
@@ -183,6 +210,8 @@ pub const ProxyConn = struct {
         conn.timeout_ns = timeout_ns;
         conn.timeout_armed = false;
         conn.head_filled = 0;
+        conn.prime_segment_count = 0;
+        conn.prime_segment_index = 0;
         conn.prime_sent = 0;
         conn.fail_response = "";
         conn.fail_sent = 0;
@@ -315,9 +344,13 @@ pub const ProxyConn = struct {
 
     fn routeAndConnect(conn: *ProxyConn, request: *const h1.Request) void {
         assert(conn.up_fd < 0); // no upstream socket yet
+        // A protocol upgrade cannot survive the forced `Connection: close`;
+        // refuse it honestly rather than letting it fail at the upstream.
+        if (request.header("upgrade") != null) return conn.fail(resp_501);
         const cluster = conn.router.route(request.host(), request.target) orelse
             return conn.fail(resp_404);
         const endpoint = conn.rr.pick(cluster) orelse return conn.fail(resp_503);
+        conn.buildPrimeSegments(request);
         conn.up_fd = createTcpSocket() orelse return conn.fail(resp_502);
         assert(conn.up_fd >= 0);
         conn.retain();
@@ -341,9 +374,50 @@ pub const ProxyConn = struct {
 
     // ---- forward buffered request bytes, then relay -----------------------
 
+    /// Lay out the upstream-bound request as slices of `head_buf`: hop-by-hop
+    /// header lines are skipped and a static `Connection: close` terminator is
+    /// injected, all without copying a byte. This makes one-request-per-
+    /// connection real: the upstream closes after its response, and a second
+    /// pipelined request can never reach the first request's cluster.
+    fn buildPrimeSegments(conn: *ProxyConn, request: *const h1.Request) void {
+        assert(request.head_len >= 4); // shortest head: request line + blank line
+        assert(request.head_len <= conn.head_filled);
+        var count: usize = 0;
+        var kept_start: usize = 0;
+        for (request.headers) |header| {
+            if (!isHopByHopHeader(request, header.name)) continue;
+            const line_start = @intFromPtr(header.line.ptr) - @intFromPtr(&conn.head_buf);
+            assert(line_start >= kept_start); // header lines are in buffer order
+            assert(line_start + header.line.len <= request.head_len);
+            if (line_start > kept_start) {
+                conn.prime_segments[count] = conn.head_buf[kept_start..line_start];
+                count += 1;
+            }
+            kept_start = line_start + header.line.len;
+        }
+        const head_end = request.head_len - 2; // stop before the blank-line CRLF
+        if (head_end > kept_start) {
+            conn.prime_segments[count] = conn.head_buf[kept_start..head_end];
+            count += 1;
+        }
+        conn.prime_segments[count] = connection_close_header;
+        count += 1;
+        if (conn.head_filled > request.head_len) { // body bytes already buffered
+            conn.prime_segments[count] = conn.head_buf[request.head_len..conn.head_filled];
+            count += 1;
+        }
+        assert(count >= 2); // at least the request line and the injected close
+        assert(count <= prime_segments_max);
+        conn.prime_segment_count = count;
+        conn.prime_segment_index = 0;
+        conn.prime_sent = 0;
+    }
+
     fn armPrime(conn: *ProxyConn) void {
         assert(conn.up_fd >= 0);
-        assert(conn.prime_sent < conn.head_filled);
+        assert(conn.prime_segment_index < conn.prime_segment_count);
+        const segment = conn.prime_segments[conn.prime_segment_index];
+        assert(conn.prime_sent < segment.len);
         conn.retain();
         conn.io.send(
             *ProxyConn,
@@ -351,7 +425,7 @@ pub const ProxyConn = struct {
             onPrimeSent,
             &conn.aux_completion,
             conn.up_fd,
-            conn.head_buf[conn.prime_sent..conn.head_filled],
+            segment[conn.prime_sent..],
         );
     }
 
@@ -359,9 +433,13 @@ pub const ProxyConn = struct {
         defer conn.releaseRef();
         if (conn.closing) return;
         const m = result catch return conn.teardown();
+        const segment = conn.prime_segments[conn.prime_segment_index];
         conn.prime_sent += m;
-        assert(conn.prime_sent <= conn.head_filled); // never forward past the buffered head
-        if (conn.prime_sent < conn.head_filled) return conn.armPrime();
+        assert(conn.prime_sent <= segment.len); // never forward past the segment
+        if (conn.prime_sent < segment.len) return conn.armPrime(); // finish a partial write
+        conn.prime_segment_index += 1;
+        conn.prime_sent = 0;
+        if (conn.prime_segment_index < conn.prime_segment_count) return conn.armPrime();
         conn.startRelay();
     }
 
@@ -516,9 +594,30 @@ fn outcomeFor(response: []const u8) access_log.Outcome {
     if (response.ptr == resp_400.ptr) return .bad_request;
     if (response.ptr == resp_404.ptr) return .not_found;
     if (response.ptr == resp_431.ptr) return .too_large;
+    if (response.ptr == resp_501.ptr) return .not_implemented;
     if (response.ptr == resp_502.ptr) return .no_upstream;
     if (response.ptr == resp_503.ptr) return .unavailable;
     return .bad_version; // resp_505
+}
+
+/// RFC 9110 §7.6.1: `Connection` itself, the legacy keep-alive headers, and
+/// any header the request's `Connection` value names are hop-by-hop — they
+/// must not be forwarded to the upstream.
+fn isHopByHopHeader(request: *const h1.Request, name: []const u8) bool {
+    assert(name.len > 0); // parser rejects empty header names
+    if (std.ascii.eqlIgnoreCase(name, "connection")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "keep-alive")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "proxy-connection")) return true;
+    for (request.headers) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
+        // Bounded by the header value's length (itself bounded by the head buffer).
+        var tokens = std.mem.splitScalar(u8, header.value, ',');
+        while (tokens.next()) |token| {
+            const trimmed = std.mem.trim(u8, token, " \t");
+            if (std.ascii.eqlIgnoreCase(trimmed, name)) return true;
+        }
+    }
+    return false;
 }
 
 fn createTcpSocket() ?posix.socket_t {
@@ -539,14 +638,17 @@ fn sockaddrIn(address: Ip4Address) linux.sockaddr.in {
 // ---- tests ----------------------------------------------------------------
 
 /// Minimal origin driven on the same IO loop: accept one connection, read the
-/// request, reply with a fixed response, and close.
+/// request head (the proxy primes it as several segmented sends), reply with a
+/// fixed response, and close. The received bytes stay in `request_buf` so tests
+/// can assert on what was actually forwarded.
 const TestOrigin = struct {
     io: *IO,
     listener: Listener,
     response: []const u8,
     sent: usize = 0,
     fd: posix.socket_t = -1,
-    reqbuf: [1024]u8 = undefined,
+    request_buf: [1024]u8 = undefined,
+    request_len: usize = 0,
     accept_c: Completion = undefined,
     recv_c: Completion = undefined,
     send_c: Completion = undefined,
@@ -561,10 +663,25 @@ const TestOrigin = struct {
         result: io_mod.AcceptError!posix.socket_t,
     ) void {
         origin.fd = result catch return;
-        origin.io.recv(*TestOrigin, origin, onRecv, &origin.recv_c, origin.fd, &origin.reqbuf);
+        origin.armRecv();
+    }
+    fn armRecv(origin: *TestOrigin) void {
+        origin.io.recv(
+            *TestOrigin,
+            origin,
+            onRecv,
+            &origin.recv_c,
+            origin.fd,
+            origin.request_buf[origin.request_len..],
+        );
     }
     fn onRecv(origin: *TestOrigin, _: *Completion, result: io_mod.RecvError!usize) void {
-        _ = result catch return;
+        const n = result catch return;
+        if (n == 0) return; // peer closed before completing the head
+        origin.request_len += n;
+        const received = origin.request_buf[0..origin.request_len];
+        // Respond only once the whole head has arrived.
+        if (std.mem.indexOf(u8, received, "\r\n\r\n") == null) return origin.armRecv();
         origin.sent = 0;
         origin.armSend();
     }
@@ -668,6 +785,154 @@ test "proxy: forwards a request to an upstream and relays the response" {
     try std.testing.expectEqualStrings(response, c.buf[0..c.len]);
 
     // Let the proxy finish tearing the connection down and reclaim its slot.
+    while (pool.free_count != pool.capacity) try io.run_once();
+}
+
+test "proxy: strips hop-by-hop headers and forces Connection: close upstream" {
+    const gpa = std.testing.allocator;
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    var origin = TestOrigin{ .io = &io, .listener = origin_listener, .response = response };
+    origin.start();
+
+    var json_buf: [256]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
+    , .{origin_listener.boundAddress().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.connection_timeout_ns,
+    );
+    server.start();
+
+    const client = try connectLoopback(proxy_listener.boundAddress().port);
+    defer _ = linux.close(client);
+
+    // `Connection` names "x-hop", making X-Hop hop-by-hop as well; all of the
+    // keep-alive machinery must be replaced by a single `Connection: close`.
+    const Client = struct {
+        io: *IO,
+        fd: posix.socket_t,
+        buf: [512]u8 = undefined,
+        len: usize = 0,
+        done: bool = false,
+        send_c: Completion = undefined,
+        recv_c: Completion = undefined,
+        fn go(c: *@This()) void {
+            c.io.recv(*@This(), c, onRecv, &c.recv_c, c.fd, &c.buf);
+            c.io.send(*@This(), c, onSend, &c.send_c, c.fd, "GET / HTTP/1.1\r\n" ++
+                "Host: o\r\n" ++
+                "Connection: keep-alive, x-hop\r\n" ++
+                "X-Hop: secret\r\n" ++
+                "Keep-Alive: timeout=5\r\n" ++
+                "Accept: */*\r\n\r\n");
+        }
+        fn onSend(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
+            _ = c;
+        }
+        fn onRecv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
+            c.len = result catch 0;
+            c.done = true;
+        }
+    };
+    var c = Client{ .io = &io, .fd = client };
+    c.go();
+
+    try io.run_until_done(&c.done);
+    try std.testing.expectEqualStrings(response, c.buf[0..c.len]);
+    while (pool.free_count != pool.capacity) try io.run_once();
+
+    const forwarded = origin.request_buf[0..origin.request_len];
+    try std.testing.expect(std.mem.startsWith(u8, forwarded, "GET / HTTP/1.1\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, forwarded, "Host: o\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forwarded, "Accept: */*\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, forwarded, "Connection: close\r\n\r\n"));
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(forwarded, "keep-alive") == null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(forwarded, "x-hop") == null);
+}
+
+test "proxy: refuses an Upgrade request with 501 instead of tunneling it" {
+    const gpa = std.testing.allocator;
+    var io = try IO.init(16, 0);
+    defer io.deinit();
+
+    // The endpoint is never contacted; the refusal happens before routing.
+    var cfg = try config.parse(gpa,
+        \\{ "listen": "0.0.0.0:0", "routes": [{ "cluster": "o" }],
+        \\  "clusters": [{ "name": "o", "endpoints": ["127.0.0.1:9"] }] }
+    );
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 2);
+    defer pool.deinit(gpa);
+
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.connection_timeout_ns,
+    );
+    server.start();
+
+    const client = try connectLoopback(proxy_listener.boundAddress().port);
+    defer _ = linux.close(client);
+
+    const Client = struct {
+        io: *IO,
+        fd: posix.socket_t,
+        buf: [512]u8 = undefined,
+        len: usize = 0,
+        done: bool = false,
+        send_c: Completion = undefined,
+        recv_c: Completion = undefined,
+        fn go(c: *@This()) void {
+            c.io.recv(*@This(), c, onRecv, &c.recv_c, c.fd, &c.buf);
+            c.io.send(*@This(), c, onSend, &c.send_c, c.fd, "GET /ws HTTP/1.1\r\n" ++
+                "Host: o\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n");
+        }
+        fn onSend(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
+            _ = c;
+        }
+        fn onRecv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
+            c.len = result catch 0;
+            c.done = true;
+        }
+    };
+    var c = Client{ .io = &io, .fd = client };
+    c.go();
+
+    try io.run_until_done(&c.done);
+    try std.testing.expect(std.mem.startsWith(u8, c.buf[0..c.len], "HTTP/1.1 501 "));
     while (pool.free_count != pool.capacity) try io.run_once();
 }
 
