@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
     const router = Router.init(&cfg);
 
     const worker_count = std.Thread.getCpuCount() catch 1;
-    assert(worker_count >= 1); // at least this thread runs a worker
+    assert(worker_count >= 1); // one worker thread is spawned even if the count fails
 
     // Shared counters (atomic) and per-worker access logs, reserved up front.
     var metrics: Metrics = .{};
