@@ -47,6 +47,7 @@ pub const guard = @import("mem/guard.zig");
 
 test {
     _ = io;
+    _ = @import("io/test_io.zig");
     _ = @import("net/listener.zig");
     _ = h1;
     _ = chunked;
