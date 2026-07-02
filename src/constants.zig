@@ -36,9 +36,19 @@ pub const chunk_size_digits_max: u8 = 16;
 pub const chunk_extension_bytes_max: u32 = 256;
 pub const trailer_bytes_max: u32 = 4096;
 
-/// Overall per-connection deadline. Backstops slow-loris clients and stalled
-/// relays: a connection that lives longer than this is torn down.
-pub const connection_timeout_ns: u63 = 30 * std.time.ns_per_s;
+/// Per-request deadline, first head byte to last response byte. Backstops
+/// slow-loris clients, stalled relays, and unresponsive upstreams.
+pub const request_timeout_ns: u63 = 30 * std.time.ns_per_s;
+
+/// How long a keep-alive connection may sit idle between requests.
+pub const idle_timeout_ns: u63 = 60 * std.time.ns_per_s;
+
+/// The per-connection timer fires at least this often and re-checks the
+/// current absolute deadline. Deadlines can therefore move (request phase ->
+/// idle phase) without any cancel/re-arm dance — exactly one timeout op is
+/// in flight per connection — at the cost of up to one tick of enforcement
+/// slop when a deadline moves closer.
+pub const timeout_tick_ns: u63 = 1 * std.time.ns_per_s;
 
 /// Idle upstream connections parked per worker (across all endpoints).
 /// Checkin beyond this closes the connection instead of keeping it.

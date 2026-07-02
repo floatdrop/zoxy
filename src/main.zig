@@ -107,7 +107,8 @@ fn runWorker(
         router,
         metrics,
         access,
-        constants.connection_timeout_ns,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
     );
     server.start();
     while (true) {

@@ -194,8 +194,11 @@ pub const ProxyConn = struct {
     closing: bool,
     /// In-flight io_uring operations for this connection.
     refs: u32,
-    /// Overall deadline; the timer is armed for the connection's whole life.
-    timeout_ns: u63,
+    request_timeout_ns: u63,
+    idle_timeout_ns: u63,
+    /// Absolute (CLOCK_MONOTONIC) deadline for the current phase. Phase
+    /// transitions just move it; the single ticking timer enforces it.
+    deadline_ns: u64,
     timeout_armed: bool,
 
     head_buf: [constants.read_buf_bytes]u8,
@@ -286,7 +289,8 @@ pub const ProxyConn = struct {
         metrics: *Metrics,
         access: *AccessLog,
         down_fd: posix.socket_t,
-        timeout_ns: u63,
+        request_timeout_ns: u63,
+        idle_timeout_ns: u63,
     ) void {
         assert(down_fd >= 0);
         conn.io = io;
@@ -300,7 +304,9 @@ pub const ProxyConn = struct {
         conn.up_fd = -1;
         conn.closing = false;
         conn.refs = 0;
-        conn.timeout_ns = timeout_ns;
+        conn.request_timeout_ns = request_timeout_ns;
+        conn.idle_timeout_ns = idle_timeout_ns;
+        conn.setDeadline(request_timeout_ns); // a fresh connection owes a request
         conn.timeout_armed = false;
         conn.head_filled = 0;
         conn.up_close_pending = false;
@@ -314,18 +320,32 @@ pub const ProxyConn = struct {
         assert(conn.refs >= 1);
     }
 
+    /// Move the current phase's deadline; the ticking timer picks it up.
+    fn setDeadline(conn: *ProxyConn, timeout_ns: u63) void {
+        assert(timeout_ns > 0);
+        conn.deadline_ns = monotonicNanos() + timeout_ns;
+    }
+
     fn armTimeout(conn: *ProxyConn) void {
         assert(!conn.timeout_armed);
+        const now = monotonicNanos();
+        // Sleep to the deadline, but at most one tick: if the deadline moves
+        // closer meanwhile (request phase -> idle phase), enforcement is late
+        // by at most the tick.
+        const remaining = if (conn.deadline_ns > now) conn.deadline_ns - now else 1;
+        const sleep_ns: u63 = @intCast(@min(remaining, constants.timeout_tick_ns));
+        assert(sleep_ns > 0);
         conn.retain();
         conn.timeout_armed = true;
-        conn.io.timeout(*ProxyConn, conn, onTimeout, &conn.timeout_completion, conn.timeout_ns);
+        conn.io.timeout(*ProxyConn, conn, onTimeout, &conn.timeout_completion, sleep_ns);
     }
 
     fn onTimeout(conn: *ProxyConn, _: *Completion, _: io_mod.TimeoutError!void) void {
         defer conn.releaseRef();
         conn.timeout_armed = false;
         if (conn.closing) return; // fired late / we cancelled it
-        conn.teardown(); // deadline exceeded
+        if (monotonicNanos() >= conn.deadline_ns) return conn.teardown(); // deadline exceeded
+        conn.armTimeout(); // still time left (or the deadline moved); keep watching
     }
 
     fn retain(conn: *ProxyConn) void {
@@ -445,6 +465,8 @@ pub const ProxyConn = struct {
         if (conn.closing) return;
         const n = result catch return conn.teardown();
         if (n == 0) return conn.teardown(); // client closed before (or between) requests
+        // Idle phase ends with the first byte: the request clock starts.
+        if (!conn.request_active) conn.setDeadline(conn.request_timeout_ns);
         conn.request_active = true; // bytes arrived: a request is in flight
         assert(n <= conn.head_buf.len - conn.head_filled); // recv was bounded by the tail
         conn.head_filled += n;
@@ -864,6 +886,10 @@ pub const ProxyConn = struct {
         conn.head_filled = excess;
         conn.resetRequestState();
         conn.request_active = conn.head_filled > 0; // pipelined bytes = a request in flight
+        // A pipelined request starts its clock now; otherwise the idle clock runs.
+        const next_timeout_ns =
+            if (conn.request_active) conn.request_timeout_ns else conn.idle_timeout_ns;
+        conn.setDeadline(next_timeout_ns);
         conn.processHead();
     }
 
@@ -924,7 +950,8 @@ pub const ProxyServer = struct {
     access: *AccessLog,
     rr: RoundRobin,
     upstream_pool: UpstreamPool,
-    timeout_ns: u63,
+    request_timeout_ns: u63,
+    idle_timeout_ns: u63,
     accept_completion: Completion,
     accept_retry_completion: Completion,
 
@@ -935,7 +962,8 @@ pub const ProxyServer = struct {
         router: *const Router,
         metrics: *Metrics,
         access: *AccessLog,
-        timeout_ns: u63,
+        request_timeout_ns: u63,
+        idle_timeout_ns: u63,
     ) ProxyServer {
         return .{
             .io = io,
@@ -946,7 +974,8 @@ pub const ProxyServer = struct {
             .access = access,
             .rr = .{},
             .upstream_pool = .{},
-            .timeout_ns = timeout_ns,
+            .request_timeout_ns = request_timeout_ns,
+            .idle_timeout_ns = idle_timeout_ns,
             .accept_completion = undefined,
             .accept_retry_completion = undefined,
         };
@@ -989,7 +1018,8 @@ pub const ProxyServer = struct {
                     server.metrics,
                     server.access,
                     fd,
-                    server.timeout_ns,
+                    server.request_timeout_ns,
+                    server.idle_timeout_ns,
                 );
             } else {
                 server.metrics.rejected.add(1);
@@ -1101,6 +1131,12 @@ fn sockaddrIn(address: Ip4Address) linux.sockaddr.in {
         .port = std.mem.nativeToBig(u16, address.port),
         .addr = @bitCast(address.bytes),
     };
+}
+
+fn monotonicNanos() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
 // ---- tests ----------------------------------------------------------------
@@ -1225,7 +1261,8 @@ test "proxy: forwards a request to an upstream and relays the response" {
         &router,
         &metrics,
         &access,
-        constants.connection_timeout_ns,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
     );
     defer server.deinit();
     server.start();
@@ -1313,7 +1350,8 @@ test "proxy: strips hop-by-hop headers from the forwarded request" {
         &router,
         &metrics,
         &access,
-        constants.connection_timeout_ns,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
     );
     defer server.deinit();
     server.start();
@@ -1393,7 +1431,8 @@ test "proxy: refuses an Upgrade request with 501 instead of tunneling it" {
         &router,
         &metrics,
         &access,
-        constants.connection_timeout_ns,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
     );
     defer server.deinit();
     server.start();
@@ -1475,7 +1514,8 @@ test "proxy: completes promptly when a lingering upstream sends a framed respons
         &router,
         &metrics,
         &access,
-        constants.connection_timeout_ns,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
     );
     defer server.deinit();
     server.start();
@@ -1513,12 +1553,6 @@ test "proxy: completes promptly when a lingering upstream sends a framed respons
     while (pool.free_count != pool.capacity) try io.run_once();
     // Well under the 30s deadline: the framer ended the response, not a timer.
     try std.testing.expect(monotonicNanos() - started_ns < 5 * std.time.ns_per_s);
-}
-
-fn monotonicNanos() u64 {
-    var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
 test "proxy: relays a chunked response and ends it at the terminal chunk" {
@@ -1566,7 +1600,8 @@ test "proxy: relays a chunked response and ends it at the terminal chunk" {
         &router,
         &metrics,
         &access,
-        constants.connection_timeout_ns,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
     );
     defer server.deinit();
     server.start();
@@ -1649,7 +1684,8 @@ test "proxy: serves pipelined requests sequentially, each routed on its own" {
         &router,
         &metrics,
         &access,
-        constants.connection_timeout_ns,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
     );
     defer server.deinit();
     server.start();
@@ -1746,7 +1782,8 @@ test "proxy: reuses the downstream connection for sequential keep-alive requests
         &router,
         &metrics,
         &access,
-        constants.connection_timeout_ns,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
     );
     defer server.deinit();
     server.start();
@@ -1861,7 +1898,8 @@ test "proxy: reuses a pooled upstream connection for the next request" {
         &router,
         &metrics,
         &access,
-        constants.connection_timeout_ns,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
     );
     defer server.deinit();
     server.start();
@@ -1970,7 +2008,8 @@ test "proxy: retries a stale pooled upstream on a fresh connection" {
         &router,
         &metrics,
         &access,
-        constants.connection_timeout_ns,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
     );
     defer server.deinit();
     server.start();
@@ -2081,7 +2120,8 @@ test "proxy: does not reuse the connection for an HTTP/1.0 client" {
         &router,
         &metrics,
         &access,
-        constants.connection_timeout_ns,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
     );
     defer server.deinit();
     server.start();
@@ -2169,7 +2209,8 @@ test "proxy: streams a framed request body to the upstream" {
         &router,
         &metrics,
         &access,
-        constants.connection_timeout_ns,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
     );
     defer server.deinit();
     server.start();
@@ -2253,7 +2294,8 @@ test "proxy: answers 502 when the upstream response is unparseable" {
         &router,
         &metrics,
         &access,
-        constants.connection_timeout_ns,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
     );
     defer server.deinit();
     server.start();
@@ -2331,7 +2373,8 @@ test "proxy: relays a response larger than the relay buffer with bounded memory"
         &router,
         &metrics,
         &access,
-        constants.connection_timeout_ns,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
     );
     defer server.deinit();
     server.start();
@@ -2403,6 +2446,7 @@ test "proxy: a stalled connection is reclaimed by the deadline" {
         &metrics,
         &access,
         short_timeout,
+        short_timeout,
     );
     defer server.deinit();
     server.start();
@@ -2418,6 +2462,108 @@ test "proxy: a stalled connection is reclaimed by the deadline" {
     try std.testing.expectEqual(pool.capacity - 1, pool.free_count);
     // ...and the deadline must reclaim it; without the timer this would hang.
     while (pool.free_count != pool.capacity) try io.run_once();
+}
+
+test "proxy: an idle keep-alive connection is reclaimed by the idle timeout" {
+    const gpa = std.testing.allocator;
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO";
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    var origin = TestOrigin{
+        .io = &io,
+        .listener = origin_listener,
+        .response = response,
+        .close_after_send = false,
+    };
+    origin.start();
+    defer if (origin.fd >= 0) {
+        _ = linux.close(origin.fd);
+    };
+
+    var json_buf: [256]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
+    , .{origin_listener.boundAddress().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    // Idle enforcement lags by at most the in-flight timer, which is bounded
+    // by the request timeout here — keep both short so the test is fast.
+    const request_timeout: u63 = 300 * std.time.ns_per_ms;
+    const idle_timeout: u63 = 100 * std.time.ns_per_ms;
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        request_timeout,
+        idle_timeout,
+    );
+    defer server.deinit();
+    server.start();
+
+    const client = try connectLoopback(proxy_listener.boundAddress().port);
+    defer _ = linux.close(client);
+
+    // One complete keep-alive exchange; then the client goes silent.
+    const Client = struct {
+        io: *IO,
+        fd: posix.socket_t,
+        expected: []const u8,
+        buf: [512]u8 = undefined,
+        len: usize = 0,
+        got_response: bool = false,
+        eof: bool = false,
+        send_c: Completion = undefined,
+        recv_c: Completion = undefined,
+        fn go(c: *@This()) void {
+            c.armRecv();
+            c.io.send(*@This(), c, onSend, &c.send_c, c.fd, "GET / HTTP/1.1\r\n" ++
+                "Host: o\r\n\r\n");
+        }
+        fn armRecv(c: *@This()) void {
+            c.io.recv(*@This(), c, onRecv, &c.recv_c, c.fd, c.buf[c.len..]);
+        }
+        fn onSend(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
+            _ = c;
+        }
+        fn onRecv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
+            const n = result catch 0;
+            if (n == 0) { // the idle deadline closed us
+                c.eof = true;
+                return;
+            }
+            c.len += n;
+            if (c.len >= c.expected.len) c.got_response = true;
+            c.armRecv();
+        }
+    };
+    var c = Client{ .io = &io, .fd = client, .expected = response };
+    c.go();
+
+    const started_ns = monotonicNanos();
+    try io.run_until_done(&c.eof);
+    try std.testing.expect(c.got_response);
+    try std.testing.expectEqualStrings(response, c.buf[0..c.len]);
+    while (pool.free_count != pool.capacity) try io.run_once();
+    // Reclaimed by the idle deadline (~100-400ms), not the old 30s whole-life
+    // deadline and not the request timeout alone.
+    try std.testing.expect(monotonicNanos() - started_ns < 2 * std.time.ns_per_s);
 }
 
 test "proxy: the serving path allocates nothing after startup (zero-alloc gate)" {
@@ -2456,7 +2602,8 @@ test "proxy: the serving path allocates nothing after startup (zero-alloc gate)"
         &router,
         &metrics,
         &access,
-        constants.connection_timeout_ns,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
     );
     defer server.deinit();
     server.start();
