@@ -106,7 +106,7 @@ fn parseRequestLine(line: []const u8) ParseError!RequestLine {
     const after_method = line[sp1 + 1 ..];
     const sp2 = std.mem.indexOfScalar(u8, after_method, ' ') orelse return error.Malformed;
     const target = after_method[0..sp2];
-    if (target.len == 0) return error.Malformed;
+    if (target.len == 0 or !isTargetText(target)) return error.Malformed;
     assert(target.len > 0);
 
     return .{
@@ -170,8 +170,30 @@ fn readLine(input: []const u8, pos: *usize) ?[]const u8 {
     return null;
 }
 
-/// True if every byte is a visible, non-whitespace token character.
+/// RFC 9110 token characters: DIGIT / ALPHA / "!#$%&'*+-.^_`|~". Everything
+/// else — separators, whitespace, control bytes, high-bit bytes — is out.
+const token_chars: [256]bool = blk: {
+    var table = [_]bool{false} ** 256;
+    for ("!#$%&'*+-.^_`|~") |c| table[c] = true;
+    for ('0'..'9' + 1) |c| table[c] = true;
+    for ('a'..'z' + 1) |c| table[c] = true;
+    for ('A'..'Z' + 1) |c| table[c] = true;
+    break :blk table;
+};
+
+/// True if every byte is an RFC 9110 token character. A strict charset for
+/// methods and header names keeps smuggling tricks (and bytes an upstream
+/// might interpret differently than we do) out of the forwarded head.
 fn isToken(s: []const u8) bool {
+    for (s) |c| {
+        if (!token_chars[c]) return false;
+    }
+    return true;
+}
+
+/// True if every byte may appear in a request target: visible ASCII plus
+/// high-bit bytes (lenient toward raw i18n URLs); controls are rejected.
+fn isTargetText(s: []const u8) bool {
     for (s) |c| {
         if (c <= 0x20 or c == 0x7f) return false;
     }
@@ -246,6 +268,23 @@ test "h1: rejects malformed requests" {
         parse("GET / HTTP/1.1\r\nBad Name: v\r\n\r\n", &headers),
     );
     try std.testing.expectError(error.Malformed, parse("GET / WHAT/1.1\r\n\r\n", &headers));
+}
+
+test "h1: rejects non-token bytes in method and header names" {
+    var headers: [4]Header = undefined;
+    // Separators and high-bit bytes are not RFC 9110 token characters.
+    try std.testing.expectError(error.Malformed, parse("GE\"T / HTTP/1.1\r\n\r\n", &headers));
+    try std.testing.expectError(
+        error.Malformed,
+        parse("GET / HTTP/1.1\r\nX(y: v\r\n\r\n", &headers),
+    );
+    try std.testing.expectError(
+        error.Malformed,
+        parse("GET / HTTP/1.1\r\nX\xffy: v\r\n\r\n", &headers),
+    );
+    // Control bytes in the target are rejected; high-bit bytes are tolerated.
+    try std.testing.expectError(error.Malformed, parse("GET /\x01 HTTP/1.1\r\n\r\n", &headers));
+    _ = try parse("GET /\xc3\xa9 HTTP/1.1\r\n\r\n", &headers);
 }
 
 test "h1: rejects unsupported versions" {
