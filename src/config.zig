@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const constants = @import("constants.zig");
 const Ip4Address = std.Io.net.Ip4Address;
 
 pub const Endpoint = struct {
@@ -14,6 +15,9 @@ pub const Endpoint = struct {
 pub const Cluster = struct {
     name: []const u8,
     endpoints: []const Endpoint,
+    /// Position within `Config.clusters`; always < `clusters_max`. Keys the
+    /// per-cluster balancer state, which is reserved statically per worker.
+    index: usize,
 };
 
 pub const Route = struct {
@@ -48,6 +52,7 @@ pub const ParseError = error{
     InvalidAddress,
     UnknownCluster,
     NoClusters,
+    TooManyClusters,
 } || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error;
 
 /// JSON shape mirrored 1:1 for decoding, then lowered into `Config`.
@@ -79,14 +84,21 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
     defer parsed.deinit();
     const dto = parsed.value;
 
+    // Balancer state is reserved statically, one counter per cluster index.
+    if (dto.clusters.len > constants.clusters_max) return error.TooManyClusters;
     const clusters = try a.alloc(Cluster, dto.clusters.len);
     assert(clusters.len == dto.clusters.len);
-    for (dto.clusters, clusters) |dc, *cluster| {
+    assert(clusters.len <= constants.clusters_max);
+    for (dto.clusters, clusters, 0..) |dc, *cluster, index| {
         const endpoints = try a.alloc(Endpoint, dc.endpoints.len);
         for (dc.endpoints, endpoints) |text_addr, *endpoint| {
             endpoint.* = .{ .address = try parseAddress(text_addr) };
         }
-        cluster.* = .{ .name = try a.dupe(u8, dc.name), .endpoints = endpoints };
+        cluster.* = .{
+            .name = try a.dupe(u8, dc.name),
+            .endpoints = endpoints,
+            .index = index,
+        };
     }
 
     const routes = try a.alloc(Route, dto.routes.len);
@@ -167,6 +179,22 @@ test "config: rejects a route to an unknown cluster" {
         \\{ "listen": "0.0.0.0:80", "routes": [{ "cluster": "ghost" }], "clusters": [] }
     ;
     try std.testing.expectError(error.UnknownCluster, parse(std.testing.allocator, bad));
+}
+
+test "config: rejects more clusters than clusters_max" {
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try w.print("{{ \"listen\": \"0.0.0.0:80\", \"routes\": [], \"clusters\": [", .{});
+    var i: usize = 0;
+    while (i < constants.clusters_max + 1) : (i += 1) {
+        if (i > 0) try w.print(",", .{});
+        try w.print("{{ \"name\": \"c{d}\", \"endpoints\": [] }}", .{i});
+    }
+    try w.print("] }}", .{});
+    try std.testing.expectError(
+        error.TooManyClusters,
+        parse(std.testing.allocator, w.buffered()),
+    );
 }
 
 test "config: rejects an invalid address" {

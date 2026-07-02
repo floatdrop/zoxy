@@ -22,6 +22,10 @@ pub const accept_backlog: u32 = 1024;
 /// never grown. The head must also fit within `read_buf_bytes`.
 pub const headers_max: usize = 64;
 
+/// Maximum clusters in a config. Bounds the per-worker balancer state so
+/// round-robin counters can be reserved statically, one per cluster.
+pub const clusters_max: usize = 64;
+
 /// Per-direction relay buffer for streaming request bodies and responses.
 pub const relay_buf_bytes: usize = 16 * 1024;
 
