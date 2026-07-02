@@ -77,7 +77,7 @@ fn fail(comptime message: []const u8, extra: anytype) noreturn {
 pub fn main(init: std.process.Init) !void {
     const gpa = init.arena.allocator();
     const args = try init.minimal.args.toSlice(gpa);
-    if (args.len > 1 and std.mem.eql(u8, args[1], "fuzz")) return fuzz();
+    if (args.len > 1 and std.mem.eql(u8, args[1], "fuzz")) return fuzz(init.io);
     const seed_base: u64 = if (args.len > 1) try std.fmt.parseInt(u64, args[1], 10) else 0;
     const iterations: u64 =
         if (args.len > 2) try std.fmt.parseInt(u64, args[2], 10) else iterations_default;
@@ -98,9 +98,11 @@ pub fn main(init: std.process.Init) !void {
 
 /// Run forever on entropy-derived seeds. Each iteration is still fully
 /// deterministic from its seed — the panic handler prints it on failure.
-fn fuzz() !void {
+/// (`process_io` is the process's std.Io, used once for the seed; the
+/// simulation runs on its own virtual IO.)
+fn fuzz(process_io: std.Io) !void {
     var entropy: [8]u8 = undefined;
-    _ = std.os.linux.getrandom(&entropy, entropy.len, 0);
+    process_io.random(&entropy);
     const seed_base = std.mem.readInt(u64, &entropy, .little);
     std.debug.print("sim: fuzzing from seed base {d}\n", .{seed_base});
     var responses_total: u64 = 0;
