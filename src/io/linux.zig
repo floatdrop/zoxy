@@ -23,6 +23,11 @@ const cqes_batch_max = 256;
 /// the retry loop finite (TigerStyle: "put a limit on everything").
 const submit_retries_max = 8;
 
+/// Busy loop iterations between clock refreshes. Busy iterations run in
+/// microseconds, so staleness stays far below the second-granularity
+/// deadlines; any *blocking* wait refreshes unconditionally.
+const clock_refresh_interval = 256;
+
 /// Resubmissions of one operation that completed with EINTR/EAGAIN. Sockets
 /// are non-blocking; io_uring normally poll-arms instead of surfacing EAGAIN,
 /// but if a kernel ever does, an unbounded resubmit would spin the loop.
@@ -136,12 +141,21 @@ pub const IO = struct {
     queued: u32 = 0,
     /// Operations submitted and awaiting completion.
     in_kernel: u32 = 0,
+    /// Monotonic time, refreshed after any blocking wait and every
+    /// `clock_refresh_interval` busy iterations. Deadline math runs in every
+    /// callback, and per-call vdso clock reads were ~3% of data-path CPU
+    /// (once-per-iteration caching measured no better: the loop iterates
+    /// about as often as the clock was read).
+    cached_now_ns: u64 = 0,
+    clock_age_iterations: u32 = 0,
 
     /// `entries` is the io_uring queue depth; must be a power of two.
     pub fn init(entries: u16, flags: u32) !IO {
         assert(entries > 0);
         assert(std.math.isPowerOfTwo(entries));
-        return .{ .ring = try IoUring.init(entries, flags) };
+        var io: IO = .{ .ring = try IoUring.init(entries, flags) };
+        io.refresh_clock();
+        return io;
     }
 
     pub fn deinit(io: *IO) void {
@@ -305,13 +319,26 @@ pub const IO = struct {
 
     // ---- synchronous helpers (seam-uniform with the simulator) ------------
 
-    /// Nanosecond monotonic clock. Deadline arithmetic must go through the
-    /// IO seam so the simulator can substitute a virtual clock.
+    /// Nanosecond monotonic clock, cached per loop iteration (see the field).
+    /// Deadline arithmetic must go through the IO seam so the simulator can
+    /// substitute a virtual clock.
     pub fn now_ns(io: *IO) u64 {
-        _ = io;
+        assert(io.cached_now_ns > 0); // refreshed at init and every iteration
+        return io.cached_now_ns;
+    }
+
+    fn refresh_clock(io: *IO) void {
         var ts: linux.timespec = undefined;
         _ = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
-        return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+        io.cached_now_ns =
+            @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+        io.clock_age_iterations = 0;
+        assert(io.cached_now_ns > 0);
+    }
+
+    fn age_clock(io: *IO, blocked: bool) void {
+        io.clock_age_iterations += 1;
+        if (blocked or io.clock_age_iterations >= clock_refresh_interval) io.refresh_clock();
     }
 
     /// A non-blocking TCP socket with TCP_NODELAY set, or null on failure.
@@ -359,6 +386,7 @@ pub const IO = struct {
     pub fn tick(io: *IO) !void {
         io.flush_submissions();
         try io.reap(0);
+        io.age_clock(false);
         io.run_completed();
     }
 
@@ -372,7 +400,9 @@ pub const IO = struct {
         }
         // Only block in the kernel when no callbacks are ready to run; a callback
         // may enqueue more work (TigerBeetle's run_for_ns rule).
-        try io.reap(if (io.completed.count == 0) 1 else 0);
+        const may_block = io.completed.count == 0;
+        try io.reap(if (may_block) 1 else 0);
+        io.age_clock(may_block);
         io.run_completed();
     }
 
