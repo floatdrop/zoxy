@@ -370,6 +370,16 @@ and the single-ticking-timer deadline design that avoids cancel/re-arm races.
 ### Phase 4 — Operability
 - Graceful drain + hot restart (FD passing over a unix socket, à la HAProxy
   `SCM_RIGHTS`; drain via `Connection: close` / GOAWAY; transfer stats).
+- **Accept balancing across workers.** Measured 2026-07 (per-worker accept
+  counters, `zoxy_worker_accepted`): the SO_REUSEPORT hash is uniform at
+  large N (1.14:1 over 150k accepts) but few long-lived connections pin
+  small-sample variance — at 64 keep-alive connections over 8 workers the
+  hottest worker drew 15/64 (23% of load, 3.75:1 max:min), and the system
+  saturates when *it* does. Options: an `SO_ATTACH_REUSEPORT_EBPF` program
+  (round-robin or least-loaded assignment) or a userspace acceptor handing
+  fds to workers over `SCM_RIGHTS` — the same machinery hot restart needs.
+  Matters most for few-hot-connections traffic (an LB tier or HTTP/2 in
+  front); high-connection-count traffic self-smooths.
 - Consistent-hash LB (ring-hash / Maglev). Distributed tracing (B3/W3C
   propagation) + Prometheus metrics.
 
