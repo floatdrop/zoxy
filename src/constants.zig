@@ -26,6 +26,47 @@ pub const headers_max: usize = 64;
 /// round-robin counters can be reserved statically, one per cluster.
 pub const clusters_max: usize = 64;
 
+/// Maximum endpoints in a single cluster. Bounds the per-worker resilience
+/// state (in-flight counts, outlier ejection, health) so it can be reserved
+/// statically, one slot per (cluster, endpoint).
+pub const endpoints_per_cluster_max: u32 = 16;
+
+/// Hard cap on a cluster's configured `retry.max`. Bounds the retry loop and
+/// the worst-case backoff shift (`base << attempts`).
+pub const retry_attempts_max: u8 = 5;
+
+/// Defaults for a cluster `retry` block: fully-jittered exponential backoff,
+/// delay drawn uniformly from [0, min(base << attempt, cap)).
+pub const retry_backoff_base_ns_default: u63 = 25 * std.time.ns_per_ms;
+pub const retry_backoff_cap_ns_default: u63 = 1 * std.time.ns_per_s;
+
+/// Retry budget defaults (Envoy-style): retries may be in flight up to
+/// max(budget_min, requests_active * budget_percent / 100) per worker.
+pub const retry_budget_percent_default: u8 = 20;
+pub const retry_budget_min_default: u32 = 3;
+
+/// Defaults for a cluster `outlier` block (passive outlier detection):
+/// consecutive attempt failures before an endpoint is ejected, how long it
+/// stays ejected, and the ceiling on the ejected share of a cluster.
+pub const outlier_consecutive_failures_default: u32 = 5;
+pub const outlier_ejection_ns_default: u63 = 30 * std.time.ns_per_s;
+pub const outlier_ejection_percent_max_default: u8 = 50;
+
+/// Defaults for a cluster `health_check` block (active TCP-connect probes,
+/// per worker, in-ring).
+pub const health_interval_ns_default: u63 = 5 * std.time.ns_per_s;
+pub const health_timeout_ns_default: u63 = 2 * std.time.ns_per_s;
+pub const health_threshold_healthy_default: u16 = 2;
+pub const health_threshold_unhealthy_default: u16 = 3;
+
+/// Concurrent health probes in flight per worker; further due probes wait
+/// for a free slot (bounded, never queued via allocation).
+pub const health_probes_inflight_max: u32 = 8;
+
+/// The health checker's scheduler tick: due-probe scan and probe-timeout
+/// enforcement granularity.
+pub const health_tick_ns: u63 = 100 * std.time.ns_per_ms;
+
 /// Per-direction relay buffer for streaming request bodies and responses.
 pub const relay_buf_bytes: usize = 16 * 1024;
 

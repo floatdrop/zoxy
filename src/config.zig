@@ -12,12 +12,54 @@ pub const Endpoint = struct {
     address: Ip4Address,
 };
 
+/// Sentinel for an unconfigured circuit-breaker limit: never trips.
+pub const limit_none: u32 = std.math.maxInt(u32);
+
+/// A cluster's resolved resilience settings (Phase 2, docs/DESIGN.md §7).
+/// Defaults mean "feature off"; a present JSON block enables the feature with
+/// per-field defaults from `constants`. All durations are pre-converted to
+/// nanoseconds at parse time so the data path never does unit math. All
+/// limits are per worker (share-nothing): a cluster-wide budget is the
+/// configured value times the worker count.
+pub const ResiliencePolicy = struct {
+    /// Configured retry attempts after the first try; 0 = retries off (the
+    /// built-in one-shot stale-pooled-connection replay stays either way).
+    retry_max: u8 = 0,
+    retry_backoff_base_ns: u63 = constants.retry_backoff_base_ns_default,
+    retry_backoff_cap_ns: u63 = constants.retry_backoff_cap_ns_default,
+    retry_budget_percent: u8 = constants.retry_budget_percent_default,
+    retry_budget_min: u32 = constants.retry_budget_min_default,
+
+    /// Deadline per upstream attempt (connect + time to first response
+    /// byte); 0 = disabled. Enforced by the per-connection ticking timer,
+    /// so it must be at least `constants.timeout_tick_ns`.
+    per_try_timeout_ns: u63 = 0,
+
+    // Circuit breaker (per worker): `limit_none` = unbounded.
+    max_connections: u32 = limit_none,
+    max_pending: u32 = limit_none,
+    max_requests: u32 = limit_none,
+    max_retries: u32 = limit_none,
+
+    /// Passive outlier detection; 0 = off.
+    outlier_consecutive_failures: u32 = 0,
+    outlier_ejection_ns: u63 = constants.outlier_ejection_ns_default,
+    outlier_ejection_percent_max: u8 = constants.outlier_ejection_percent_max_default,
+
+    /// Active TCP health probes; 0 interval = off.
+    health_interval_ns: u63 = 0,
+    health_timeout_ns: u63 = constants.health_timeout_ns_default,
+    health_threshold_healthy: u16 = constants.health_threshold_healthy_default,
+    health_threshold_unhealthy: u16 = constants.health_threshold_unhealthy_default,
+};
+
 pub const Cluster = struct {
     name: []const u8,
     endpoints: []const Endpoint,
     /// Position within `Config.clusters`; always < `clusters_max`. Keys the
     /// per-cluster balancer state, which is reserved statically per worker.
     index: usize,
+    policy: ResiliencePolicy,
 };
 
 pub const Route = struct {
@@ -55,6 +97,8 @@ pub const ParseError = error{
     UnknownCluster,
     NoClusters,
     TooManyClusters,
+    TooManyEndpoints,
+    InvalidLimit,
 } || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error;
 
 /// JSON shape mirrored 1:1 for decoding, then lowered into `Config`.
@@ -72,6 +116,37 @@ const Dto = struct {
     const ClusterDto = struct {
         name: []const u8,
         endpoints: []const []const u8,
+        retry: ?RetryDto = null,
+        circuit_breaker: ?CircuitBreakerDto = null,
+        outlier: ?OutlierDto = null,
+        health_check: ?HealthCheckDto = null,
+        per_try_timeout_ms: u32 = 0,
+    };
+    // Absent per-field values fall back to `constants` defaults during
+    // lowering (kept out of the DTO so the defaults live in one place).
+    const RetryDto = struct {
+        max: u8,
+        backoff_base_ms: ?u32 = null,
+        backoff_cap_ms: ?u32 = null,
+        budget_percent: ?u8 = null,
+        budget_min: ?u32 = null,
+    };
+    const CircuitBreakerDto = struct {
+        max_connections: ?u32 = null,
+        max_pending: ?u32 = null,
+        max_requests: ?u32 = null,
+        max_retries: ?u32 = null,
+    };
+    const OutlierDto = struct {
+        consecutive_failures: ?u32 = null,
+        ejection_ms: ?u32 = null,
+        max_ejection_percent: ?u8 = null,
+    };
+    const HealthCheckDto = struct {
+        interval_ms: ?u32 = null,
+        timeout_ms: ?u32 = null,
+        healthy_threshold: ?u16 = null,
+        unhealthy_threshold: ?u16 = null,
     };
 };
 
@@ -93,6 +168,8 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
     assert(clusters.len == dto.clusters.len);
     assert(clusters.len <= constants.clusters_max);
     for (dto.clusters, clusters, 0..) |dc, *cluster, index| {
+        // Per-endpoint resilience state is reserved statically per worker.
+        if (dc.endpoints.len > constants.endpoints_per_cluster_max) return error.TooManyEndpoints;
         const endpoints = try a.alloc(Endpoint, dc.endpoints.len);
         for (dc.endpoints, endpoints) |text_addr, *endpoint| {
             endpoint.* = .{ .address = try parse_address(text_addr) };
@@ -101,6 +178,7 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
             .name = try a.dupe(u8, dc.name),
             .endpoints = endpoints,
             .index = index,
+            .policy = try resolve_policy(&dc),
         };
     }
 
@@ -127,6 +205,82 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
         .routes = routes,
         .clusters = clusters,
     };
+}
+
+/// Lower a cluster's optional resilience blocks into a resolved policy:
+/// absent block = feature off; absent field = `constants` default; every
+/// configured value validated here so the data path can assert, not check.
+fn resolve_policy(dc: *const Dto.ClusterDto) error{InvalidLimit}!ResiliencePolicy {
+    var policy: ResiliencePolicy = .{};
+    if (dc.retry) |retry| {
+        if (retry.max == 0 or retry.max > constants.retry_attempts_max) return error.InvalidLimit;
+        const percent = retry.budget_percent orelse constants.retry_budget_percent_default;
+        if (percent == 0 or percent > 100) return error.InvalidLimit;
+        policy.retry_max = retry.max;
+        policy.retry_budget_percent = percent;
+        policy.retry_budget_min = retry.budget_min orelse constants.retry_budget_min_default;
+        if (retry.backoff_base_ms) |ms| policy.retry_backoff_base_ns = ms_to_ns(ms);
+        if (retry.backoff_cap_ms) |ms| policy.retry_backoff_cap_ns = ms_to_ns(ms);
+        if (policy.retry_backoff_base_ns == 0) return error.InvalidLimit;
+        if (policy.retry_backoff_cap_ns < policy.retry_backoff_base_ns) return error.InvalidLimit;
+    }
+    if (dc.per_try_timeout_ms > 0) {
+        policy.per_try_timeout_ns = ms_to_ns(dc.per_try_timeout_ms);
+        // Enforced by the ticking timer; a deadline under one tick would
+        // always be late by more than its own length.
+        if (policy.per_try_timeout_ns < constants.timeout_tick_ns) return error.InvalidLimit;
+    }
+    if (dc.circuit_breaker) |breaker| {
+        policy.max_connections = breaker.max_connections orelse limit_none;
+        policy.max_pending = breaker.max_pending orelse limit_none;
+        policy.max_requests = breaker.max_requests orelse limit_none;
+        policy.max_retries = breaker.max_retries orelse limit_none;
+        const limits = [_]u32{
+            policy.max_connections, policy.max_pending,
+            policy.max_requests,    policy.max_retries,
+        };
+        for (limits) |limit| if (limit == 0) return error.InvalidLimit;
+    }
+    if (dc.outlier) |outlier| {
+        const failures = outlier.consecutive_failures orelse
+            constants.outlier_consecutive_failures_default;
+        const percent = outlier.max_ejection_percent orelse
+            constants.outlier_ejection_percent_max_default;
+        if (failures == 0 or percent == 0 or percent > 100) return error.InvalidLimit;
+        policy.outlier_consecutive_failures = failures;
+        policy.outlier_ejection_percent_max = percent;
+        if (outlier.ejection_ms) |ms| policy.outlier_ejection_ns = ms_to_ns(ms);
+        if (policy.outlier_ejection_ns == 0) return error.InvalidLimit;
+    }
+    if (dc.health_check) |health| return resolve_health(policy, &health);
+    return policy;
+}
+
+fn resolve_health(
+    base: ResiliencePolicy,
+    health: *const Dto.HealthCheckDto,
+) error{InvalidLimit}!ResiliencePolicy {
+    var policy = base;
+    assert(policy.health_interval_ns == 0); // health is resolved exactly once
+    policy.health_interval_ns = if (health.interval_ms) |ms|
+        ms_to_ns(ms)
+    else
+        constants.health_interval_ns_default;
+    if (health.timeout_ms) |ms| policy.health_timeout_ns = ms_to_ns(ms);
+    policy.health_threshold_healthy = health.healthy_threshold orelse
+        constants.health_threshold_healthy_default;
+    policy.health_threshold_unhealthy = health.unhealthy_threshold orelse
+        constants.health_threshold_unhealthy_default;
+    if (policy.health_interval_ns == 0 or policy.health_timeout_ns == 0) return error.InvalidLimit;
+    if (policy.health_threshold_healthy == 0) return error.InvalidLimit;
+    if (policy.health_threshold_unhealthy == 0) return error.InvalidLimit;
+    return policy;
+}
+
+/// Config durations are milliseconds; the data path runs on nanoseconds.
+/// u32 milliseconds always fit a u63 nanosecond count (2^32 * 10^6 < 2^63).
+fn ms_to_ns(ms: u32) u63 {
+    return @as(u63, ms) * std.time.ns_per_ms;
 }
 
 fn find_cluster_in(clusters: []const Cluster, name: []const u8) ?*const Cluster {
@@ -220,4 +374,114 @@ test "config: rejects an invalid address" {
         \\{ "listen": "not-an-address", "routes": [], "clusters": [] }
     ;
     try std.testing.expectError(error.InvalidAddress, parse(std.testing.allocator, bad));
+}
+
+test "config: absent resilience blocks mean every feature is off" {
+    var config = try parse(std.testing.allocator, test_config);
+    defer config.deinit();
+
+    const policy = config.find_cluster("api").?.policy;
+    try std.testing.expectEqual(@as(u8, 0), policy.retry_max);
+    try std.testing.expectEqual(@as(u63, 0), policy.per_try_timeout_ns);
+    try std.testing.expectEqual(limit_none, policy.max_connections);
+    try std.testing.expectEqual(limit_none, policy.max_pending);
+    try std.testing.expectEqual(limit_none, policy.max_requests);
+    try std.testing.expectEqual(limit_none, policy.max_retries);
+    try std.testing.expectEqual(@as(u32, 0), policy.outlier_consecutive_failures);
+    try std.testing.expectEqual(@as(u63, 0), policy.health_interval_ns);
+}
+
+test "config: resilience blocks resolve fields, defaults, and ms to ns" {
+    var config = try parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"],
+        \\    "retry": { "max": 3, "backoff_base_ms": 50 },
+        \\    "per_try_timeout_ms": 2000,
+        \\    "circuit_breaker": { "max_requests": 128 },
+        \\    "outlier": { "consecutive_failures": 7 },
+        \\    "health_check": { "interval_ms": 1000 } }] }
+    );
+    defer config.deinit();
+
+    const policy = config.find_cluster("c").?.policy;
+    try std.testing.expectEqual(@as(u8, 3), policy.retry_max);
+    try std.testing.expectEqual(@as(u63, 50 * std.time.ns_per_ms), policy.retry_backoff_base_ns);
+    // Absent fields inside a present block fall back to constants defaults.
+    try std.testing.expectEqual(constants.retry_backoff_cap_ns_default, policy.retry_backoff_cap_ns);
+    try std.testing.expectEqual(constants.retry_budget_percent_default, policy.retry_budget_percent);
+    try std.testing.expectEqual(constants.retry_budget_min_default, policy.retry_budget_min);
+    try std.testing.expectEqual(@as(u63, 2 * std.time.ns_per_s), policy.per_try_timeout_ns);
+    try std.testing.expectEqual(@as(u32, 128), policy.max_requests);
+    try std.testing.expectEqual(limit_none, policy.max_connections);
+    try std.testing.expectEqual(@as(u32, 7), policy.outlier_consecutive_failures);
+    try std.testing.expectEqual(constants.outlier_ejection_ns_default, policy.outlier_ejection_ns);
+    try std.testing.expectEqual(@as(u63, 1 * std.time.ns_per_s), policy.health_interval_ns);
+    try std.testing.expectEqual(constants.health_timeout_ns_default, policy.health_timeout_ns);
+    try std.testing.expectEqual(
+        constants.health_threshold_healthy_default,
+        policy.health_threshold_healthy,
+    );
+}
+
+test "config: rejects more endpoints than endpoints_per_cluster_max" {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try w.print(
+        \\{{ "listen": "0.0.0.0:80", "routes": [],
+        \\   "clusters": [{{ "name": "c", "endpoints": [
+    , .{});
+    var i: usize = 0;
+    while (i < constants.endpoints_per_cluster_max + 1) : (i += 1) {
+        if (i > 0) try w.print(",", .{});
+        try w.print("\"127.0.0.1:{d}\"", .{9000 + i});
+    }
+    try w.print("] }}] }}", .{});
+    try std.testing.expectError(
+        error.TooManyEndpoints,
+        parse(std.testing.allocator, w.buffered()),
+    );
+}
+
+test "config: rejects out-of-range resilience limits" {
+    const cases = [_][]const u8{
+        // retry.max of zero (omit the block to disable) and beyond the cap
+        \\"retry": { "max": 0 }
+        ,
+        \\"retry": { "max": 6 }
+        ,
+        // budget percent beyond 100
+        \\"retry": { "max": 1, "budget_percent": 101 }
+        ,
+        // backoff cap below base
+        \\"retry": { "max": 1, "backoff_base_ms": 100, "backoff_cap_ms": 50 }
+        ,
+        // per-try below one timer tick (1s)
+        \\"per_try_timeout_ms": 500
+        ,
+        // zero-valued breaker limit (omit the field for unbounded)
+        \\"circuit_breaker": { "max_requests": 0 }
+        ,
+        // zero outlier threshold / over-100 ejection share
+        \\"outlier": { "consecutive_failures": 0 }
+        ,
+        \\"outlier": { "max_ejection_percent": 101 }
+        ,
+        // zero health interval / thresholds
+        \\"health_check": { "interval_ms": 0 }
+        ,
+        \\"health_check": { "healthy_threshold": 0 }
+        ,
+    };
+    for (cases) |case| {
+        var buf: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try w.print(
+            \\{{ "listen": "0.0.0.0:80", "routes": [],
+            \\   "clusters": [{{ "name": "c", "endpoints": [], {s} }}] }}
+        , .{case});
+        try std.testing.expectError(
+            error.InvalidLimit,
+            parse(std.testing.allocator, w.buffered()),
+        );
+    }
 }
