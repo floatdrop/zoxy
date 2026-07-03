@@ -23,7 +23,7 @@ pub const CountingAllocator = struct {
 
     /// Calls that create or move a heap allocation (i.e. must not happen on the
     /// serving path). Frees are excluded — releasing startup memory is fine.
-    pub fn allocationCount(self: *const CountingAllocator) usize {
+    pub fn allocation_count(self: *const CountingAllocator) usize {
         return self.allocations + self.resizes + self.remaps;
     }
 
@@ -73,8 +73,8 @@ test "guard: counts heap-touching calls, ignores frees" {
     const a = counting.allocator();
 
     const buf = try a.alloc(u8, 32);
-    try std.testing.expectEqual(@as(usize, 1), counting.allocationCount());
+    try std.testing.expectEqual(@as(usize, 1), counting.allocation_count());
     a.free(buf);
-    try std.testing.expectEqual(@as(usize, 1), counting.allocationCount()); // frees don't count
+    try std.testing.expectEqual(@as(usize, 1), counting.allocation_count()); // frees don't count
     try std.testing.expectEqual(@as(usize, 1), counting.frees);
 }

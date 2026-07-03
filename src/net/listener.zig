@@ -21,14 +21,14 @@ pub const Listener = struct {
     };
 
     /// Create a non-blocking, reuseport TCP listener bound to `address`.
-    /// A `port` of 0 lets the kernel choose one; read it back with `boundAddress`.
+    /// A `port` of 0 lets the kernel choose one; read it back with `bound_address`.
     pub fn open(address: Ip4Address, backlog: u32) OpenError!Listener {
-        const fd = createSocket() orelse return error.SocketCreateFailed;
+        const fd = create_socket() orelse return error.SocketCreateFailed;
         errdefer _ = linux.close(fd);
 
-        setReuse(fd) catch return error.SetSockOptFailed;
+        set_reuse(fd) catch return error.SetSockOptFailed;
 
-        var sa = sockaddrIn(address);
+        var sa = sockaddr_in(address);
         if (posix.errno(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
             return error.BindFailed;
         }
@@ -44,7 +44,7 @@ pub const Listener = struct {
     }
 
     /// The bound address, resolving an ephemeral port assigned by the kernel.
-    pub fn boundAddress(listener: Listener) Ip4Address {
+    pub fn bound_address(listener: Listener) Ip4Address {
         var sa: linux.sockaddr.in = undefined;
         var len: posix.socklen_t = @sizeOf(linux.sockaddr.in);
         const rc = linux.getsockname(listener.fd, @ptrCast(&sa), &len);
@@ -54,21 +54,21 @@ pub const Listener = struct {
     }
 };
 
-fn createSocket() ?posix.socket_t {
+fn create_socket() ?posix.socket_t {
     const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK;
     const rc = linux.socket(linux.AF.INET, flags, 0);
     if (posix.errno(rc) != .SUCCESS) return null;
     return @intCast(rc);
 }
 
-fn setReuse(fd: posix.socket_t) posix.SetSockOptError!void {
+fn set_reuse(fd: posix.socket_t) posix.SetSockOptError!void {
     const on: c_int = 1;
     const bytes = std.mem.asBytes(&on);
     try posix.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, bytes);
     try posix.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, bytes);
 }
 
-fn sockaddrIn(address: Ip4Address) linux.sockaddr.in {
+fn sockaddr_in(address: Ip4Address) linux.sockaddr.in {
     return .{
         .family = linux.AF.INET,
         .port = std.mem.nativeToBig(u16, address.port),
@@ -85,7 +85,7 @@ test "listener: accepts a loopback connection" {
 
     var listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer listener.close();
-    const port = listener.boundAddress().port;
+    const port = listener.bound_address().port;
 
     // Blocking loopback connect completes the handshake into the accept queue.
     const client: posix.socket_t = blk: {
@@ -95,7 +95,7 @@ test "listener: accepts a loopback connection" {
     };
     defer _ = linux.close(client);
     {
-        var sa = sockaddrIn(Ip4Address.loopback(port));
+        var sa = sockaddr_in(Ip4Address.loopback(port));
         const rc = linux.connect(client, @ptrCast(&sa), @sizeOf(linux.sockaddr.in));
         try std.testing.expect(posix.errno(rc) == .SUCCESS);
     }
@@ -106,14 +106,14 @@ test "listener: accepts a loopback connection" {
     const Harness = struct {
         accepted_fd: posix.socket_t = -1,
         done: bool = false,
-        fn onAccept(h: *@This(), _: *Completion, result: io_mod.AcceptError!posix.socket_t) void {
+        fn on_accept(h: *@This(), _: *Completion, result: io_mod.AcceptError!posix.socket_t) void {
             h.accepted_fd = result catch -1;
             h.done = true;
         }
     };
     var h = Harness{};
     var completion: Completion = undefined;
-    io.accept(*Harness, &h, Harness.onAccept, &completion, listener.fd);
+    io.accept(*Harness, &h, Harness.on_accept, &completion, listener.fd);
     try io.run_until_done(&h.done);
 
     try std.testing.expect(h.accepted_fd >= 0);
@@ -123,11 +123,11 @@ test "listener: accepts a loopback connection" {
 test "listener: two workers share one reuseport address" {
     var a = try Listener.open(Ip4Address.loopback(0), 8);
     defer a.close();
-    const port = a.boundAddress().port;
+    const port = a.bound_address().port;
 
     // A second listener binds the same port thanks to SO_REUSEPORT — this is how
     // every worker shares one address and the kernel balances accepts.
     var b = try Listener.open(Ip4Address.loopback(port), 8);
     defer b.close();
-    try std.testing.expectEqual(port, b.boundAddress().port);
+    try std.testing.expectEqual(port, b.bound_address().port);
 }

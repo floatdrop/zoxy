@@ -46,7 +46,7 @@ pub const Metrics = struct {
 
     /// Write a Prometheus-style text exposition of every counter. Array
     /// fields become labeled series, one per non-zero slot.
-    pub fn writeText(metrics: *const Metrics, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    pub fn write_text(metrics: *const Metrics, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         inline for (@typeInfo(Metrics).@"struct".fields) |field| {
             if (comptime field.type == Counter) {
                 const counter: *const Counter = &@field(metrics, field.name);
@@ -76,12 +76,12 @@ test "metrics: counters add, sub, and load" {
     try std.testing.expectEqual(@as(u64, 0), m.rejected.load());
 }
 
-test "metrics: writeText dumps every counter" {
+test "metrics: write_text dumps every counter" {
     var m = Metrics{};
     m.requests.add(7);
     var buf: [512]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try m.writeText(&w);
+    try m.write_text(&w);
     const out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "zoxy_requests 7\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "zoxy_accepted 0\n") != null);
@@ -93,7 +93,7 @@ test "metrics: per-worker counters emit labeled series, zeros omitted" {
     m.worker_accepted[5].add(9);
     var buf: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try m.writeText(&w);
+    try m.write_text(&w);
     const out = w.buffered();
     const series_0 = "zoxy_worker_accepted{worker=\"0\"} 3\n";
     const series_5 = "zoxy_worker_accepted{worker=\"5\"} 9\n";

@@ -54,7 +54,7 @@ pub fn main(init: std.process.Init) !void {
     for (threads, pools, accesses, 0..) |*thread, *pool, *access, cpu| {
         thread.* = try std.Thread.spawn(
             .{},
-            runWorker,
+            run_worker,
             .{ cfg.listen, pool, &router, &metrics, access, cpu },
         );
     }
@@ -81,7 +81,7 @@ pub fn main(init: std.process.Init) !void {
 
 /// One share-nothing worker: its own IO ring, SO_REUSEPORT listener, and pool,
 /// pinned to a core. Runs the proxy accept/relay loop forever.
-fn runWorker(
+fn run_worker(
     listen: Ip4Address,
     pool: *Pool,
     router: *const Router,
@@ -90,14 +90,14 @@ fn runWorker(
     cpu: usize,
 ) void {
     assert(pool.capacity > 0);
-    pinToCpu(cpu);
+    pin_to_cpu(cpu);
 
     var io = IO.init(constants.io_ring_entries, 0) catch |err|
-        return logWorkerError("io init", err);
+        return log_worker_error("io init", err);
     defer io.deinit();
 
     var listener = Listener.open(listen, constants.accept_backlog) catch |err|
-        return logWorkerError("listen", err);
+        return log_worker_error("listen", err);
     defer listener.close();
 
     var server = ProxyServer.init(
@@ -114,13 +114,13 @@ fn runWorker(
     server.worker_index = @intCast(@min(cpu, constants.workers_max - 1));
     server.start();
     while (true) {
-        io.run_once() catch |err| return logWorkerError("io run", err);
+        io.run_once() catch |err| return log_worker_error("io run", err);
         access.flush(); // batched: one write per event-loop iteration, off the per-connection path
     }
 }
 
 /// Best-effort CPU pinning (Linux only). Failure is non-fatal.
-fn pinToCpu(cpu: usize) void {
+fn pin_to_cpu(cpu: usize) void {
     var set = std.mem.zeroes(linux.cpu_set_t);
     const bits = @bitSizeOf(usize);
     assert(bits > 0);
@@ -130,6 +130,6 @@ fn pinToCpu(cpu: usize) void {
     linux.sched_setaffinity(0, &set) catch {};
 }
 
-fn logWorkerError(what: []const u8, err: anyerror) void {
+fn log_worker_error(what: []const u8, err: anyerror) void {
     std.log.err("zoxy worker {s}: {s}", .{ what, @errorName(err) });
 }

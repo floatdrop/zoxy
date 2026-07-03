@@ -53,7 +53,7 @@ pub const ChunkedDecoder = struct {
         assert(decoder.state != .done);
         const c = bytes[0];
         switch (decoder.state) {
-            .chunk_size => return decoder.stepChunkSize(c),
+            .chunk_size => return decoder.step_chunk_size(c),
             .chunk_extension => {
                 if (c == '\r') {
                     decoder.state = .chunk_size_lf;
@@ -96,7 +96,7 @@ pub const ChunkedDecoder = struct {
                     return 1;
                 }
                 decoder.state = .trailer_line;
-                try decoder.countTrailerByte();
+                try decoder.count_trailer_byte();
                 return 1;
             },
             .trailer_line => {
@@ -104,7 +104,7 @@ pub const ChunkedDecoder = struct {
                     decoder.state = .trailer_line_lf;
                     return 1;
                 }
-                try decoder.countTrailerByte();
+                try decoder.count_trailer_byte();
                 return 1;
             },
             .trailer_line_lf => {
@@ -121,8 +121,8 @@ pub const ChunkedDecoder = struct {
         }
     }
 
-    fn stepChunkSize(decoder: *ChunkedDecoder, c: u8) error{Malformed}!usize {
-        if (hexDigit(c)) |digit| {
+    fn step_chunk_size(decoder: *ChunkedDecoder, c: u8) error{Malformed}!usize {
+        if (hex_digit(c)) |digit| {
             if (decoder.size_digits == constants.chunk_size_digits_max) return error.Malformed;
             decoder.remaining = decoder.remaining * 16 + digit;
             decoder.size_digits += 1;
@@ -141,13 +141,13 @@ pub const ChunkedDecoder = struct {
         return error.Malformed;
     }
 
-    fn countTrailerByte(decoder: *ChunkedDecoder) error{Malformed}!void {
+    fn count_trailer_byte(decoder: *ChunkedDecoder) error{Malformed}!void {
         decoder.trailer_bytes += 1;
         if (decoder.trailer_bytes > constants.trailer_bytes_max) return error.Malformed;
     }
 };
 
-fn hexDigit(c: u8) ?u64 {
+fn hex_digit(c: u8) ?u64 {
     return switch (c) {
         '0'...'9' => c - '0',
         'a'...'f' => c - 'a' + 10,

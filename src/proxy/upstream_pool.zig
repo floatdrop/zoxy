@@ -27,7 +27,7 @@ pub const UpstreamPool = struct {
     pub fn checkout(pool: *UpstreamPool, address: Ip4Address) ?posix.socket_t {
         for (&pool.slots) |*slot| {
             if (slot.fd < 0) continue;
-            if (!addressEqual(slot.address, address)) continue;
+            if (!address_equal(slot.address, address)) continue;
             const fd = slot.fd;
             slot.fd = -1;
             assert(pool.count > 0);
@@ -67,7 +67,7 @@ pub const UpstreamPool = struct {
     }
 };
 
-fn addressEqual(a: Ip4Address, b: Ip4Address) bool {
+fn address_equal(a: Ip4Address, b: Ip4Address) bool {
     return a.port == b.port and std.mem.eql(u8, &a.bytes, &b.bytes);
 }
 

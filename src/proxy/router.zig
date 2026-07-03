@@ -18,22 +18,22 @@ pub const Router = struct {
     /// `host` is the (optional) Host header; `target` is the request target.
     pub fn route(router: Router, host: ?[]const u8, target: []const u8) ?*const Cluster {
         for (router.config.routes) |r| {
-            if (!hostMatches(r.host, host)) continue;
+            if (!host_matches(r.host, host)) continue;
             if (!std.mem.startsWith(u8, target, r.path_prefix)) continue;
-            return router.config.findCluster(r.cluster);
+            return router.config.find_cluster(r.cluster);
         }
         return null;
     }
 };
 
-fn hostMatches(pattern: []const u8, host: ?[]const u8) bool {
+fn host_matches(pattern: []const u8, host: ?[]const u8) bool {
     if (std.mem.eql(u8, pattern, "*")) return true;
     const h = host orelse return false;
-    return std.ascii.eqlIgnoreCase(pattern, stripPort(h));
+    return std.ascii.eqlIgnoreCase(pattern, strip_port(h));
 }
 
 /// Drop a trailing ":port" from a Host header value for comparison.
-fn stripPort(host: []const u8) []const u8 {
+fn strip_port(host: []const u8) []const u8 {
     const colon = std.mem.lastIndexOfScalar(u8, host, ':') orelse return host;
     return host[0..colon];
 }

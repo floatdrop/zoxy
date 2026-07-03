@@ -42,7 +42,7 @@ pub const Config = struct {
         config.gpa.destroy(config.arena);
     }
 
-    pub fn findCluster(config: Config, name: []const u8) ?*const Cluster {
+    pub fn find_cluster(config: Config, name: []const u8) ?*const Cluster {
         for (config.clusters) |*cluster| {
             if (std.mem.eql(u8, cluster.name, name)) return cluster;
         }
@@ -95,7 +95,7 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
     for (dto.clusters, clusters, 0..) |dc, *cluster, index| {
         const endpoints = try a.alloc(Endpoint, dc.endpoints.len);
         for (dc.endpoints, endpoints) |text_addr, *endpoint| {
-            endpoint.* = .{ .address = try parseAddress(text_addr) };
+            endpoint.* = .{ .address = try parse_address(text_addr) };
         }
         cluster.* = .{
             .name = try a.dupe(u8, dc.name),
@@ -116,20 +116,20 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
 
     // Validate every route references a real cluster before we commit.
     for (routes) |route| {
-        if (findClusterIn(clusters, route.cluster) == null) return error.UnknownCluster;
+        if (find_cluster_in(clusters, route.cluster) == null) return error.UnknownCluster;
     }
 
     return .{
         .gpa = gpa,
         .arena = arena,
-        .listen = try parseAddress(dto.listen),
-        .admin = if (dto.admin) |text_addr| try parseAddress(text_addr) else null,
+        .listen = try parse_address(dto.listen),
+        .admin = if (dto.admin) |text_addr| try parse_address(text_addr) else null,
         .routes = routes,
         .clusters = clusters,
     };
 }
 
-fn findClusterIn(clusters: []const Cluster, name: []const u8) ?*const Cluster {
+fn find_cluster_in(clusters: []const Cluster, name: []const u8) ?*const Cluster {
     for (clusters) |*cluster| {
         if (std.mem.eql(u8, cluster.name, name)) return cluster;
     }
@@ -137,7 +137,7 @@ fn findClusterIn(clusters: []const Cluster, name: []const u8) ?*const Cluster {
 }
 
 /// Parse "host:port" (IPv4) into an address.
-fn parseAddress(text: []const u8) error{InvalidAddress}!Ip4Address {
+fn parse_address(text: []const u8) error{InvalidAddress}!Ip4Address {
     const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return error.InvalidAddress;
     assert(colon < text.len); // lastIndexOfScalar returns an in-bounds index
     const port = std.fmt.parseInt(u16, text[colon + 1 ..], 10) catch return error.InvalidAddress;
@@ -172,10 +172,10 @@ test "config: parses listen, routes, clusters" {
     try std.testing.expectEqualStrings("*", config.routes[1].host);
     try std.testing.expectEqualStrings("/", config.routes[1].path_prefix);
 
-    const api = config.findCluster("api").?;
+    const api = config.find_cluster("api").?;
     try std.testing.expectEqual(@as(usize, 2), api.endpoints.len);
     try std.testing.expectEqual(@as(u16, 9002), api.endpoints[1].address.port);
-    try std.testing.expect(config.findCluster("nope") == null);
+    try std.testing.expect(config.find_cluster("nope") == null);
 }
 
 test "config: admin endpoint is optional and parses when present" {

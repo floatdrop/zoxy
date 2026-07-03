@@ -18,11 +18,11 @@ pub const RoundRobin = struct {
 
     /// Pick the next endpoint, cycling through the cluster. Null if the cluster
     /// has no endpoints.
-    pub fn pick(rr: *RoundRobin, cluster: *const Cluster) ?*const Endpoint {
+    pub fn pick(round_robin: *RoundRobin, cluster: *const Cluster) ?*const Endpoint {
         if (cluster.endpoints.len == 0) return null;
         assert(cluster.endpoints.len > 0); // negative space: handled above
         assert(cluster.index < constants.clusters_max); // enforced by config.parse
-        const counter = &rr.next[cluster.index];
+        const counter = &round_robin.next[cluster.index];
         const index = counter.* % cluster.endpoints.len;
         assert(index < cluster.endpoints.len);
         counter.* +%= 1;
@@ -43,12 +43,12 @@ test "balancer: round-robin cycles endpoints" {
         \\}
     );
     defer cfg.deinit();
-    const cluster = cfg.findCluster("c").?;
+    const cluster = cfg.find_cluster("c").?;
 
-    var rr: RoundRobin = .{};
+    var round_robin: RoundRobin = .{};
     const ports = [_]u16{ 1, 2, 3, 1, 2 };
     for (ports) |expected| {
-        try std.testing.expectEqual(expected, rr.pick(cluster).?.address.port);
+        try std.testing.expectEqual(expected, round_robin.pick(cluster).?.address.port);
     }
 }
 
@@ -64,20 +64,20 @@ test "balancer: clusters rotate independently under interleaved traffic" {
         \\}
     );
     defer cfg.deinit();
-    const a = cfg.findCluster("a").?;
-    const b = cfg.findCluster("b").?;
+    const a = cfg.find_cluster("a").?;
+    const b = cfg.find_cluster("b").?;
 
     // With a counter shared across clusters, this alternating pattern pins "a"
     // to endpoint 1 and "b" to endpoint 4 forever. Per-cluster counters must
     // cycle both.
-    var rr: RoundRobin = .{};
+    var round_robin: RoundRobin = .{};
     const expected = [_]struct { cluster: *const Cluster, port: u16 }{
         .{ .cluster = a, .port = 1 }, .{ .cluster = b, .port = 3 },
         .{ .cluster = a, .port = 2 }, .{ .cluster = b, .port = 4 },
         .{ .cluster = a, .port = 1 }, .{ .cluster = b, .port = 3 },
     };
     for (expected) |pick| {
-        try std.testing.expectEqual(pick.port, rr.pick(pick.cluster).?.address.port);
+        try std.testing.expectEqual(pick.port, round_robin.pick(pick.cluster).?.address.port);
     }
 }
 
@@ -87,6 +87,6 @@ test "balancer: empty cluster yields null" {
         \\  "clusters": [{ "name": "c", "endpoints": [] }] }
     );
     defer cfg.deinit();
-    var rr: RoundRobin = .{};
-    try std.testing.expect(rr.pick(cfg.findCluster("c").?) == null);
+    var round_robin: RoundRobin = .{};
+    try std.testing.expect(round_robin.pick(cfg.find_cluster("c").?) == null);
 }

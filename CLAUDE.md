@@ -87,7 +87,7 @@ Consequences that bite if you forget them:
 | `src/io/linux.zig` | `IO` + `Completion` over `std.os.linux.IoUring`; ops: accept/recv/send/connect/close/timeout/cancel, plus sync seam helpers (now_ns, open_tcp_socket, shutdown_socket, close_now) |
 | `src/io/test_io.zig` | deterministic simulation backend: virtual sockets/clock, seeded scheduler, adversarial partial IO; selected when the root file declares `zoxy_io = .simulation` |
 | `src/sim.zig` | the simulator: real data path + misbehaving virtual origins/clients, per-seed invariants (no deadlock, no leaks, every response parses + frames) |
-| `src/net/proxy.zig` | **the data path**: `ProxyConn` (recvHead→parse→route→pool checkout or connect→framed relay→reuse or teardown), `Pipe` (one framed relay direction), `ProxyServer`, hop-by-hop header handling both ways, fixed 4xx/5xx responses, stale-pooled-upstream retry, integration + zero-alloc gate tests |
+| `src/net/proxy.zig` | **the data path**: `ProxyConn` (recv head→parse→route→pool checkout or connect→framed relay→reuse or teardown), `Pipe` (one framed relay direction), `ProxyServer`, hop-by-hop header handling both ways, fixed 4xx/5xx responses, stale-pooled-upstream retry, integration + zero-alloc gate tests |
 | `src/net/listener.zig` | `SO_REUSEPORT` TCP listener via raw linux syscalls (REUSEADDR+REUSEPORT set before bind) |
 | `src/net/pool.zig` | generic `Pool(T)` over an **intrusive free list** (requires `T.free_next: ?*T`); exhaustion rejects, never grows |
 | `src/http/h1.zig` | zero-copy HTTP/1.1 request+response parsers, RFC 9112 §6.3 body-framing decisions (smuggling shapes rejected), `BodyFramer` message-end tracker |

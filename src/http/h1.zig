@@ -34,7 +34,7 @@ pub const Request = struct {
 
     /// Case-insensitive header lookup; returns the first match.
     pub fn header(request: *const Request, name: []const u8) ?[]const u8 {
-        return findHeader(request.headers, name);
+        return find_header(request.headers, name);
     }
 
     pub fn host(request: *const Request) ?[]const u8 {
@@ -55,7 +55,7 @@ pub const Response = struct {
 
     /// Case-insensitive header lookup; returns the first match.
     pub fn header(response: *const Response, name: []const u8) ?[]const u8 {
-        return findHeader(response.headers, name);
+        return find_header(response.headers, name);
     }
 };
 
@@ -85,10 +85,10 @@ pub fn parse(input: []const u8, headers: []Header) ParseError!Parsed {
     assert(headers.len > 0);
     var pos: usize = 0;
 
-    const request_line = readLine(input, &pos) orelse return .incomplete;
-    const line = try parseRequestLine(request_line);
+    const request_line = read_line(input, &pos) orelse return .incomplete;
+    const line = try parse_request_line(request_line);
 
-    const count = (try readHeaders(input, &pos, headers)) orelse return .incomplete;
+    const count = (try read_headers(input, &pos, headers)) orelse return .incomplete;
     assert(count <= headers.len);
     assert(pos <= input.len);
     return .{ .complete = .{
@@ -102,14 +102,14 @@ pub fn parse(input: []const u8, headers: []Header) ParseError!Parsed {
 }
 
 /// Parse a response head out of `input`, filling `headers` with header lines.
-pub fn parseResponse(input: []const u8, headers: []Header) ParseError!ParsedResponse {
+pub fn parse_response(input: []const u8, headers: []Header) ParseError!ParsedResponse {
     assert(headers.len > 0);
     var pos: usize = 0;
 
-    const status_line = readLine(input, &pos) orelse return .incomplete;
-    const line = try parseStatusLine(status_line);
+    const status_line = read_line(input, &pos) orelse return .incomplete;
+    const line = try parse_status_line(status_line);
 
-    const count = (try readHeaders(input, &pos, headers)) orelse return .incomplete;
+    const count = (try read_headers(input, &pos, headers)) orelse return .incomplete;
     assert(count <= headers.len);
     assert(pos <= input.len);
     return .{ .complete = .{
@@ -122,21 +122,21 @@ pub fn parseResponse(input: []const u8, headers: []Header) ParseError!ParsedResp
 
 /// Read header lines up to and including the blank line, returning how many
 /// were stored. Null means the head is not yet complete.
-fn readHeaders(input: []const u8, pos: *usize, headers: []Header) ParseError!?usize {
+fn read_headers(input: []const u8, pos: *usize, headers: []Header) ParseError!?usize {
     var count: usize = 0;
     while (true) {
         const line_start = pos.*;
-        const header_line = readLine(input, pos) orelse return null;
+        const header_line = read_line(input, pos) orelse return null;
         if (header_line.len == 0) return count; // blank line terminates the head
         if (count == headers.len) return error.TooManyHeaders;
-        headers[count] = try parseHeader(header_line);
+        headers[count] = try parse_header(header_line);
         headers[count].line = input[line_start..pos.*];
         count += 1;
     }
 }
 
 /// Case-insensitive lookup over parsed headers; returns the first match.
-fn findHeader(headers: []const Header, name: []const u8) ?[]const u8 {
+fn find_header(headers: []const Header, name: []const u8) ?[]const u8 {
     for (headers) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
     }
@@ -166,14 +166,14 @@ pub const FramingError = error{
 
 /// Body length of a request. Requests have no close-delimited form: absent
 /// framing headers mean no body.
-pub fn requestFraming(request: *const Request) FramingError!Framing {
-    const te = singleHeader(request.headers, "transfer-encoding") catch
+pub fn request_framing(request: *const Request) FramingError!Framing {
+    const te = single_header(request.headers, "transfer-encoding") catch
         return error.InvalidFraming;
-    const length = try contentLengthValue(request.headers);
+    const length = try content_length_value(request.headers);
     // Both present is the classic TE/CL smuggling split; reject outright.
     if (te != null and length != null) return error.InvalidFraming;
     if (te) |value| {
-        if (!isChunkedOnly(value)) return error.InvalidFraming; // a coding we can't frame
+        if (!is_chunked_only(value)) return error.InvalidFraming; // a coding we can't frame
         return .chunked;
     }
     if (length) |n| {
@@ -186,18 +186,18 @@ pub fn requestFraming(request: *const Request) FramingError!Framing {
 /// Body length of a response to `method`. Transfer-Encoding wins over
 /// Content-Length; exotic codings and absent framing fall back to
 /// close-delimited (safe, because the connection is then not reused).
-pub fn responseFraming(method: Method, response: *const Response) FramingError!Framing {
+pub fn response_framing(method: Method, response: *const Response) FramingError!Framing {
     assert(response.status >= 100); // the parser rejects anything lower
     if (method == .head) return .none;
     if (response.status < 200) return .none; // 1xx interim: never has a body
     if (response.status == 204 or response.status == 304) return .none;
     if (method == .connect and response.status < 300) return .until_close; // tunnel
-    const te = singleHeader(response.headers, "transfer-encoding") catch return .until_close;
+    const te = single_header(response.headers, "transfer-encoding") catch return .until_close;
     if (te) |value| {
-        if (!isChunkedOnly(value)) return .until_close; // a coding we can't frame
+        if (!is_chunked_only(value)) return .until_close; // a coding we can't frame
         return .chunked;
     }
-    if (try contentLengthValue(response.headers)) |n| {
+    if (try content_length_value(response.headers)) |n| {
         if (n == 0) return .none;
         return .{ .content_length = n };
     }
@@ -206,7 +206,7 @@ pub fn responseFraming(method: Method, response: *const Response) FramingError!F
 
 /// The value of `name` when it appears exactly once; duplicates are refused
 /// (for framing headers a duplicate is ambiguity an attacker can exploit).
-fn singleHeader(headers: []const Header, name: []const u8) error{Conflict}!?[]const u8 {
+fn single_header(headers: []const Header, name: []const u8) error{Conflict}!?[]const u8 {
     var found: ?[]const u8 = null;
     for (headers) |h| {
         if (!std.ascii.eqlIgnoreCase(h.name, name)) continue;
@@ -217,8 +217,8 @@ fn singleHeader(headers: []const Header, name: []const u8) error{Conflict}!?[]co
 }
 
 /// Parse the Content-Length value: a single header, digits only.
-fn contentLengthValue(headers: []const Header) FramingError!?u64 {
-    const text = singleHeader(headers, "content-length") catch return error.InvalidFraming;
+fn content_length_value(headers: []const Header) FramingError!?u64 {
+    const text = single_header(headers, "content-length") catch return error.InvalidFraming;
     const value = text orelse return null;
     if (value.len == 0 or value.len > 19) return error.InvalidFraming; // 19 digits < 2^64
     for (value) |c| {
@@ -230,7 +230,7 @@ fn contentLengthValue(headers: []const Header) FramingError!?u64 {
 
 /// True when the Transfer-Encoding value is exactly "chunked" — the only
 /// coding we can frame. Lists ("gzip, chunked") are not.
-fn isChunkedOnly(value: []const u8) bool {
+fn is_chunked_only(value: []const u8) bool {
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "chunked");
 }
 
@@ -272,7 +272,7 @@ pub const BodyFramer = struct {
 
     /// True when the whole body has been consumed. Never true for
     /// `.until_close` — there the connection's EOF is the terminator.
-    pub fn isComplete(framer: *const BodyFramer) bool {
+    pub fn is_complete(framer: *const BodyFramer) bool {
         return switch (framer.framing) {
             .none => true,
             .content_length => framer.remaining == 0,
@@ -289,23 +289,23 @@ const RequestLine = struct {
     version_minor: u8,
 };
 
-fn parseRequestLine(line: []const u8) ParseError!RequestLine {
+fn parse_request_line(line: []const u8) ParseError!RequestLine {
     const sp1 = std.mem.indexOfScalar(u8, line, ' ') orelse return error.Malformed;
     const method_text = line[0..sp1];
-    if (method_text.len == 0 or !isToken(method_text)) return error.Malformed;
+    if (method_text.len == 0 or !is_token(method_text)) return error.Malformed;
     assert(method_text.len > 0); // negative space: rejected above
 
     const after_method = line[sp1 + 1 ..];
     const sp2 = std.mem.indexOfScalar(u8, after_method, ' ') orelse return error.Malformed;
     const target = after_method[0..sp2];
-    if (target.len == 0 or !isTargetText(target)) return error.Malformed;
+    if (target.len == 0 or !is_target_text(target)) return error.Malformed;
     assert(target.len > 0);
 
     return .{
-        .method = methodFromText(method_text),
+        .method = method_from_text(method_text),
         .method_text = method_text,
         .target = target,
-        .version_minor = try parseVersion(after_method[sp2 + 1 ..]),
+        .version_minor = try parse_version(after_method[sp2 + 1 ..]),
     };
 }
 
@@ -316,10 +316,10 @@ const StatusLine = struct {
 
 /// Parse "HTTP/1.x NNN[ reason]". The reason phrase may be absent (some
 /// servers send none) and is ignored either way.
-fn parseStatusLine(line: []const u8) ParseError!StatusLine {
+fn parse_status_line(line: []const u8) ParseError!StatusLine {
     const version_len = "HTTP/1.1".len;
     if (line.len < version_len + 4) return error.Malformed; // SP + three digits
-    const version_minor = try parseVersion(line[0..version_len]);
+    const version_minor = try parse_version(line[0..version_len]);
     if (line[version_len] != ' ') return error.Malformed;
     var status: u16 = 0;
     for (line[version_len + 1 ..][0..3]) |c| {
@@ -333,7 +333,7 @@ fn parseStatusLine(line: []const u8) ParseError!StatusLine {
     return .{ .status = status, .version_minor = version_minor };
 }
 
-fn parseVersion(version: []const u8) ParseError!u8 {
+fn parse_version(version: []const u8) ParseError!u8 {
     const prefix = "HTTP/";
     if (!std.mem.startsWith(u8, version, prefix)) return error.Malformed;
     const v = version[prefix.len..];
@@ -347,16 +347,16 @@ fn parseVersion(version: []const u8) ParseError!u8 {
     };
 }
 
-fn parseHeader(line: []const u8) ParseError!Header {
+fn parse_header(line: []const u8) ParseError!Header {
     const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.Malformed;
     const name = line[0..colon];
     // A token name with no whitespace blocks header-smuggling tricks.
-    if (name.len == 0 or !isToken(name)) return error.Malformed;
+    if (name.len == 0 or !is_token(name)) return error.Malformed;
     assert(name.len > 0);
-    return .{ .name = name, .value = trimOws(line[colon + 1 ..]) };
+    return .{ .name = name, .value = trim_ows(line[colon + 1 ..]) };
 }
 
-fn methodFromText(text: []const u8) Method {
+fn method_from_text(text: []const u8) Method {
     const map = std.StaticStringMap(Method).initComptime(.{
         .{ "GET", .get },
         .{ "HEAD", .head },
@@ -373,7 +373,7 @@ fn methodFromText(text: []const u8) Method {
 
 /// Read one CRLF-terminated line, advancing `pos` past the CRLF. Returns null
 /// (incomplete) if no CRLF is present yet. The returned slice excludes the CRLF.
-fn readLine(input: []const u8, pos: *usize) ?[]const u8 {
+fn read_line(input: []const u8, pos: *usize) ?[]const u8 {
     assert(pos.* <= input.len);
     const start = pos.*;
     var i = start;
@@ -400,7 +400,7 @@ const token_chars: [256]bool = blk: {
 /// True if every byte is an RFC 9110 token character. A strict charset for
 /// methods and header names keeps smuggling tricks (and bytes an upstream
 /// might interpret differently than we do) out of the forwarded head.
-fn isToken(s: []const u8) bool {
+fn is_token(s: []const u8) bool {
     for (s) |c| {
         if (!token_chars[c]) return false;
     }
@@ -409,7 +409,7 @@ fn isToken(s: []const u8) bool {
 
 /// True if every byte may appear in a request target: visible ASCII plus
 /// high-bit bytes (lenient toward raw i18n URLs); controls are rejected.
-fn isTargetText(s: []const u8) bool {
+fn is_target_text(s: []const u8) bool {
     for (s) |c| {
         if (c <= 0x20 or c == 0x7f) return false;
     }
@@ -417,7 +417,7 @@ fn isTargetText(s: []const u8) bool {
 }
 
 /// Trim optional leading/trailing whitespace (spaces and tabs) per RFC 9110 OWS.
-fn trimOws(s: []const u8) []const u8 {
+fn trim_ows(s: []const u8) []const u8 {
     var start: usize = 0;
     var end: usize = s.len;
     while (start < end and (s[start] == ' ' or s[start] == '\t')) start += 1;
@@ -522,7 +522,7 @@ test "h1: rejects unsupported versions" {
 test "h1: parses a complete response head" {
     var headers: [8]Header = undefined;
     const raw = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHELLO";
-    const response = (try parseResponse(raw, &headers)).complete;
+    const response = (try parse_response(raw, &headers)).complete;
     try std.testing.expectEqual(@as(u16, 200), response.status);
     try std.testing.expectEqual(@as(u8, 1), response.version_minor);
     try std.testing.expectEqualStrings("5", response.header("content-length").?);
@@ -531,9 +531,9 @@ test "h1: parses a complete response head" {
 
 test "h1: response reason phrase is optional and may contain spaces" {
     var headers: [4]Header = undefined;
-    const no_reason = (try parseResponse("HTTP/1.1 204\r\n\r\n", &headers)).complete;
+    const no_reason = (try parse_response("HTTP/1.1 204\r\n\r\n", &headers)).complete;
     try std.testing.expectEqual(@as(u16, 204), no_reason.status);
-    const spaced = (try parseResponse("HTTP/1.0 404 Not Found\r\n\r\n", &headers)).complete;
+    const spaced = (try parse_response("HTTP/1.0 404 Not Found\r\n\r\n", &headers)).complete;
     try std.testing.expectEqual(@as(u16, 404), spaced.status);
     try std.testing.expectEqual(@as(u8, 0), spaced.version_minor);
 }
@@ -542,35 +542,38 @@ test "h1: incomplete response asks for more" {
     var headers: [4]Header = undefined;
     try std.testing.expectEqual(
         ParsedResponse.incomplete,
-        try parseResponse("HTTP/1.1 200 OK\r\nA: b\r\n", &headers),
+        try parse_response("HTTP/1.1 200 OK\r\nA: b\r\n", &headers),
     );
-    try std.testing.expectEqual(ParsedResponse.incomplete, try parseResponse("HTTP/1.", &headers));
+    try std.testing.expectEqual(ParsedResponse.incomplete, try parse_response("HTTP/1.", &headers));
 }
 
 test "h1: rejects malformed and unsupported responses" {
     var headers: [4]Header = undefined;
-    try std.testing.expectError(error.Malformed, parseResponse("HTTP/1.1 20\r\n\r\n", &headers));
-    try std.testing.expectError(error.Malformed, parseResponse("HTTP/1.1 2x0\r\n\r\n", &headers));
-    try std.testing.expectError(error.Malformed, parseResponse("HTTP/1.1 099\r\n\r\n", &headers));
-    try std.testing.expectError(error.Malformed, parseResponse("HTTP/1.1 200OK\r\n\r\n", &headers));
-    try std.testing.expectError(error.Malformed, parseResponse("ICY 200 OK\r\n\r\n", &headers));
+    try std.testing.expectError(error.Malformed, parse_response("HTTP/1.1 20\r\n\r\n", &headers));
+    try std.testing.expectError(error.Malformed, parse_response("HTTP/1.1 2x0\r\n\r\n", &headers));
+    try std.testing.expectError(error.Malformed, parse_response("HTTP/1.1 099\r\n\r\n", &headers));
+    try std.testing.expectError(
+        error.Malformed,
+        parse_response("HTTP/1.1 200OK\r\n\r\n", &headers),
+    );
+    try std.testing.expectError(error.Malformed, parse_response("ICY 200 OK\r\n\r\n", &headers));
     try std.testing.expectError(
         error.UnsupportedVersion,
-        parseResponse("HTTP/2.0 200 OK\r\n\r\n", &headers),
+        parse_response("HTTP/2.0 200 OK\r\n\r\n", &headers),
     );
 }
 
 test "h1: request framing follows Content-Length and chunked" {
     var headers: [8]Header = undefined;
     const bare = (try parse("GET / HTTP/1.1\r\n\r\n", &headers)).complete;
-    try std.testing.expectEqual(Framing.none, try requestFraming(&bare));
+    try std.testing.expectEqual(Framing.none, try request_framing(&bare));
 
     const sized = (try parse("POST / HTTP/1.1\r\nContent-Length: 12\r\n\r\n", &headers)).complete;
-    try std.testing.expectEqual(Framing{ .content_length = 12 }, try requestFraming(&sized));
+    try std.testing.expectEqual(Framing{ .content_length = 12 }, try request_framing(&sized));
 
     const chunked_request =
         (try parse("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", &headers)).complete;
-    try std.testing.expectEqual(Framing.chunked, try requestFraming(&chunked_request));
+    try std.testing.expectEqual(Framing.chunked, try request_framing(&chunked_request));
 }
 
 test "h1: request framing rejects smuggling-shaped headers" {
@@ -580,82 +583,82 @@ test "h1: request framing rejects smuggling-shaped headers" {
         "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n",
         &headers,
     )).complete;
-    try std.testing.expectError(error.InvalidFraming, requestFraming(&both));
+    try std.testing.expectError(error.InvalidFraming, request_framing(&both));
     // Duplicate Content-Length headers.
     const duplicate = (try parse(
         "POST / HTTP/1.1\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\n",
         &headers,
     )).complete;
-    try std.testing.expectError(error.InvalidFraming, requestFraming(&duplicate));
+    try std.testing.expectError(error.InvalidFraming, request_framing(&duplicate));
     // Non-numeric length and a coding we cannot frame.
     const garbage =
         (try parse("POST / HTTP/1.1\r\nContent-Length: 4x\r\n\r\n", &headers)).complete;
-    try std.testing.expectError(error.InvalidFraming, requestFraming(&garbage));
+    try std.testing.expectError(error.InvalidFraming, request_framing(&garbage));
     const gzip =
         (try parse("POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", &headers))
             .complete;
-    try std.testing.expectError(error.InvalidFraming, requestFraming(&gzip));
+    try std.testing.expectError(error.InvalidFraming, request_framing(&gzip));
 }
 
 test "h1: response framing per RFC 9112 section 6.3" {
     var headers: [8]Header = undefined;
-    const sized = (try parseResponse(
+    const sized = (try parse_response(
         "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
         &headers,
     )).complete;
-    try std.testing.expectEqual(Framing{ .content_length = 5 }, try responseFraming(.get, &sized));
+    try std.testing.expectEqual(Framing{ .content_length = 5 }, try response_framing(.get, &sized));
     // HEAD: the head advertises a body that will not be sent.
-    try std.testing.expectEqual(Framing.none, try responseFraming(.head, &sized));
+    try std.testing.expectEqual(Framing.none, try response_framing(.head, &sized));
 
-    const chunked_response = (try parseResponse(
+    const chunked_response = (try parse_response(
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n",
         &headers,
     )).complete;
     // Transfer-Encoding wins over Content-Length.
-    try std.testing.expectEqual(Framing.chunked, try responseFraming(.get, &chunked_response));
+    try std.testing.expectEqual(Framing.chunked, try response_framing(.get, &chunked_response));
 
-    const no_body = (try parseResponse("HTTP/1.1 304\r\n\r\n", &headers)).complete;
-    try std.testing.expectEqual(Framing.none, try responseFraming(.get, &no_body));
+    const no_body = (try parse_response("HTTP/1.1 304\r\n\r\n", &headers)).complete;
+    try std.testing.expectEqual(Framing.none, try response_framing(.get, &no_body));
 
     // No framing headers at all: close-delimited.
-    const bare = (try parseResponse("HTTP/1.1 200 OK\r\n\r\n", &headers)).complete;
-    try std.testing.expectEqual(Framing.until_close, try responseFraming(.get, &bare));
+    const bare = (try parse_response("HTTP/1.1 200 OK\r\n\r\n", &headers)).complete;
+    try std.testing.expectEqual(Framing.until_close, try response_framing(.get, &bare));
 
     // A coding we cannot frame degrades to close-delimited, not an error.
-    const gzip = (try parseResponse(
+    const gzip = (try parse_response(
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n",
         &headers,
     )).complete;
-    try std.testing.expectEqual(Framing.until_close, try responseFraming(.get, &gzip));
+    try std.testing.expectEqual(Framing.until_close, try response_framing(.get, &gzip));
 
     // Conflicting Content-Length is an error (502), not a guess.
-    const conflict = (try parseResponse(
+    const conflict = (try parse_response(
         "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n",
         &headers,
     )).complete;
-    try std.testing.expectError(error.InvalidFraming, responseFraming(.get, &conflict));
+    try std.testing.expectError(error.InvalidFraming, response_framing(.get, &conflict));
 }
 
 test "h1: BodyFramer tracks message ends across split reads" {
     var sized = BodyFramer.init(.{ .content_length = 5 });
     try std.testing.expectEqual(@as(usize, 3), try sized.consume("abc"));
-    try std.testing.expect(!sized.isComplete());
+    try std.testing.expect(!sized.is_complete());
     // Two bytes finish the body; "XX" belongs to the next message.
     try std.testing.expectEqual(@as(usize, 2), try sized.consume("deXX"));
-    try std.testing.expect(sized.isComplete());
+    try std.testing.expect(sized.is_complete());
 
     var chunked_body = BodyFramer.init(.chunked);
     const wire = "3\r\nabc\r\n0\r\n\r\nNEXT";
     try std.testing.expectEqual(wire.len - "NEXT".len, try chunked_body.consume(wire));
-    try std.testing.expect(chunked_body.isComplete());
+    try std.testing.expect(chunked_body.is_complete());
 
     var empty = BodyFramer.init(.none);
     try std.testing.expectEqual(@as(usize, 0), try empty.consume("junk"));
-    try std.testing.expect(empty.isComplete());
+    try std.testing.expect(empty.is_complete());
 
     var close_delimited = BodyFramer.init(.until_close);
     try std.testing.expectEqual(@as(usize, 4), try close_delimited.consume("data"));
-    try std.testing.expect(!close_delimited.isComplete()); // only EOF ends it
+    try std.testing.expect(!close_delimited.is_complete()); // only EOF ends it
 }
 
 test "h1: rejects too many headers" {

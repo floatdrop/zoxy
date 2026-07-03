@@ -47,7 +47,7 @@ const line_max = target_display_max + 64;
 
 /// Format one access-log line into `out`. Never fails: an over-long target is
 /// truncated so the line always fits `line_max`.
-pub fn formatLine(out: []u8, entry: Entry) []const u8 {
+pub fn format_line(out: []u8, entry: Entry) []const u8 {
     assert(out.len >= line_max); // the caller must give us a line-sized buffer
     const method = if (entry.method.len == 0) "-" else entry.method;
     const target = if (entry.target.len == 0)
@@ -83,7 +83,7 @@ pub const AccessLog = struct {
         assert(log.used <= log.buf.len);
         if (log.used + line_max > log.buf.len) log.flush();
         assert(log.used + line_max <= log.buf.len); // flush guaranteed room
-        const line = formatLine(log.buf[log.used..], entry);
+        const line = format_line(log.buf[log.used..], entry);
         log.used += line.len;
         assert(log.used <= log.buf.len);
     }
@@ -103,7 +103,7 @@ test "access_log: formats lines by outcome" {
     var buf: [line_max]u8 = undefined;
     try std.testing.expectEqualStrings(
         "GET /a proxied 12\n",
-        formatLine(&buf, .{
+        format_line(&buf, .{
             .method = "GET",
             .target = "/a",
             .outcome = .proxied,
@@ -112,7 +112,7 @@ test "access_log: formats lines by outcome" {
     );
     try std.testing.expectEqualStrings(
         "- - aborted 0\n",
-        formatLine(&buf, .{
+        format_line(&buf, .{
             .method = "",
             .target = "",
             .outcome = .aborted,
@@ -121,7 +121,7 @@ test "access_log: formats lines by outcome" {
     );
     try std.testing.expectEqualStrings(
         "POST /x 404 0\n",
-        formatLine(&buf, .{
+        format_line(&buf, .{
             .method = "POST",
             .target = "/x",
             .outcome = .not_found,

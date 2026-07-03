@@ -210,12 +210,13 @@ fn dump_pool(pool: *ConnPool) void {
     for (pool.items) |*conn| {
         if (conn.free_next != null) continue; // parked on the free list
         std.debug.print(
-            "sim: leaked conn: refs={d} closing={} timeout_armed={} down_fd={d} up_fd={d} " ++
-                "outcome={s} request_active={} up_close_pending={}\n",
+            "sim: leaked conn: refs={d} closing={} timeout_armed={} downstream_fd={d} " ++
+                "upstream_fd={d} " ++
+                "outcome={s} request_active={} upstream_close_pending={}\n",
             .{
-                conn.refs,           conn.closing,          conn.timeout_armed,
-                conn.down_fd,        conn.up_fd,            @tagName(conn.outcome),
-                conn.request_active, conn.up_close_pending,
+                conn.refs,           conn.closing,                conn.timeout_armed,
+                conn.downstream_fd,  conn.upstream_fd,            @tagName(conn.outcome),
+                conn.request_active, conn.upstream_close_pending,
             },
         );
     }
@@ -357,11 +358,11 @@ const OriginConn = struct {
             .incomplete => return conn.arm_recv(),
             .complete => |request| request,
         };
-        var framer = h1.BodyFramer.init(h1.requestFraming(&request) catch
+        var framer = h1.BodyFramer.init(h1.request_framing(&request) catch
             return conn.shutdown());
         const body_consumed = framer.consume(conn.buf[request.head_len..conn.filled]) catch
             return conn.shutdown();
-        if (!framer.isComplete()) return conn.arm_recv(); // body still arriving
+        if (!framer.is_complete()) return conn.arm_recv(); // body still arriving
         conn.request_end = request.head_len + body_consumed;
         conn.respond(request.target);
     }
@@ -687,13 +688,13 @@ const Client = struct {
     fn consume_response(client: *Client) void {
         if (client.framer == null) {
             const received = client.recv_buf[0..client.filled];
-            const parsed = h1.parseResponse(received, &client.headers) catch
+            const parsed = h1.parse_response(received, &client.headers) catch
                 fail("proxy emitted an unparseable response head", .{});
             const response = switch (parsed) {
                 .incomplete => return client.arm_recv(),
                 .complete => |response| response,
             };
-            const framing = h1.responseFraming(client.method, &response) catch
+            const framing = h1.response_framing(client.method, &response) catch
                 fail("proxy emitted conflicting framing headers", .{});
             var framer = h1.BodyFramer.init(framing);
             const body = client.recv_buf[response.head_len..client.filled];
@@ -709,7 +710,7 @@ const Client = struct {
                 fail("proxy emitted a malformed chunked body", .{});
             client.body_cursor += consumed;
         }
-        if (!client.framer.?.isComplete()) {
+        if (!client.framer.?.is_complete()) {
             if (client.abort_mid_response) return client.conclude(); // rude client
             return client.arm_recv();
         }

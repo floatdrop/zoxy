@@ -14,7 +14,7 @@ const Metrics = @import("metrics.zig").Metrics;
 const Ip4Address = std.Io.net.Ip4Address;
 
 /// Sized for every counter in `Metrics` plus one labeled series per worker
-/// slot; the comptime check in `serveOne` keeps this honest as counters grow.
+/// slot; the comptime check in `serve_one` keeps this honest as counters grow.
 const body_bytes_max = 32 * 1024;
 const head_bytes_max = 256;
 const accept_backlog = 8;
@@ -43,7 +43,7 @@ pub const Admin = struct {
         posix.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&on)) catch
             return error.SetSockOptFailed;
 
-        var sa = sockaddrIn(address);
+        var sa = sockaddr_in(address);
         if (posix.errno(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
             return error.BindFailed;
         }
@@ -59,7 +59,7 @@ pub const Admin = struct {
     }
 
     /// The bound address, resolving an ephemeral port assigned by the kernel.
-    pub fn boundAddress(admin: Admin) Ip4Address {
+    pub fn bound_address(admin: Admin) Ip4Address {
         var sa: linux.sockaddr.in = undefined;
         var len: posix.socklen_t = @sizeOf(linux.sockaddr.in);
         const rc = linux.getsockname(admin.fd, @ptrCast(&sa), &len);
@@ -71,11 +71,11 @@ pub const Admin = struct {
     /// Serve forever, one connection at a time. The admin plane is best-effort
     /// by design: per-connection errors are dropped, never fatal.
     pub fn run(admin: *Admin) void {
-        while (true) admin.serveOne();
+        while (true) admin.serve_one();
     }
 
     /// Accept one connection, answer it with the metrics exposition, close it.
-    pub fn serveOne(admin: *Admin) void {
+    pub fn serve_one(admin: *Admin) void {
         const rc = linux.accept4(admin.fd, null, null, linux.SOCK.CLOEXEC);
         if (posix.errno(rc) != .SUCCESS) return;
         const fd: posix.socket_t = @intCast(rc);
@@ -93,7 +93,7 @@ pub const Admin = struct {
             assert((fields.len + constants.workers_max) * 64 <= body_bytes_max);
         }
         var body_writer = std.Io.Writer.fixed(&body_buf);
-        admin.metrics.writeText(&body_writer) catch return;
+        admin.metrics.write_text(&body_writer) catch return;
         const body = body_writer.buffered();
         assert(body.len > 0);
         assert(body.len <= body_bytes_max);
@@ -103,13 +103,13 @@ pub const Admin = struct {
             "Content-Type: text/plain; version=0.0.4\r\n" ++
             "Content-Length: {d}\r\n" ++
             "Connection: close\r\n\r\n", .{body.len}) catch return;
-        writeAll(fd, head);
-        writeAll(fd, body);
+        write_all(fd, head);
+        write_all(fd, body);
     }
 };
 
 /// Blocking best-effort write of the whole buffer; gives up on any error.
-fn writeAll(fd: posix.socket_t, bytes: []const u8) void {
+fn write_all(fd: posix.socket_t, bytes: []const u8) void {
     assert(bytes.len > 0);
     var sent: usize = 0;
     while (sent < bytes.len) { // bounded: every iteration sends >= 1 byte or returns
@@ -121,7 +121,7 @@ fn writeAll(fd: posix.socket_t, bytes: []const u8) void {
     }
 }
 
-fn sockaddrIn(address: Ip4Address) linux.sockaddr.in {
+fn sockaddr_in(address: Ip4Address) linux.sockaddr.in {
     return .{
         .family = linux.AF.INET,
         .port = std.mem.nativeToBig(u16, address.port),
@@ -138,9 +138,9 @@ test "admin: serves the metrics exposition over HTTP" {
 
     var admin = try Admin.open(Ip4Address.loopback(0), &metrics);
     defer admin.close();
-    const port = admin.boundAddress().port;
+    const port = admin.bound_address().port;
 
-    // Blocking loopback client: connect, send a request, then let serveOne
+    // Blocking loopback client: connect, send a request, then let serve_one
     // (same thread) accept and respond before we read the reply back.
     const client: posix.socket_t = blk: {
         const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
@@ -148,18 +148,18 @@ test "admin: serves the metrics exposition over HTTP" {
         break :blk @intCast(rc);
     };
     defer _ = linux.close(client);
-    var sa = sockaddrIn(Ip4Address.loopback(port));
+    var sa = sockaddr_in(Ip4Address.loopback(port));
     try std.testing.expect(
         posix.errno(linux.connect(client, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) == .SUCCESS,
     );
     const request = "GET /metrics HTTP/1.0\r\n\r\n";
     _ = linux.write(client, request, request.len);
 
-    admin.serveOne();
+    admin.serve_one();
 
     var response_buf: [body_bytes_max + head_bytes_max]u8 = undefined;
     var response_len: usize = 0;
-    while (true) { // read to EOF (serveOne closed its end)
+    while (true) { // read to EOF (serve_one closed its end)
         const rc = linux.read(client, response_buf[response_len..].ptr, 512);
         try std.testing.expect(posix.errno(rc) == .SUCCESS);
         if (rc == 0) break;
