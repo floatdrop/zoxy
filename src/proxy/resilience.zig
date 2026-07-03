@@ -160,18 +160,73 @@ pub const Resilience = struct {
         assert(endpoint.in_flight <= constants.connections_max);
     }
 
+    /// Settle an attempt and run passive outlier detection on its outcome:
+    /// a `failure` extends the endpoint's consecutive-failure streak and, at
+    /// the policy threshold, ejects it for `outlier_ejection_ns` (unless the
+    /// cluster is already at its ejection ceiling); `success` resets the
+    /// streak; `failure_stale_pool` and `aborted` are neutral. Returns true
+    /// when this call ejected the endpoint (callers count the metric).
     pub fn attempt_finish(
         resilience: *Resilience,
         cluster_index: u32,
         endpoint_index: u32,
         outcome: AttemptOutcome,
-    ) void {
+        policy: *const ResiliencePolicy,
+        endpoints_total: u32,
+        now_ns: u64,
+    ) bool {
+        assert(endpoints_total <= constants.endpoints_per_cluster_max);
+        assert(endpoint_index < endpoints_total);
         const endpoint = resilience.endpoint_state(cluster_index, endpoint_index);
         assert(endpoint.in_flight > 0); // finish never precedes start
         endpoint.in_flight -= 1;
-        // Outcomes drive outlier detection (Phase 2 slice 7); accounted, not
-        // yet acted upon.
-        _ = outcome;
+        switch (outcome) {
+            .success => endpoint.consecutive_failures = 0,
+            .failure => {
+                if (policy.outlier_consecutive_failures == 0) return false; // outlier off
+                endpoint.consecutive_failures += 1;
+                if (endpoint.consecutive_failures < policy.outlier_consecutive_failures) {
+                    return false;
+                }
+                return resilience.maybe_eject(cluster_index, endpoint_index, policy, //
+                    endpoints_total, now_ns);
+            },
+            .failure_stale_pool, .aborted => {}, // not endpoint-health signals
+        }
+        return false;
+    }
+
+    /// Eject the endpoint unless the cluster would exceed its ejection
+    /// ceiling. Expired ejections are swept out of the count first (lazy
+    /// un-ejection: the balancer already treats them as available; the
+    /// bookkeeping catches up here, exactly where the count matters).
+    fn maybe_eject(
+        resilience: *Resilience,
+        cluster_index: u32,
+        endpoint_index: u32,
+        policy: *const ResiliencePolicy,
+        endpoints_total: u32,
+        now_ns: u64,
+    ) bool {
+        assert(policy.outlier_ejection_ns > 0); // enforced at parse
+        assert(policy.outlier_ejection_percent_max <= 100);
+        const cluster = resilience.cluster_state(cluster_index);
+        for (cluster.endpoints[0..endpoints_total]) |*swept| {
+            if (swept.ejected_until_ns == 0 or now_ns < swept.ejected_until_ns) continue;
+            swept.ejected_until_ns = 0;
+            assert(cluster.ejected_count > 0); // every set deadline was counted
+            cluster.ejected_count -= 1;
+        }
+        const endpoint = &cluster.endpoints[endpoint_index];
+        if (endpoint.ejected_until_ns != 0) return false; // already ejected
+        const ceiling = @as(u64, endpoints_total) * policy.outlier_ejection_percent_max;
+        if (@as(u64, cluster.ejected_count + 1) * 100 > ceiling) return false;
+        endpoint.ejected_until_ns = now_ns + policy.outlier_ejection_ns;
+        cluster.ejected_count += 1;
+        // A fresh slate once the ejection expires: re-ejection requires a
+        // full new streak (a per-repeat multiplier is deferred).
+        endpoint.consecutive_failures = 0;
+        return true;
     }
 
     pub fn dial_start(resilience: *Resilience, cluster_index: u32) void {
@@ -233,21 +288,76 @@ test "resilience: request/attempt/dial/connection cycles return to idle" {
 
     resilience.dial_finish(3);
     resilience.connection_close(3);
-    resilience.attempt_finish(3, 1, .success);
+    _ = resilience.attempt_finish(3, 1, .success, &ResiliencePolicy{}, 2, 0);
     resilience.request_finish(3);
     try std.testing.expect(resilience.is_idle());
 }
 
 test "resilience: a retried request stacks attempts on the same request" {
     var resilience = Resilience{};
+    const off = ResiliencePolicy{};
     resilience.request_start(0);
     resilience.attempt_start(0, 0);
-    resilience.attempt_finish(0, 0, .failure_stale_pool);
+    _ = resilience.attempt_finish(0, 0, .failure_stale_pool, &off, 1, 0);
     resilience.attempt_start(0, 0); // the replay, same endpoint
     try std.testing.expectEqual(@as(u32, 1), resilience.clusters[0].endpoints[0].in_flight);
-    resilience.attempt_finish(0, 0, .success);
+    _ = resilience.attempt_finish(0, 0, .success, &off, 1, 0);
     resilience.request_finish(0);
     try std.testing.expect(resilience.is_idle());
+}
+
+test "resilience: consecutive failures eject, success and neutral outcomes do not" {
+    var resilience = Resilience{};
+    const policy = ResiliencePolicy{
+        .outlier_consecutive_failures = 2,
+        .outlier_ejection_ns = 1000,
+        .outlier_ejection_percent_max = 50,
+    };
+    const total: u32 = 4;
+
+    // Neutral outcomes leave the streak alone; success resets it.
+    resilience.attempt_start(0, 0);
+    try std.testing.expect(!resilience.attempt_finish(0, 0, .failure_stale_pool, &policy, total, 0));
+    resilience.attempt_start(0, 0);
+    try std.testing.expect(!resilience.attempt_finish(0, 0, .failure, &policy, total, 0));
+    try std.testing.expectEqual(@as(u32, 1), resilience.clusters[0].endpoints[0].consecutive_failures);
+    resilience.attempt_start(0, 0);
+    try std.testing.expect(!resilience.attempt_finish(0, 0, .success, &policy, total, 0));
+    try std.testing.expectEqual(@as(u32, 0), resilience.clusters[0].endpoints[0].consecutive_failures);
+
+    // Two straight failures eject: deadline set, count bumped, streak reset.
+    for (0..2) |i| {
+        resilience.attempt_start(0, 0);
+        const ejected = resilience.attempt_finish(0, 0, .failure, &policy, total, 100);
+        try std.testing.expectEqual(i == 1, ejected);
+    }
+    try std.testing.expectEqual(@as(u64, 1100), resilience.clusters[0].endpoints[0].ejected_until_ns);
+    try std.testing.expectEqual(@as(u32, 1), resilience.clusters[0].ejected_count);
+    try std.testing.expectEqual(@as(u32, 0), resilience.clusters[0].endpoints[0].consecutive_failures);
+}
+
+test "resilience: the ejection ceiling holds until an expired ejection is swept" {
+    var resilience = Resilience{};
+    const policy = ResiliencePolicy{
+        .outlier_consecutive_failures = 1,
+        .outlier_ejection_ns = 1000,
+        .outlier_ejection_percent_max = 50,
+    };
+    const total: u32 = 2; // ceiling: at most 1 of 2 ejected
+
+    resilience.attempt_start(0, 0);
+    try std.testing.expect(resilience.attempt_finish(0, 0, .failure, &policy, total, 0));
+    // Endpoint 1 fails at t=500: the ceiling refuses a second ejection.
+    resilience.attempt_start(0, 1);
+    try std.testing.expect(!resilience.attempt_finish(0, 1, .failure, &policy, total, 500));
+    try std.testing.expectEqual(@as(u32, 1), resilience.clusters[0].ejected_count);
+    // At t=2000 endpoint 0's ejection has expired: the sweep frees the slot
+    // and endpoint 1 (streak intact from the refused attempt) ejects.
+    resilience.attempt_start(0, 1);
+    try std.testing.expect(resilience.attempt_finish(0, 1, .failure, &policy, total, 2000));
+    try std.testing.expectEqual(@as(u64, 0), resilience.clusters[0].endpoints[0].ejected_until_ns);
+    try std.testing.expectEqual(@as(u64, 3000), resilience.clusters[0].endpoints[1].ejected_until_ns);
+    try std.testing.expectEqual(@as(u32, 1), resilience.clusters[0].ejected_count);
 }
 
 test "resilience: admission gates trip at their limits and never below" {

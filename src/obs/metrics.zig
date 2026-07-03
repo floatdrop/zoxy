@@ -44,6 +44,8 @@ pub const Metrics = struct {
     retry_attempts: Counter = .{},
     /// Retries denied by the retry budget or the max_retries breaker.
     retry_budget_exhausted: Counter = .{},
+    /// Endpoints ejected by passive outlier detection.
+    outlier_ejections: Counter = .{},
     /// Requests rejected by a cluster circuit breaker (max_requests).
     breaker_requests_rejected: Counter = .{},
     /// Upstream dials rejected by a cluster circuit breaker (max_pending or

@@ -139,10 +139,12 @@ fn run_iteration(seed: u64) !u64 {
         \\  "clusters": [
         \\    { "name": "one", "endpoints": ["127.0.0.1:9001", "127.0.0.1:9002"],
         \\      "per_try_timeout_ms": 2000,
-        \\      "retry": { "max": 2, "backoff_base_ms": 50, "backoff_cap_ms": 400 } },
+        \\      "retry": { "max": 2, "backoff_base_ms": 50, "backoff_cap_ms": 400 },
+        \\      "outlier": { "consecutive_failures": 3, "ejection_ms": 3000 } },
         \\    { "name": "two", "endpoints": ["127.0.0.1:9003"],
         \\      "per_try_timeout_ms": 2000,
-        \\      "retry": { "max": 2, "backoff_base_ms": 50, "backoff_cap_ms": 400 } }
+        \\      "retry": { "max": 2, "backoff_base_ms": 50, "backoff_cap_ms": 400 },
+        \\      "outlier": { "consecutive_failures": 3, "ejection_ms": 3000 } }
         \\  ] }
     );
     const router = Router.init(&cfg);

@@ -501,7 +501,16 @@ pub const ProxyConn = struct {
         assert(conn.attempt_open);
         conn.attempt_open = false;
         conn.try_deadline_ns = 0;
-        conn.resilience.attempt_finish(conn.cluster_index, conn.endpoint_index, outcome);
+        const cluster = conn.cluster.?; // an open attempt implies a routed request
+        const ejected = conn.resilience.attempt_finish(
+            conn.cluster_index,
+            conn.endpoint_index,
+            outcome,
+            conn.policy,
+            @intCast(cluster.endpoints.len),
+            conn.io.now_ns(),
+        );
+        if (ejected) conn.metrics.outlier_ejections.add(1);
         // A settling retry attempt returns its budget charge.
         conn.release_retry_charge();
     }
@@ -3130,6 +3139,101 @@ test "proxy: a configured retry survives an upstream that dies once" {
     _ = linux.close(client);
     while (pool.free_count != pool.capacity) try io.run_once();
     try std.testing.expect(server.resilience.is_idle());
+}
+
+test "proxy: outlier detection ejects a dead endpoint and traffic routes around it" {
+    const gpa = std.testing.allocator;
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHELLO";
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    var origin = TestOrigin{ .io = &io, .listener = origin_listener, .response = response };
+    origin.start();
+
+    // A dead endpoint: a port that had a listener (so nothing else claims
+    // it) and does not anymore — connects are refused instantly.
+    var dead_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    const dead_port = dead_listener.bound_address().port;
+    dead_listener.close();
+
+    // One failure ejects (threshold 1); a retry covers the request that
+    // draws the dead endpoint first.
+    var json_buf: [512]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o",
+        \\     "endpoints": ["127.0.0.1:{d}", "127.0.0.1:{d}"],
+        \\     "retry": {{ "max": 2, "backoff_base_ms": 1, "backoff_cap_ms": 10 }},
+        \\     "outlier": {{ "consecutive_failures": 1, "ejection_ms": 60000 }} }}] }}
+    , .{ origin_listener.bound_address().port, dead_port });
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
+    );
+    defer server.deinit();
+    server.start();
+
+    const Client = struct {
+        io: *IO,
+        fd: posix.socket_t,
+        buf: [256]u8 = undefined,
+        len: usize = 0,
+        done: bool = false,
+        send_c: Completion = undefined,
+        recv_c: Completion = undefined,
+        fn go(c: *@This()) void {
+            c.io.recv(*@This(), c, on_recv, &c.recv_c, c.fd, &c.buf);
+            c.io.send(*@This(), c, on_send, &c.send_c, c.fd, "GET / HTTP/1.1\r\nHost: o\r\n\r\n");
+        }
+        fn on_send(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
+            _ = c;
+        }
+        fn on_recv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
+            c.len = result catch 0;
+            c.done = true;
+        }
+    };
+
+    // Every sequential request succeeds: a draw of the dead endpoint fails
+    // fast (refused), ejects it, and the retry lands on the live one.
+    var successes: u32 = 0;
+    for (0..6) |_| {
+        const fd = try connect_loopback(proxy_listener.bound_address().port);
+        var c = Client{ .io = &io, .fd = fd };
+        c.go();
+        try io.run_until_done(&c.done);
+        try std.testing.expect(std.mem.startsWith(u8, c.buf[0..c.len], "HTTP/1.1 200 "));
+        successes += 1;
+        _ = linux.close(fd);
+        while (pool.free_count != pool.capacity) try io.run_once();
+    }
+    try std.testing.expectEqual(@as(u32, 6), successes);
+    // The dead endpoint was drawn at least once and ejected exactly once
+    // (its 60s ejection outlives the test, so it never returns).
+    try std.testing.expectEqual(@as(u64, 1), metrics.outlier_ejections.load());
+    try std.testing.expect(metrics.retry_attempts.load() >= 1);
+    try std.testing.expect(server.resilience.is_idle());
+    try std.testing.expectEqual(@as(u32, 1), server.resilience.clusters[0].ejected_count);
 }
 
 test "proxy: per-try timeout answers 504 while the overall deadline still runs" {
