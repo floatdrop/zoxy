@@ -519,7 +519,11 @@ pub const ProxyConn = struct {
         const framing = h1.requestFraming(request) catch return conn.fail(resp_400);
         conn.request_method = request.method;
         conn.request_framer = h1.BodyFramer.init(framing);
-        conn.downstream_keep_alive = keepAliveRequested(request);
+        const connection = ConnectionTokens.collect(request.headers);
+        // A truncated token list means incomplete hop-by-hop classification;
+        // refuse rather than forward a header we should have stripped.
+        if (connection.overflow) return conn.fail(resp_400);
+        conn.downstream_keep_alive = keepAliveRequested(request, &connection);
         const cluster = conn.router.route(request.host(), request.target) orelse
             return conn.fail(resp_404);
         const endpoint = conn.rr.pick(cluster) orelse return conn.fail(resp_503);
@@ -530,7 +534,7 @@ pub const ProxyConn = struct {
         const body_consumed = conn.request_framer.consume(body) catch
             return conn.fail(resp_400);
         conn.request_end = request.head_len + body_consumed;
-        conn.buildPrimeSegments(request, conn.request_end);
+        conn.buildPrimeSegments(request, conn.request_end, &connection);
         // Replayable = the whole request is in the prime segments; a stale
         // pooled connection can then be retried without losing body bytes.
         conn.request_replayable = conn.request_framer.isComplete();
@@ -612,7 +616,12 @@ pub const ProxyConn = struct {
     /// injected, all without copying a byte. This makes one-request-per-
     /// connection real: the upstream closes after its response, and a second
     /// pipelined request can never reach the first request's cluster.
-    fn buildPrimeSegments(conn: *ProxyConn, request: *const h1.Request, body_end: usize) void {
+    fn buildPrimeSegments(
+        conn: *ProxyConn,
+        request: *const h1.Request,
+        body_end: usize,
+        connection: *const ConnectionTokens,
+    ) void {
         assert(request.head_len >= 4); // shortest head: request line + blank line
         assert(request.head_len <= conn.head_filled);
         assert(body_end >= request.head_len); // the frame starts after the head
@@ -620,7 +629,7 @@ pub const ProxyConn = struct {
         var count: usize = 0;
         var kept_start: usize = 0;
         for (request.headers) |header| {
-            if (!isHopByHopHeader(request.headers, header.name)) continue;
+            if (!isHopByHopHeader(connection, header.name)) continue;
             const line_start = @intFromPtr(header.line.ptr) - @intFromPtr(&conn.head_buf);
             assert(line_start >= kept_start); // header lines are in buffer order
             assert(line_start + header.line.len <= request.head_len);
@@ -758,21 +767,28 @@ pub const ProxyConn = struct {
             h1.responseFraming(conn.request_method, response) catch
                 return conn.fail(resp_502); // conflicting framing: refuse to guess
         const pipe = &conn.u2d;
+        // Collected once; a truncated (overflow) list means incomplete
+        // hop-by-hop classification, which poisons any reuse or splicing.
+        const connection = ConnectionTokens.collect(response.headers);
         // Reuse intent: a framed response to a keep-alive client. The final
         // decision (`canReuseDownstream`) also needs the request forwarded.
-        conn.response_reusable = conn.downstream_keep_alive and framing != .until_close;
+        conn.response_reusable = conn.downstream_keep_alive and
+            framing != .until_close and
+            !connection.overflow;
         // The upstream connection can be pooled when the response is framed
         // HTTP/1.1 that does not announce a close. (Decided before the strip
         // below invalidates the header slices.)
         conn.upstream_reusable = framing != .until_close and
             response.status >= 200 and
             response.version_minor == 1 and
-            !connectionListNames(response.headers, "close");
+            !connection.overflow and
+            !connection.names("close");
         var head_len = response.head_len;
         if (conn.response_reusable) {
-            // The upstream was told `Connection: close` and its response says
-            // so. The client must not see that — it would close on us.
-            head_len -= conn.stripResponseHead(response);
+            // The upstream's connection-management headers (a close
+            // announcement, keep-alive hints) are hop semantics between it
+            // and us; a keep-alive client must not see them and close on us.
+            head_len -= conn.stripResponseHead(response, &connection);
         }
         pipe.framer = h1.BodyFramer.init(framing);
         const body = pipe.buf[head_len..pipe.filled];
@@ -792,14 +808,18 @@ pub const ProxyConn = struct {
     /// the head lives in our relay buffer, so the remainder shifts left (one
     /// bounded copy). For an HTTP/1.1 client, absence of `Connection` means
     /// keep-alive — nothing needs injecting. Returns the bytes removed.
-    fn stripResponseHead(conn: *ProxyConn, response: *const h1.Response) usize {
+    fn stripResponseHead(
+        conn: *ProxyConn,
+        response: *const h1.Response,
+        connection: *const ConnectionTokens,
+    ) usize {
         const pipe = &conn.u2d;
         assert(response.head_len <= pipe.filled);
         assert(response.headers.len <= constants.headers_max);
         // Decide up front: compaction below invalidates the header slices.
         var remove: [constants.headers_max]bool = undefined;
         for (response.headers, 0..) |header, index| {
-            remove[index] = isHopByHopHeader(response.headers, header.name);
+            remove[index] = isHopByHopHeader(connection, header.name);
         }
         var write: usize = 0;
         var read: usize = 0;
@@ -1090,38 +1110,67 @@ fn outcomeFor(response: []const u8) access_log.Outcome {
     return .bad_version; // resp_505
 }
 
+/// The comma-separated tokens named by a message's `Connection` header(s),
+/// collected once per message. Classifying each header used to re-scan every
+/// header and re-split the token lists — O(headers²), measured at ~9% of
+/// data-path CPU; against this list it is O(headers × tokens).
+const ConnectionTokens = struct {
+    tokens: [tokens_max][]const u8,
+    count: usize,
+    /// More tokens than the table holds. Absurd for a legitimate message,
+    /// and classification would be incomplete — callers must refuse to
+    /// splice or reuse anything based on a truncated list.
+    overflow: bool,
+
+    const tokens_max = 8;
+
+    fn collect(headers: []const h1.Header) ConnectionTokens {
+        var connection = ConnectionTokens{ .tokens = undefined, .count = 0, .overflow = false };
+        for (headers) |header| {
+            if (!std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
+            // Bounded by the value's length (itself bounded by the head buffer).
+            var candidates = std.mem.splitScalar(u8, header.value, ',');
+            while (candidates.next()) |candidate| {
+                const trimmed = std.mem.trim(u8, candidate, " \t");
+                if (trimmed.len == 0) continue;
+                if (connection.count == tokens_max) {
+                    connection.overflow = true;
+                    return connection;
+                }
+                connection.tokens[connection.count] = trimmed;
+                connection.count += 1;
+            }
+        }
+        assert(connection.count <= tokens_max);
+        return connection;
+    }
+
+    fn names(connection: *const ConnectionTokens, token: []const u8) bool {
+        assert(token.len > 0);
+        for (connection.tokens[0..connection.count]) |candidate| {
+            if (std.ascii.eqlIgnoreCase(candidate, token)) return true;
+        }
+        return false;
+    }
+};
+
 /// RFC 9110 §7.6.1: `Connection` itself, the legacy keep-alive headers, and
 /// any header the message's `Connection` value names are hop-by-hop — they
 /// must not be forwarded past this hop (either direction).
-fn isHopByHopHeader(headers: []const h1.Header, name: []const u8) bool {
+fn isHopByHopHeader(connection: *const ConnectionTokens, name: []const u8) bool {
     assert(name.len > 0); // parser rejects empty header names
     if (std.ascii.eqlIgnoreCase(name, "connection")) return true;
     if (std.ascii.eqlIgnoreCase(name, "keep-alive")) return true;
     if (std.ascii.eqlIgnoreCase(name, "proxy-connection")) return true;
-    return connectionListNames(headers, name);
-}
-
-/// True when any `Connection` header's comma-separated list names `token`.
-fn connectionListNames(headers: []const h1.Header, token: []const u8) bool {
-    assert(token.len > 0);
-    for (headers) |header| {
-        if (!std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
-        // Bounded by the header value's length (itself bounded by the head buffer).
-        var tokens = std.mem.splitScalar(u8, header.value, ',');
-        while (tokens.next()) |candidate| {
-            const trimmed = std.mem.trim(u8, candidate, " \t");
-            if (std.ascii.eqlIgnoreCase(trimmed, token)) return true;
-        }
-    }
-    return false;
+    return connection.names(name);
 }
 
 /// Whether the client's request permits downstream connection reuse. Only
 /// HTTP/1.1 (keep-alive by default) qualifies; HTTP/1.0 keep-alive is a
 /// relic we treat as close (it would require injecting a response header).
-fn keepAliveRequested(request: *const h1.Request) bool {
+fn keepAliveRequested(request: *const h1.Request, connection: *const ConnectionTokens) bool {
     if (request.version_minor != 1) return false;
-    return !connectionListNames(request.headers, "close");
+    return !connection.names("close");
 }
 
 fn sockaddrIn(address: Ip4Address) linux.sockaddr.in {
