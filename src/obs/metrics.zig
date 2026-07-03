@@ -46,6 +46,10 @@ pub const Metrics = struct {
     retry_budget_exhausted: Counter = .{},
     /// Endpoints ejected by passive outlier detection.
     outlier_ejections: Counter = .{},
+    /// Active health probes completed (all workers).
+    health_probes: Counter = .{},
+    /// Active health probes that failed (refused, reset, or timed out).
+    health_probe_failures: Counter = .{},
     /// Requests rejected by a cluster circuit breaker (max_requests).
     breaker_requests_rejected: Counter = .{},
     /// Upstream dials rejected by a cluster circuit breaker (max_pending or

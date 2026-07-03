@@ -41,6 +41,7 @@ const constants = @import("constants.zig");
 const config_mod = @import("config.zig");
 const h1 = @import("http/h1.zig");
 const Router = @import("proxy/router.zig").Router;
+const HealthChecker = @import("proxy/health_check.zig").HealthChecker;
 const proxy_mod = @import("net/proxy.zig");
 const ProxyServer = proxy_mod.ProxyServer;
 const ConnPool = proxy_mod.ConnPool;
@@ -140,11 +141,13 @@ fn run_iteration(seed: u64) !u64 {
         \\    { "name": "one", "endpoints": ["127.0.0.1:9001", "127.0.0.1:9002"],
         \\      "per_try_timeout_ms": 2000,
         \\      "retry": { "max": 2, "backoff_base_ms": 50, "backoff_cap_ms": 400 },
-        \\      "outlier": { "consecutive_failures": 3, "ejection_ms": 3000 } },
+        \\      "outlier": { "consecutive_failures": 3, "ejection_ms": 3000 },
+        \\      "health_check": { "interval_ms": 1000, "timeout_ms": 500 } },
         \\    { "name": "two", "endpoints": ["127.0.0.1:9003"],
         \\      "per_try_timeout_ms": 2000,
         \\      "retry": { "max": 2, "backoff_base_ms": 50, "backoff_cap_ms": 400 },
-        \\      "outlier": { "consecutive_failures": 3, "ejection_ms": 3000 } }
+        \\      "outlier": { "consecutive_failures": 3, "ejection_ms": 3000 },
+        \\      "health_check": { "interval_ms": 1000, "timeout_ms": 500 } }
         \\  ] }
     );
     const router = Router.init(&cfg);
@@ -177,6 +180,12 @@ fn run_iteration(seed: u64) !u64 {
     // P2C draws, same schedule — determinism end to end.
     server.prng = .init(seed +% 0x853C49E6748FEA9B);
     server.start();
+
+    // Active health probes run through the same virtual ring and fault
+    // profile: refused/black-holed probes flip endpoints unhealthy and the
+    // balancer must still route (fail-open) — under every seed's schedule.
+    var health = HealthChecker.init(&io, cfg.clusters, &server.resilience, &metrics);
+    health.start();
 
     const clients = try arena.alloc(Client, clients_max);
     for (clients, 0..) |*client, index| {

@@ -30,6 +30,9 @@ pub const balancer = @import("proxy/balancer.zig");
 /// Per-worker resilience state: LB/breaker/outlier/retry accounting (§7 Phase 2).
 pub const resilience = @import("proxy/resilience.zig");
 
+/// Per-worker active health checking (TCP-connect probes, in-ring).
+pub const HealthChecker = @import("proxy/health_check.zig").HealthChecker;
+
 /// Per-worker idle upstream connection pool.
 pub const UpstreamPool = @import("proxy/upstream_pool.zig").UpstreamPool;
 
@@ -58,6 +61,7 @@ test {
     _ = @import("proxy/router.zig");
     _ = balancer;
     _ = resilience;
+    _ = @import("proxy/health_check.zig");
     _ = @import("proxy/upstream_pool.zig");
     _ = @import("net/pool.zig");
     _ = proxy;

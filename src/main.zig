@@ -121,6 +121,11 @@ fn run_worker(
     server.worker_index = @intCast(@min(cpu, constants.workers_max - 1));
     server.prng = .init(seed_base +% cpu);
     server.start();
+
+    // Active health checks ride the same ring; arms only when configured.
+    var health = zoxy.HealthChecker.init(&io, router.config.clusters, &server.resilience, metrics);
+    health.start();
+
     while (true) {
         io.run_once() catch |err| return log_worker_error("io run", err);
         access.flush(); // batched: one write per event-loop iteration, off the per-connection path
