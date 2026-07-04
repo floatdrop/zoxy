@@ -427,6 +427,18 @@ pub const ProxyConn = struct {
     /// Per-cluster upstream client contexts (by cluster.index); empty when
     /// no cluster re-encrypts. From the server, set at start.
     upstream_tls_contexts: []const ?*const terminator.Context,
+    /// Buffered plaintext must be delivered from the event loop, never
+    /// synchronously from a logical-op start (TigerStyle: no recursion) —
+    /// hence a zero-delay yield timer per side. CONNECTION-scoped, not
+    /// leg-scoped: an upstream yield can outlive its attempt's leg, and a
+    /// leg-embedded completion re-armed by the next leg at the same address
+    /// while still in the ring corrupts it (found by CI on the pooled-TLS
+    /// test). A pending yield coalesces: it pumps whatever leg is current
+    /// when it fires.
+    downstream_yield_pending: bool,
+    upstream_yield_pending: bool,
+    downstream_yield_completion: Completion,
+    upstream_yield_completion: Completion,
     /// The record layer lives in the kernel (docs/DESIGN.md §6): `tls` is
     /// null again and every downstream op is a plain ring op on the fd; only
     /// the polite close differs (an alert cmsg instead of a channel).
@@ -473,10 +485,6 @@ pub const ProxyConn = struct {
         send_consumed: usize,
         send_active: bool,
         send_callback: *const fn (*ProxyConn, io_mod.SendError!usize) void,
-        /// Buffered plaintext must be delivered from the event loop, never
-        /// synchronously from a logical-op start (TigerStyle: no recursion);
-        /// this guards the zero-delay yield timer that reschedules us.
-        yield_pending: bool,
         /// A close_notify is queued and flushing; when the wire drains,
         /// teardown runs. Normal logical progress stops in this mode. The
         /// flush is bounded by the connection deadline: the ticking timer is
@@ -494,7 +502,6 @@ pub const ProxyConn = struct {
         secrets: terminator.TrafficSecrets,
         wire_recv_completion: Completion,
         wire_send_completion: Completion,
-        yield_completion: Completion,
 
         const Side = enum { downstream, upstream };
 
@@ -516,14 +523,12 @@ pub const ProxyConn = struct {
                 .send_consumed = 0,
                 .send_active = false,
                 .send_callback = undefined,
-                .yield_pending = false,
                 .notify_then_teardown = false,
                 .kernel_switch_pending = false,
                 .kernel_offload_enabled = kernel_offload_enabled,
                 .secrets = .{},
                 .wire_recv_completion = undefined,
                 .wire_send_completion = undefined,
-                .yield_completion = undefined,
             };
         }
     };
@@ -550,6 +555,8 @@ pub const ProxyConn = struct {
         conn.tls = null;
         conn.upstream_tls = null;
         conn.upstream_tls_contexts = upstream_tls_contexts;
+        conn.downstream_yield_pending = false;
+        conn.upstream_yield_pending = false;
         conn.ktls_active = false;
         conn.ktls_notify_pending = false;
         if (tls_context) |context| {
@@ -1348,44 +1355,58 @@ pub const ProxyConn = struct {
         conn.tls_progress(leg);
     }
 
+    /// One yield per side may be in flight; further requests coalesce (the
+    /// pending yield pumps whatever leg is current when it fires). The flag
+    /// and completion are connection-scoped so a leg swap can never re-arm
+    /// a completion that is still in the ring.
     fn tls_arm_yield(conn: *ProxyConn, leg: *Tls) void {
         assert(!conn.closing);
-        if (leg.yield_pending) return;
-        leg.yield_pending = true;
-        conn.retain();
         switch (leg.side) {
-            .downstream => conn.io.timeout(
-                *ProxyConn,
-                conn,
-                on_downstream_yield,
-                &leg.yield_completion,
-                0,
-            ),
-            .upstream => conn.io.timeout(
-                *ProxyConn,
-                conn,
-                on_upstream_yield,
-                &leg.yield_completion,
-                0,
-            ),
+            .downstream => {
+                if (conn.downstream_yield_pending) return;
+                conn.downstream_yield_pending = true;
+                conn.retain();
+                conn.io.timeout(
+                    *ProxyConn,
+                    conn,
+                    on_downstream_yield,
+                    &conn.downstream_yield_completion,
+                    0,
+                );
+            },
+            .upstream => {
+                if (conn.upstream_yield_pending) return;
+                conn.upstream_yield_pending = true;
+                conn.retain();
+                conn.io.timeout(
+                    *ProxyConn,
+                    conn,
+                    on_upstream_yield,
+                    &conn.upstream_yield_completion,
+                    0,
+                );
+            },
         }
     }
 
     fn on_downstream_yield(conn: *ProxyConn, _: *Completion, _: io_mod.TimeoutError!void) void {
         defer conn.release_ref();
-        conn.tls.?.yield_pending = false;
+        conn.downstream_yield_pending = false;
         if (conn.closing) return;
-        conn.tls_progress(&conn.tls.?);
+        // The leg may be gone: the kernel switchover freed it and HTTP now
+        // runs on plain ring ops — nothing left to pump.
+        const leg = if (conn.tls) |*leg| leg else return;
+        conn.tls_progress(leg);
     }
 
     fn on_upstream_yield(conn: *ProxyConn, _: *Completion, _: io_mod.TimeoutError!void) void {
         defer conn.release_ref();
-        // The per-request leg may be gone (disposed) or replaced (a retry's
-        // fresh leg) by the time a stale yield fires; pumping the current
-        // leg — or nothing — is always safe: progress is idempotent.
-        const leg = if (conn.upstream_tls) |*leg| leg else return;
-        leg.yield_pending = false;
+        conn.upstream_yield_pending = false;
         if (conn.closing) return;
+        // The attempt's leg may be gone (disposed) or replaced (the next
+        // request's resumed leg) by the time a stale yield fires; pumping
+        // the current leg — or nothing — is safe: progress is idempotent.
+        const leg = if (conn.upstream_tls) |*leg| leg else return;
         conn.tls_progress(leg);
     }
 
