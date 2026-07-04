@@ -423,10 +423,52 @@ h2c-in-simulator coverage; CONTINUATION-flood / rapid-reset hardening beyond
 what the fixed slots already give; the zrk measurement gate on the
 few-hot-connections shape (accept balancing exists to serve it).
 
-### Phase 6 — dynamic config (planned)
-xDS-style client or simpler custom protocol; apply via RCU pointer swap
-(build immutable config off-path, atomic publish) so the data path stays
-lock-free.
+### Phase 6 — config: JSON schema + file-watch reload (planned)
+Decided 2026-07-04. Keep JSON as the canonical, machine-facing format (Caddy's
+model): the format was never the problem — `config.zig` already lowers a wire
+DTO into an immutable, arena-owned `Config`, and the allocation island absorbs
+all parse cost. What's missing is a *schema*, *strictness*, and *reload*.
+
+**xDS rejected (for now).** It is mature and multi-vendor, but it is a *client*
+protocol for joining someone else's control plane, not a config format: it drags
+in protobuf (no first-class Zig codegen), a gRPC upstream-H2 client, the
+ACK/NACK resource state machine, and Envoy's object model — a hard collision
+with the one-deliberate-dependency rule, bought only by mesh interop we don't
+need. xDS is additive (Envoy itself boots from a static file and layers xDS on
+top), so nothing here forecloses it; revisit only if "be a data plane in an
+existing Envoy/Istio mesh" becomes a real requirement.
+
+Slices, each behind the usual gates:
+
+1. **Schema + strictness.** The Zig DTO stays the single source of truth; a
+   comptime reflection over its fields emits a JSON Schema, shipped for editor
+   completion and a `zig build check-config` CI gate (the schema can't drift —
+   it is derived from the parser). **Stop ignoring unknown fields**
+   (`ignore_unknown_fields = true` today): a misspelled `"circuit_breaker"`
+   silently disables the feature you thought you set — the worst property an
+   ops-facing config can have. Unknown keys become a parse error naming the
+   offending path.
+2. **File-watch reload → RCU swap.** A dedicated thread (off every data path)
+   watches the config file, parses + validates a *complete* new `Config` in a
+   fresh arena, and publishes only on success — a bad edit is logged and the
+   running config keeps serving, never a self-inflicted outage. Watch the
+   directory for the atomic-rename-replace editors perform (inotify
+   `IN_MOVED_TO` / `IN_CLOSE_WRITE` on the name, not an fd on the inode, which a
+   rename orphans); SIGHUP is an explicit second trigger. Publish per worker:
+   the watcher posts the new pointer to a per-worker mailbox, and each worker
+   swaps its own active `*const Config` at a loop-top quiescent point after one
+   atomic mailbox check — the per-request path stays a plain pointer deref, no
+   locks. **Reclamation is the hard part:** a routed request borrows
+   `*const Cluster` deep into `ProxyConn`, so the old arena cannot free until
+   every worker has both swapped *and* drained the requests that captured it —
+   an RCU grace period, reusing the Phase-4 drain accounting to detect
+   quiescence.
+3. **Human-readable surface (later).** If hand-authoring JSON hurts, add a
+   Caddyfile-style DSL that *lowers to* JSON — JSON stays canonical, the sugar
+   never becomes a second source of truth.
+
+Deferred within the phase: multi-file/dir includes, env interpolation, and any
+push-based (non-file) config source — all additive over the file-watch core.
 
 ### Deferred improvements (recorded decisions, revisit on evidence)
 - io_uring setup flags (`SINGLE_ISSUER` | `COOP_TASKRUN` | `DEFER_TASKRUN`)
