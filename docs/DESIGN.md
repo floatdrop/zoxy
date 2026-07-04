@@ -546,11 +546,18 @@ catches the dominant failures), ejection-time multipliers.
      burst itself. Heap: ~161 KiB per live TLS connection (consistent at
      c=64/c=256), 0.9 MiB process baseline → the reservation is now derived
      at startup as base + per_connection × connections_max × workers
-     (constants.zig; virtual, pages touch as connections carve). Still
-     deferred: SNI multi-cert (single identity in config today; the
-     servername callback is the extension point); shrinking the ~161 KiB
-     per-connection cost (`SSL_MODE_RELEASE_BUFFERS`, tighter BIO sizing) if
-     TLS density ever matters.
+     (constants.zig; virtual, pages touch as connections carve).
+     SNI multi-cert landed 2026-07-04: `tls.additional_identities` — one
+     server context per identity, selected by the servername callback
+     (`SSL_set_SSL_CTX` mid-ClientHello) against explicit `server_names`
+     (exact + single-label "*." wildcards, RFC 6125-style, config-declared
+     rather than introspected from the certificates); absent/unmatched SNI
+     keeps the default identity, never a fatal alert. Keylog, ALPN, and the
+     hardening ride the swapped context, so kTLS switchover works for every
+     identity. Verified with strict curl: each hostname verifies only
+     against its own authority. Still deferred: shrinking the ~161 KiB
+     per-connection cost (`SSL_MODE_RELEASE_BUFFERS`, tighter BIO sizing)
+     if TLS density ever matters.
   3. **kTLS fast path** — designed 2026-07-04 (§6 "kTLS design"): sans-io
      handshake unchanged; keylog-callback secrets + `hkdfExpandLabel` install
      the keys, the zero-records-flowed eligibility rule makes sequence

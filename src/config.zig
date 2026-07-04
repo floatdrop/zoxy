@@ -87,12 +87,23 @@ pub const Route = struct {
 /// TLS termination identity (Phase 3, docs/DESIGN.md §6): file paths only.
 /// This module stays FFI-free (the simulator imports it); reading and
 /// validating the PEM files happens at startup in main via `tls/openssl.zig`.
+/// One additional server identity, selected when the client's SNI matches
+/// any of its names (exact, or single-label "*." wildcards).
+pub const TlsIdentity = struct {
+    server_names: []const []const u8,
+    certificate_file: []const u8,
+    private_key_file: []const u8,
+};
+
 pub const TlsConfig = struct {
     certificate_file: []const u8,
     private_key_file: []const u8,
     /// Hand completed handshakes to kernel TLS (docs/DESIGN.md §6); off
     /// forces every connection onto the userspace relay (ops escape hatch).
     kernel_offload: bool = true,
+    /// SNI identities beyond the default certificate; absent or unmatched
+    /// SNI gets the default.
+    additional_identities: []const TlsIdentity = &.{},
 };
 
 pub const Config = struct {
@@ -141,6 +152,12 @@ const Dto = struct {
         certificate_file: []const u8,
         private_key_file: []const u8,
         kernel_offload: bool = true,
+        additional_identities: []const TlsIdentityDto = &.{},
+    };
+    const TlsIdentityDto = struct {
+        server_names: []const []const u8,
+        certificate_file: []const u8,
+        private_key_file: []const u8,
     };
     const ClusterTlsDto = struct {
         server_name: ?[]const u8 = null,
@@ -241,10 +258,31 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
     const tls: ?TlsConfig = if (dto.tls) |dt| lower: {
         if (dt.certificate_file.len == 0) return error.InvalidTls;
         if (dt.private_key_file.len == 0) return error.InvalidTls;
+        // The default identity counts toward the identity limit.
+        if (dt.additional_identities.len + 1 > constants.tls_identities_max) {
+            return error.InvalidTls;
+        }
+        const identities = try a.alloc(TlsIdentity, dt.additional_identities.len);
+        for (dt.additional_identities, identities) |di, *identity| {
+            if (di.server_names.len == 0) return error.InvalidTls;
+            if (di.certificate_file.len == 0) return error.InvalidTls;
+            if (di.private_key_file.len == 0) return error.InvalidTls;
+            const names = try a.alloc([]const u8, di.server_names.len);
+            for (di.server_names, names) |name, *duped| {
+                if (name.len == 0) return error.InvalidTls;
+                duped.* = try a.dupe(u8, name);
+            }
+            identity.* = .{
+                .server_names = names,
+                .certificate_file = try a.dupe(u8, di.certificate_file),
+                .private_key_file = try a.dupe(u8, di.private_key_file),
+            };
+        }
         break :lower .{
             .certificate_file = try a.dupe(u8, dt.certificate_file),
             .private_key_file = try a.dupe(u8, dt.private_key_file),
             .kernel_offload = dt.kernel_offload,
+            .additional_identities = identities,
         };
     } else null;
 
@@ -439,6 +477,35 @@ test "config: tls block is optional, parses paths, rejects empty ones" {
     try std.testing.expectError(error.InvalidTls, parse(std.testing.allocator,
         \\{ "listen": "0.0.0.0:443",
         \\  "tls": { "certificate_file": "", "private_key_file": "key.pem" },
+        \\  "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    ));
+}
+
+test "config: tls additional identities parse and validate" {
+    var parsed = try parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:443",
+        \\  "tls": { "certificate_file": "cert.pem", "private_key_file": "key.pem",
+        \\    "additional_identities": [
+        \\      { "server_names": ["other.test", "*.other.test"],
+        \\        "certificate_file": "other.pem", "private_key_file": "other_key.pem" } ] },
+        \\  "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    );
+    defer parsed.deinit();
+    const identities = parsed.tls.?.additional_identities;
+    try std.testing.expectEqual(@as(usize, 1), identities.len);
+    try std.testing.expectEqualStrings("other.test", identities[0].server_names[0]);
+    try std.testing.expectEqualStrings("*.other.test", identities[0].server_names[1]);
+    try std.testing.expectEqualStrings("other.pem", identities[0].certificate_file);
+
+    // An identity without names has nothing to match: refused.
+    try std.testing.expectError(error.InvalidTls, parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:443",
+        \\  "tls": { "certificate_file": "cert.pem", "private_key_file": "key.pem",
+        \\    "additional_identities": [
+        \\      { "server_names": [], "certificate_file": "o.pem",
+        \\        "private_key_file": "ok.pem" } ] },
         \\  "routes": [{ "cluster": "c" }],
         \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
     ));

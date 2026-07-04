@@ -41,6 +41,8 @@ pub const SSL_TLSEXT_ERR_OK: c_int = 0;
 pub const SSL_TLSEXT_ERR_NOACK: c_int = 3;
 pub const SSL_VERIFY_PEER: c_int = 0x01;
 pub const SSL_CTRL_SET_TLSEXT_HOSTNAME: c_int = 55;
+pub const SSL_CTRL_SET_TLSEXT_SERVERNAME_CB: c_int = 53;
+pub const SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG: c_int = 54;
 pub const TLSEXT_NAMETYPE_host_name: c_long = 0;
 
 var global_heap: Heap = undefined;
@@ -256,6 +258,18 @@ pub extern fn X509_STORE_add_cert(store: *X509_STORE, certificate: *X509) c_int;
 pub extern fn SSL_set1_host(ssl: *SSL, hostname: [*:0]const u8) c_int;
 /// The macro escape hatch (SSL_set_tlsext_host_name = ctrl 55).
 pub extern fn SSL_ctrl(ssl: *SSL, command: c_int, argument: c_long, pointer: ?*anyopaque) c_long;
+
+// SNI multi-certificate selection (docs/DESIGN.md §6).
+pub extern fn SSL_CTX_callback_ctrl(
+    context: *SSL_CTX,
+    command: c_int,
+    function: ?*const fn () callconv(.c) void,
+) c_long;
+/// The SNI hostname from the ClientHello (kind = TLSEXT_NAMETYPE_host_name).
+pub extern fn SSL_get_servername(ssl: *const SSL, kind: c_int) ?[*:0]const u8;
+/// Swap the connection onto another context (certificate + callbacks);
+/// returns the previous context, or null on failure.
+pub extern fn SSL_set_SSL_CTX(ssl: *SSL, context: *SSL_CTX) ?*SSL_CTX;
 
 /// Add every certificate of a PEM bundle to a store (a private CA plus any
 /// intermediates); returns how many were added.

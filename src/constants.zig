@@ -124,6 +124,10 @@ pub const tls_heap_per_connection_bytes: usize = 192 * 1024;
 /// stay below maxInt(c_int): the PEM bytes cross the OpenSSL FFI boundary.
 pub const tls_pem_bytes_max: u32 = 256 * 1024;
 
+/// Maximum server identities on the TLS listener (the default plus SNI
+/// additions). Bounds the SNI table scan and the startup context builds.
+pub const tls_identities_max: usize = 16;
+
 /// Each half of a connection's BIO pair buffers this much ciphertext (the
 /// pair is the in-memory "network" between the SSL state machine and our
 /// ring ops). Sized to hold one maximum TLS record (16 KiB payload + record

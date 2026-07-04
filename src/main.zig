@@ -68,7 +68,12 @@ pub fn main(init: std.process.Init) !void {
     var tls_context: ?*const zoxy.terminator.Context = null;
     if (cfg.tls) |tls_config| {
         const context = try gpa.create(zoxy.terminator.Context);
-        context.* = load_tls_identity(init.io, gpa, tls_config) catch |err| {
+        context.* = load_tls_identity(
+            init.io,
+            gpa,
+            tls_config.certificate_file,
+            tls_config.private_key_file,
+        ) catch |err| {
             std.log.err("zoxy: cannot load tls identity ({s} / {s}): {s}", .{
                 tls_config.certificate_file,
                 tls_config.private_key_file,
@@ -82,6 +87,41 @@ pub fn main(init: std.process.Init) !void {
             tls_config.certificate_file,
             tls_config.kernel_offload,
         });
+
+        // SNI identities beyond the default certificate (docs/DESIGN.md §6).
+        if (tls_config.additional_identities.len > 0) {
+            const entries = try gpa.alloc(
+                zoxy.terminator.SniTable.Entry,
+                tls_config.additional_identities.len,
+            );
+            for (tls_config.additional_identities, entries) |identity, *entry| {
+                const identity_context = try gpa.create(zoxy.terminator.Context);
+                identity_context.* = load_tls_identity(
+                    init.io,
+                    gpa,
+                    identity.certificate_file,
+                    identity.private_key_file,
+                ) catch |err| {
+                    std.log.err("zoxy: cannot load sni identity ({s}): {s}", .{
+                        identity.certificate_file,
+                        @errorName(err),
+                    });
+                    return err;
+                };
+                identity_context.kernel_offload = tls_config.kernel_offload;
+                entry.* = .{
+                    .server_names = identity.server_names,
+                    .context = identity_context,
+                };
+                std.log.info("zoxy sni identity: {s} ({d} name(s))", .{
+                    identity.certificate_file,
+                    identity.server_names.len,
+                });
+            }
+            const table = try gpa.create(zoxy.terminator.SniTable);
+            table.* = .{ .entries = entries };
+            zoxy.terminator.enable_sni(context, table);
+        }
     }
 
     // Upstream re-encryption: one verifying client context per TLS cluster,
@@ -176,21 +216,22 @@ fn build_upstream_context(
     } });
 }
 
-/// Read the configured PEM files (startup-time, bounded) and build the TLS
-/// server context from them — parsing, cross-checking, and installing the
+/// Read a certificate/key PEM pair (startup-time, bounded) and build a
+/// server context from it — parsing, cross-checking, and installing the
 /// identity via the exact stack that will terminate TLS.
 fn load_tls_identity(
     io: std.Io,
     gpa: std.mem.Allocator,
-    tls_config: zoxy.config.TlsConfig,
+    certificate_file: []const u8,
+    private_key_file: []const u8,
 ) !zoxy.terminator.Context {
-    assert(tls_config.certificate_file.len > 0); // config.parse rejects empty
-    assert(tls_config.private_key_file.len > 0);
+    assert(certificate_file.len > 0); // config.parse rejects empty
+    assert(private_key_file.len > 0);
     const limit = std.Io.Limit.limited(constants.tls_pem_bytes_max);
     const certificate_pem = try std.Io.Dir.cwd()
-        .readFileAlloc(io, tls_config.certificate_file, gpa, limit);
+        .readFileAlloc(io, certificate_file, gpa, limit);
     const private_key_pem = try std.Io.Dir.cwd()
-        .readFileAlloc(io, tls_config.private_key_file, gpa, limit);
+        .readFileAlloc(io, private_key_file, gpa, limit);
     return zoxy.terminator.Context.init_server(certificate_pem, private_key_pem);
 }
 

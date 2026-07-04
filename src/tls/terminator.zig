@@ -169,6 +169,84 @@ pub const Context = struct {
     }
 };
 
+/// SNI multi-certificate selection (docs/DESIGN.md §6): additional server
+/// identities keyed by the names they serve, consulted by the servername
+/// callback. The default context answers absent and unmatched SNI. The
+/// table, its names, and every context must outlive the listener.
+pub const SniTable = struct {
+    entries: []const Entry,
+
+    pub const Entry = struct {
+        /// Exact names, or single-label wildcards ("*.example.com").
+        server_names: []const []const u8,
+        context: *const Context,
+    };
+
+    pub fn lookup(table: *const SniTable, host: []const u8) ?*const Context {
+        assert(host.len > 0);
+        for (table.entries) |entry| {
+            assert(entry.context.role == .server);
+            for (entry.server_names) |name| {
+                if (host_matches(name, host)) return entry.context;
+            }
+        }
+        return null;
+    }
+};
+
+/// RFC 6125-style name match: case-insensitive; "*.suffix" covers exactly
+/// one label (a.example.com — never example.com or a.b.example.com).
+pub fn host_matches(pattern: []const u8, host: []const u8) bool {
+    assert(pattern.len > 0);
+    if (host.len == 0) return false;
+    if (std.mem.startsWith(u8, pattern, "*.")) {
+        const suffix = pattern[1..]; // ".example.com"
+        if (host.len <= suffix.len) return false;
+        const label = host[0 .. host.len - suffix.len];
+        assert(label.len > 0);
+        if (std.mem.indexOfScalar(u8, label, '.') != null) return false;
+        return std.ascii.eqlIgnoreCase(suffix, host[label.len..]);
+    }
+    return std.ascii.eqlIgnoreCase(pattern, host);
+}
+
+/// Arm SNI selection on the default server context. Connections whose SNI
+/// matches a table entry are moved onto that identity's context mid-
+/// ClientHello (certificate and callbacks swap; the session stays).
+pub fn enable_sni(default_context: *const Context, table: *const SniTable) void {
+    assert(default_context.role == .server);
+    assert(table.entries.len > 0);
+    const callback: *const fn () callconv(.c) void = @ptrCast(&servername_select);
+    _ = openssl.SSL_CTX_callback_ctrl(
+        default_context.context,
+        openssl.SSL_CTRL_SET_TLSEXT_SERVERNAME_CB,
+        callback,
+    );
+    _ = openssl.SSL_CTX_ctrl(
+        default_context.context,
+        openssl.SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG,
+        0,
+        @ptrCast(@constCast(table)),
+    );
+}
+
+/// int (*cb)(SSL *s, int *al, void *arg): NOACK keeps the default identity
+/// (absent SNI, unmatched name, or a failed swap) — never a fatal alert.
+fn servername_select(ssl: *openssl.SSL, alert: ?*c_int, argument: ?*anyopaque) callconv(.c) c_int {
+    _ = alert;
+    const raw = argument orelse return openssl.SSL_TLSEXT_ERR_NOACK;
+    const table: *const SniTable = @ptrCast(@alignCast(raw));
+    const name = openssl.SSL_get_servername(ssl, @intCast(openssl.TLSEXT_NAMETYPE_host_name)) orelse
+        return openssl.SSL_TLSEXT_ERR_NOACK;
+    const host = std.mem.span(name);
+    if (host.len == 0) return openssl.SSL_TLSEXT_ERR_NOACK;
+    const matched = table.lookup(host) orelse return openssl.SSL_TLSEXT_ERR_NOACK;
+    if (openssl.SSL_set_SSL_CTX(ssl, matched.context) == null) {
+        return openssl.SSL_TLSEXT_ERR_NOACK;
+    }
+    return openssl.SSL_TLSEXT_ERR_OK;
+}
+
 /// OpenSSL's reserved application-data ex_data slot (the SSL_set_app_data
 /// macro's index): holds the connection's `*TrafficSecrets` when capture
 /// is armed, null otherwise.
@@ -835,6 +913,67 @@ test "terminator: a verifying client refuses a wrong host or unknown authority" 
         .bundle_pem = "not a pem",
         .host = "zoxy.test",
     } }));
+}
+
+test "terminator: host_matches — exact, case, and single-label wildcards" {
+    try std.testing.expect(host_matches("example.com", "example.com"));
+    try std.testing.expect(host_matches("Example.COM", "example.com"));
+    try std.testing.expect(!host_matches("example.com", "other.com"));
+    try std.testing.expect(!host_matches("example.com", ""));
+
+    try std.testing.expect(host_matches("*.example.com", "a.example.com"));
+    try std.testing.expect(host_matches("*.example.com", "WWW.Example.Com"));
+    try std.testing.expect(!host_matches("*.example.com", "example.com")); // no label
+    try std.testing.expect(!host_matches("*.example.com", "a.b.example.com")); // two labels
+    try std.testing.expect(!host_matches("*.example.com", "aexample.com")); // no dot
+}
+
+test "terminator: SNI selects the matching identity; unmatched keeps the default" {
+    install_test_hook();
+    // Default identity: CN=zoxy.test. Additional identity: CN=other.test.
+    var default_context = try Context.init_server(test_certificate_pem, test_private_key_pem);
+    defer default_context.deinit();
+    var other_context = try Context.init_server(
+        @embedFile("testdata/other_certificate.pem"),
+        @embedFile("testdata/other_key.pem"),
+    );
+    defer other_context.deinit();
+    const names = [_][]const u8{"other.test"};
+    const entries = [_]SniTable.Entry{
+        .{ .server_names = &names, .context = &other_context },
+    };
+    const table = SniTable{ .entries = &entries };
+    enable_sni(&default_context, &table);
+
+    // A client demanding other.test gets the other identity — with the
+    // default certificate this handshake would fail both the authority
+    // check and the hostname pin.
+    {
+        const client_context = try Context.init_client(.{ .authority = .{
+            .bundle_pem = @embedFile("testdata/other_certificate.pem"),
+            .host = "other.test",
+        } });
+        defer client_context.deinit();
+        var server = try Channel.init(&default_context);
+        defer server.deinit();
+        var client = try Channel.init(&client_context);
+        defer client.deinit();
+        try test_handshaken_pair(&client, &server, constants.tls_bio_pair_bytes);
+    }
+
+    // A client demanding zoxy.test does not match the table: default cert.
+    {
+        const client_context = try Context.init_client(.{ .authority = .{
+            .bundle_pem = test_certificate_pem,
+            .host = "zoxy.test",
+        } });
+        defer client_context.deinit();
+        var server = try Channel.init(&default_context);
+        defer server.deinit();
+        var client = try Channel.init(&client_context);
+        defer client.deinit();
+        try test_handshaken_pair(&client, &server, constants.tls_bio_pair_bytes);
+    }
 }
 
 test "terminator: channels drain the hook heap to baseline" {
