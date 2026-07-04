@@ -38,6 +38,8 @@ const Completion = io_mod.Completion;
 const constants = @import("../constants.zig");
 const Listener = @import("listener.zig").Listener;
 const h1 = @import("../http/h1.zig");
+const h2_frame = @import("../http/h2_frame.zig");
+const hpack = @import("../http/hpack.zig");
 const config = @import("../config.zig");
 const Router = @import("../proxy/router.zig").Router;
 const balancer = @import("../proxy/balancer.zig");
@@ -52,6 +54,9 @@ const AccessLog = access_log.AccessLog;
 const guard = @import("../mem/guard.zig");
 const terminator = @import("../tls/terminator.zig");
 const kernel_tls = @import("../tls/kernel.zig");
+const h2_proxy = @import("h2_proxy.zig");
+const H2ConnPool = h2_proxy.H2ConnPool;
+const H2LegPool = h2_proxy.LegPool;
 const Ip4Address = std.Io.net.Ip4Address;
 
 const Pool = @import("pool.zig").Pool(ProxyConn);
@@ -453,6 +458,13 @@ pub const ProxyConn = struct {
     /// Per-cluster upstream client contexts (by cluster.index); empty when
     /// no cluster re-encrypts. From the server, set at start.
     upstream_tls_contexts: []const ?*const terminator.Context,
+    /// The worker's HTTP/2 pools, non-null iff `tls.http2` (docs/DESIGN.md
+    /// §7 Phase 5). When a downstream handshake negotiates `h2` in ALPN, the
+    /// connection is handed to a fresh `H2Conn` from this pool; the leg pool
+    /// is passed on for its per-stream upstream transactions. From the
+    /// server, set at start.
+    h2_conn_pool: ?*H2ConnPool,
+    h2_leg_pool: ?*H2LegPool,
     /// Buffered plaintext must be delivered from the event loop, never
     /// synchronously from a logical-op start (TigerStyle: no recursion) —
     /// hence a zero-delay yield timer per side. CONNECTION-scoped, not
@@ -586,14 +598,20 @@ pub const ProxyConn = struct {
         tls_context: ?*const terminator.Context,
         upstream_tls_contexts: []const ?*const terminator.Context,
         tls_legs: ?*TlsLegPool,
+        h2_conn_pool: ?*H2ConnPool,
+        h2_leg_pool: ?*H2LegPool,
     ) void {
         assert(downstream_fd >= 0);
+        assert((h2_conn_pool == null) == (h2_leg_pool == null)); // wired together
+        assert(h2_conn_pool == null or tls_context != null); // h2 rides TLS ALPN
         // TLS first, before any state or metrics: exhaustion of the TLS heap
         // sheds the whole connection here (reject, never a partial start).
         conn.tls = null;
         conn.upstream_tls = null;
         conn.tls_legs = tls_legs;
         conn.upstream_tls_contexts = upstream_tls_contexts;
+        conn.h2_conn_pool = h2_conn_pool;
+        conn.h2_leg_pool = h2_leg_pool;
         conn.downstream_yield_pending = false;
         conn.upstream_yield_pending = false;
         conn.ktls_active = false;
@@ -1056,6 +1074,12 @@ pub const ProxyConn = struct {
         if (tls.wire_recv_in_flight) return; // its completion loops back here
 
         tls.kernel_switch_pending = false;
+        // The wire is now idle (all our ciphertext out, nothing pending, no
+        // wire recv in flight) — the exact quiescent point the h2 handoff
+        // also needs. A client that negotiated `h2` in ALPN goes to the H2
+        // data path from here; any staged bytes past the handshake (a
+        // coalesced preface) ride along.
+        if (conn.h2_selected(tls)) return conn.hand_off_to_h2(tls);
         const eligible = tls.kernel_offload_enabled and
             tls.wire_recv_staged == 0 and
             tls.channel.kernel_switch_eligible();
@@ -1081,6 +1105,63 @@ pub const ProxyConn = struct {
         }
         conn.metrics.tls_ktls_fallbacks.add(1);
         conn.arm_recv_head(); // userspace relay, as before the switchover existed
+    }
+
+    /// The downstream handshake negotiated `h2` and this listener offers it.
+    fn h2_selected(conn: *const ProxyConn, tls: *const Tls) bool {
+        if (conn.h2_conn_pool == null) return false;
+        assert(tls.side == .downstream);
+        const alpn = tls.channel.alpn_selected() orelse return false;
+        return std.mem.eql(u8, alpn, terminator.alpn_h2);
+    }
+
+    /// Move the terminated `h2` connection to a fresh `H2Conn`: the channel
+    /// and the fd change hands, this `ProxyConn` relinquishes both and
+    /// returns to its pool. Called only at the quiescent switchover point,
+    /// so no wire op references the fd and no ciphertext is pending. Pool
+    /// exhaustion sheds the connection (the client retries).
+    fn hand_off_to_h2(conn: *ProxyConn, tls: *Tls) void {
+        assert(!conn.closing);
+        assert(tls.side == .downstream);
+        assert(tls.handshake_complete);
+        assert(!tls.wire_send_in_flight and tls.wire_send_sent == tls.wire_send_filled);
+        assert(tls.channel.pending_ciphertext() == 0);
+        assert(!tls.wire_recv_in_flight);
+        assert(conn.downstream_fd >= 0);
+        assert(!conn.request_forwarded); // no HTTP has flowed
+        const h2 = conn.h2_conn_pool.?.acquire() orelse {
+            // Every H2 slot taken: shed like any pool exhaustion. The client
+            // retries; nothing was committed to an endpoint.
+            conn.metrics.rejected.add(1);
+            return conn.teardown();
+        };
+        // The bytes the handshaker read past the handshake — a coalesced
+        // client preface — travel with the channel as `staged`.
+        const staged = tls.wire_recv_buf[0..tls.wire_recv_staged];
+        h2.start(
+            conn.io,
+            conn.h2_conn_pool.?,
+            conn.h2_leg_pool.?,
+            conn.router,
+            conn.resilience,
+            conn.upstream_pool,
+            conn.metrics,
+            conn.access,
+            conn.random,
+            conn.downstream_fd,
+            conn.request_timeout_ns,
+            conn.idle_timeout_ns,
+            tls.channel, // ownership moves to the H2Conn
+            staged,
+        );
+        conn.metrics.tls_h2_handoffs.add(1);
+        // Relinquish: the channel and fd are the H2Conn's now. Null the leg's
+        // channel view (release must not deinit it) and the fd (teardown must
+        // not close it), then tear down to return this slot to the H1 pool.
+        conn.tls = null;
+        conn.tls_leg_release(tls);
+        conn.downstream_fd = -1;
+        conn.teardown();
     }
 
     /// Close the downstream connection the way the peer's TLS stack wants:
@@ -2442,6 +2523,11 @@ pub const ProxyServer = struct {
     /// This worker's TLS leg pool; set by the worker after init alongside
     /// the contexts. Null iff neither side speaks TLS.
     tls_legs: ?*TlsLegPool,
+    /// This worker's HTTP/2 pools (docs/DESIGN.md §7 Phase 5): non-null iff
+    /// `tls.http2`, set by the worker after init. When a downstream ALPN
+    /// negotiates `h2`, the connection is handed to an `H2Conn` from these.
+    h2_conn_pool: ?*H2ConnPool,
+    h2_leg_pool: ?*H2LegPool,
     request_timeout_ns: u63,
     idle_timeout_ns: u63,
     /// Drain-to-forced-teardown bound; set by the worker after init like
@@ -2499,6 +2585,8 @@ pub const ProxyServer = struct {
             .tls_context = null,
             .upstream_tls_contexts = &.{},
             .tls_legs = null,
+            .h2_conn_pool = null,
+            .h2_leg_pool = null,
             .request_timeout_ns = request_timeout_ns,
             .idle_timeout_ns = idle_timeout_ns,
             .drain_timeout_ns = constants.drain_timeout_ns,
@@ -2580,6 +2668,8 @@ pub const ProxyServer = struct {
                     server.tls_context,
                     server.upstream_tls_contexts,
                     server.tls_legs,
+                    server.h2_conn_pool,
+                    server.h2_leg_pool,
                 );
             } else {
                 server.metrics.rejected.add(1);
@@ -2687,6 +2777,14 @@ pub const ProxyServer = struct {
             // path closes via `drain_close`.
             if (!conn.request_active) conn.close_downstream();
         }
+        // The handed-off HTTP/2 connections drain in parallel: each stages a
+        // GOAWAY, completes its in-flight streams, then closes (§7 Phase 5).
+        if (server.h2_conn_pool) |h2_pool| {
+            for (h2_pool.items) |*h2| {
+                if (!h2.in_use) continue;
+                h2.begin_drain();
+            }
+        }
         assert(server.draining);
     }
 
@@ -2727,6 +2825,13 @@ pub const ProxyServer = struct {
         if (!server.draining) return false;
         if (server.operations_pending > 0) return false;
         if (server.pool.free_count != server.pool.capacity) return false;
+        // Handed-off H2 connections and their upstream legs must also be home.
+        if (server.h2_conn_pool) |h2_pool| {
+            if (h2_pool.free_count != h2_pool.capacity) return false;
+        }
+        if (server.h2_leg_pool) |leg_pool| {
+            if (leg_pool.free_count != leg_pool.capacity) return false;
+        }
         assert(server.listener_closed); // no ops pending implies the accept ended
         assert(!server.accept_pending);
         return true;
@@ -6302,6 +6407,259 @@ test "proxy: the serving path allocates nothing after startup (zero-alloc gate)"
     server.begin_drain();
     while (!server.drain_complete()) try io.run_once();
     try std.testing.expectEqual(baseline, counting.allocation_count());
+}
+
+/// An h2-over-TLS client on the test loop: a client `Channel` glued to a
+/// socket, driving the handshake (offering `h2`), then the HTTP/2 preface +
+/// one GET, decrypting server frames into a status + body. The end-to-end
+/// counterpart of the H2Conn-side isolation tests — here the full
+/// ProxyConn handshaker + ALPN handoff is exercised.
+const TlsH2ProxyClient = struct {
+    io: *IO,
+    fd: posix.socket_t,
+    channel: terminator.Channel,
+    handshake_done: bool = false,
+    sent_opening: bool = false,
+    plain_out: [512]u8 = undefined,
+    plain_out_len: usize = 0,
+    plain_out_encrypted: usize = 0,
+    wire_out: [constants.tls_bio_pair_bytes]u8 = undefined,
+    wire_out_filled: usize = 0,
+    wire_out_sent: usize = 0,
+    send_in_flight: bool = false,
+    recv_in_flight: bool = false,
+    wire_in: [constants.tls_bio_pair_bytes]u8 = undefined,
+    frame_buf: [8192]u8 = undefined,
+    frame_len: usize = 0,
+    decoder: hpack.Decoder = .{},
+    fields: [16]hpack.Header = undefined,
+    fields_storage: [1024]u8 = undefined,
+    status: u16 = 0,
+    body: [256]u8 = undefined,
+    body_len: usize = 0,
+    done: bool = false,
+    reset: bool = false,
+    send_c: Completion = undefined,
+    recv_c: Completion = undefined,
+
+    fn go(client: *TlsH2ProxyClient) void {
+        _ = client.channel.handshake_step(); // ClientHello
+        client.progress();
+    }
+
+    fn build_opening(client: *TlsH2ProxyClient) void {
+        var len: usize = 0;
+        @memcpy(client.plain_out[0..h2_frame.client_preface.len], h2_frame.client_preface);
+        len += h2_frame.client_preface.len;
+        var settings: [64]u8 = undefined;
+        const settings_len = h2_frame.write_settings(&.{}, &settings);
+        @memcpy(client.plain_out[len..][0..settings_len], settings[0..settings_len]);
+        len += settings_len;
+        var block: [128]u8 = undefined;
+        var block_len: usize = 0;
+        block_len += hpack.encode_header(":method", "GET", block[block_len..]) catch unreachable;
+        block_len += hpack.encode_header(":scheme", "https", block[block_len..]) catch unreachable;
+        block_len += hpack.encode_header(":path", "/", block[block_len..]) catch unreachable;
+        block_len += hpack.encode_header(":authority", "o", block[block_len..]) catch unreachable;
+        h2_frame.write_frame_header(.{
+            .length = @intCast(block_len),
+            .type = .headers,
+            .flags = h2_frame.Flags.end_headers | h2_frame.Flags.end_stream,
+            .stream_id = 1,
+        }, client.plain_out[len..][0..h2_frame.frame_header_bytes]);
+        len += h2_frame.frame_header_bytes;
+        @memcpy(client.plain_out[len..][0..block_len], block[0..block_len]);
+        len += block_len;
+        client.plain_out_len = len;
+    }
+
+    fn progress(client: *TlsH2ProxyClient) void {
+        _ = client.channel.handshake_step();
+        if (client.channel.handshake_done() and !client.sent_opening) {
+            client.sent_opening = true;
+            client.build_opening();
+        }
+        var enc_budget: u32 = 16;
+        while (client.plain_out_encrypted < client.plain_out_len and enc_budget > 0) : (enc_budget -= 1) {
+            switch (client.channel.write_plaintext(client.plain_out[client.plain_out_encrypted..client.plain_out_len])) {
+                .bytes => |c| client.plain_out_encrypted += c,
+                .want_io => break,
+                .failed => return,
+            }
+        }
+        var read_budget: u32 = 32;
+        while (read_budget > 0) : (read_budget -= 1) {
+            var plain: [1024]u8 = undefined;
+            switch (client.channel.read_plaintext(&plain)) {
+                .bytes => |n| client.consume_frames(plain[0..n]),
+                .closed => {
+                    client.done = true;
+                    break;
+                },
+                .want_io, .failed => break,
+            }
+        }
+        client.flush_wire();
+        client.arm_wire_recv();
+    }
+
+    fn consume_frames(client: *TlsH2ProxyClient, plain: []const u8) void {
+        @memcpy(client.frame_buf[client.frame_len..][0..plain.len], plain);
+        client.frame_len += plain.len;
+        var offset: usize = 0;
+        while (true) {
+            const frame = (h2_frame.parse_frame(client.frame_buf[offset..client.frame_len]) catch {
+                client.reset = true;
+                client.done = true;
+                break;
+            }) orelse break;
+            offset += frame.wire_bytes();
+            switch (frame.header.type) {
+                .headers => {
+                    const decoded = client.decoder.decode(frame.payload, &client.fields, &client.fields_storage) catch unreachable;
+                    client.status = std.fmt.parseInt(u16, decoded[0].value, 10) catch 0;
+                    if (frame.header.flags & h2_frame.Flags.end_stream != 0) client.done = true;
+                },
+                .data => {
+                    @memcpy(client.body[client.body_len..][0..frame.payload.len], frame.payload);
+                    client.body_len += frame.payload.len;
+                    if (frame.header.flags & h2_frame.Flags.end_stream != 0) client.done = true;
+                },
+                .rst_stream => {
+                    client.reset = true;
+                    client.done = true;
+                },
+                else => {},
+            }
+        }
+        std.mem.copyForwards(u8, client.frame_buf[0 .. client.frame_len - offset], client.frame_buf[offset..client.frame_len]);
+        client.frame_len -= offset;
+    }
+
+    fn flush_wire(client: *TlsH2ProxyClient) void {
+        if (client.send_in_flight) return;
+        if (client.wire_out_sent == client.wire_out_filled) {
+            client.wire_out_filled = client.channel.drain_ciphertext(&client.wire_out);
+            client.wire_out_sent = 0;
+            if (client.wire_out_filled == 0) return;
+        }
+        client.send_in_flight = true;
+        client.io.send(*TlsH2ProxyClient, client, on_send, &client.send_c, client.fd, client.wire_out[client.wire_out_sent..client.wire_out_filled]);
+    }
+    fn on_send(client: *TlsH2ProxyClient, _: *Completion, result: io_mod.SendError!usize) void {
+        client.send_in_flight = false;
+        client.wire_out_sent += result catch return;
+        client.progress();
+    }
+    fn arm_wire_recv(client: *TlsH2ProxyClient) void {
+        if (client.recv_in_flight or client.done) return;
+        client.recv_in_flight = true;
+        client.io.recv(*TlsH2ProxyClient, client, on_recv, &client.recv_c, client.fd, &client.wire_in);
+    }
+    fn on_recv(client: *TlsH2ProxyClient, _: *Completion, result: io_mod.RecvError!usize) void {
+        client.recv_in_flight = false;
+        const n = result catch 0;
+        if (n == 0) {
+            client.done = true;
+            return;
+        }
+        const fed = client.channel.feed_ciphertext(client.wire_in[0..n]);
+        std.testing.expectEqual(n, fed) catch unreachable;
+        client.progress();
+    }
+};
+
+test "proxy: negotiates h2 over TLS and hands the connection to the H2 data path" {
+    const gpa = std.testing.allocator;
+    install_proxy_test_hook();
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    var origin = TestOrigin{
+        .io = &io,
+        .listener = origin_listener,
+        .response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO",
+        .close_after_send = false, // keep-alive: the pooled upstream lingers
+    };
+    origin.start();
+
+    var json_buf: [256]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
+    , .{origin_listener.bound_address().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var server_context = try terminator.Context.init_server(
+        @embedFile("../tls/testdata/certificate.pem"),
+        @embedFile("../tls/testdata/private_key.pem"),
+    );
+    defer server_context.deinit();
+    terminator.enable_h2(&server_context);
+    const client_context = try terminator.Context.init_client(.insecure);
+    defer client_context.deinit();
+
+    var pool = try Pool.init(gpa, 2);
+    defer pool.deinit(gpa);
+    var legs = try TlsLegPool.init(gpa, 2);
+    defer legs.deinit(gpa);
+    var h2_pool = try H2ConnPool.init(gpa, 2);
+    defer h2_pool.deinit(gpa);
+    var h2_legs = try H2LegPool.init(gpa, 4);
+    defer h2_legs.deinit(gpa);
+
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    var metrics = Counters{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
+    );
+    defer server.deinit();
+    server.tls_context = &server_context;
+    server.tls_legs = &legs;
+    server.h2_conn_pool = &h2_pool;
+    server.h2_leg_pool = &h2_legs;
+    server.start();
+
+    const client_fd = try connect_loopback(proxy_listener.bound_address().port);
+    defer _ = linux.close(client_fd);
+    var client = TlsH2ProxyClient{
+        .io = &io,
+        .fd = client_fd,
+        .channel = try terminator.Channel.init(&client_context),
+    };
+    defer client.channel.deinit();
+    const offer = "\x02h2\x08http/1.1";
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        @import("../tls/openssl.zig").SSL_set_alpn_protos(client.channel.ssl, offer.ptr, offer.len),
+    );
+    client.go();
+
+    try io.run_until_done(&client.done);
+    try std.testing.expect(!client.reset);
+    try std.testing.expectEqual(@as(u16, 200), client.status);
+    try std.testing.expectEqualStrings("HELLO", client.body[0..client.body_len]);
+    // The connection took the h2 handoff, not the H1 path.
+    try std.testing.expectEqual(@as(u64, 1), metrics.tls_h2_handoffs.load());
+
+    // Drain sweeps the handed-off H2 connection too; everything comes home.
+    server.begin_drain();
+    while (!server.drain_complete()) try io.run_once();
+    try std.testing.expect(server.resilience.is_idle());
 }
 
 fn connect_loopback(port: u16) !posix.socket_t {

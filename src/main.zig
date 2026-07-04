@@ -16,6 +16,8 @@ const Router = zoxy.Router;
 const ProxyServer = zoxy.proxy.ProxyServer;
 const Pool = zoxy.proxy.ConnPool;
 const TlsLegPool = zoxy.proxy.TlsLegPool;
+const H2ConnPool = zoxy.h2_proxy.H2ConnPool;
+const H2LegPool = zoxy.h2_proxy.LegPool;
 const Metrics = zoxy.Metrics;
 const AccessLog = zoxy.AccessLog;
 const Ip4Address = std.Io.net.Ip4Address;
@@ -84,10 +86,14 @@ pub fn main(init: std.process.Init) !void {
             return err;
         };
         context.kernel_offload = tls_config.kernel_offload;
+        // The ALPN gate (docs/DESIGN.md §7 Phase 5): offer h2, and the
+        // handshaker hands `h2`-negotiating connections to the H2 data path.
+        if (tls_config.http2) zoxy.terminator.enable_h2(context);
         tls_context = context;
-        std.log.info("zoxy tls listener: {s} (kernel_offload={})", .{
+        std.log.info("zoxy tls listener: {s} (kernel_offload={}, http2={})", .{
             tls_config.certificate_file,
             tls_config.kernel_offload,
+            tls_config.http2,
         });
 
         // SNI identities beyond the default certificate (docs/DESIGN.md §6).
@@ -111,6 +117,7 @@ pub fn main(init: std.process.Init) !void {
                     return err;
                 };
                 identity_context.kernel_offload = tls_config.kernel_offload;
+                if (tls_config.http2) zoxy.terminator.enable_h2(identity_context);
                 entry.* = .{
                     .server_names = identity.server_names,
                     .context = identity_context,
@@ -259,6 +266,21 @@ pub fn main(init: std.process.Init) !void {
         break :pools leg_pools;
     } else &.{};
 
+    // HTTP/2 pools, reserved per worker only when a TLS listener offers h2
+    // (docs/DESIGN.md §7 Phase 5): the connection pool a handoff draws from,
+    // and the stream-leg pool its per-stream upstream transactions use.
+    const http2_enabled = if (cfg.tls) |t| t.http2 else false;
+    const h2_conn_pools: []cache_line.Padded(H2ConnPool) = if (http2_enabled) pools: {
+        const h2_pools = try gpa.alloc(cache_line.Padded(H2ConnPool), worker_count);
+        for (h2_pools) |*slot| slot.value = try H2ConnPool.init(gpa, constants.h2_connections_max);
+        break :pools h2_pools;
+    } else &.{};
+    const h2_leg_pools: []cache_line.Padded(H2LegPool) = if (http2_enabled) pools: {
+        const h2_pools = try gpa.alloc(cache_line.Padded(H2LegPool), worker_count);
+        for (h2_pools) |*slot| slot.value = try H2LegPool.init(gpa, constants.h2_legs_max);
+        break :pools h2_pools;
+    } else &.{};
+
     // One entropy draw seeds every worker's PRNG (P2C draws, retry jitter);
     // each worker offsets it by its cpu index so no two draw alike.
     var seed_bytes: [8]u8 = undefined;
@@ -275,14 +297,17 @@ pub fn main(init: std.process.Init) !void {
     | {
         const listener = unique_listeners[if (cfg.accept_mode == .shared) 0 else cpu];
         const legs: ?*TlsLegPool = if (tls_sides > 0) &leg_pools[cpu].value else null;
+        const h2_conns: ?*H2ConnPool = if (http2_enabled) &h2_conn_pools[cpu].value else null;
+        const h2_legs: ?*H2LegPool = if (http2_enabled) &h2_leg_pools[cpu].value else null;
         thread.* = try std.Thread.spawn(
             .{},
             run_worker,
             .{
-                listener, &pool_slot.value,   &router,
-                &metrics, &access_slot.value, seed_base,
-                cpu,      tls_context,        upstream_tls,
-                legs,     trigger[0],         shared_listener_refs,
+                listener,   &pool_slot.value,     &router,
+                &metrics,   &access_slot.value,   seed_base,
+                cpu,        tls_context,          upstream_tls,
+                legs,       h2_conns,             h2_legs,
+                trigger[0], shared_listener_refs,
             },
         );
     }
@@ -439,6 +464,8 @@ fn run_worker(
     tls_context: ?*const zoxy.terminator.Context,
     upstream_tls: []const ?*const zoxy.terminator.Context,
     tls_legs: ?*TlsLegPool,
+    h2_conn_pool: ?*H2ConnPool,
+    h2_leg_pool: ?*H2LegPool,
     drain_trigger_fd: std.posix.socket_t,
     listener_refs: ?*zoxy.Counter,
 ) void {
@@ -472,6 +499,8 @@ fn run_worker(
     server.tls_context = tls_context;
     server.upstream_tls_contexts = upstream_tls;
     server.tls_legs = tls_legs;
+    server.h2_conn_pool = h2_conn_pool;
+    server.h2_leg_pool = h2_leg_pool;
     server.drain_trigger_fd = drain_trigger_fd;
     server.listener_refs = listener_refs;
     server.start();

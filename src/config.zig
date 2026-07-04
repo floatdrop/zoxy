@@ -113,6 +113,10 @@ pub const TlsConfig = struct {
     /// Hand completed handshakes to kernel TLS (docs/DESIGN.md §6); off
     /// forces every connection onto the userspace relay (ops escape hatch).
     kernel_offload: bool = true,
+    /// Offer HTTP/2 in ALPN (docs/DESIGN.md §7 Phase 5). When a client
+    /// negotiates `h2`, the handshaker hands the connection to the H2 data
+    /// path; everything else stays HTTP/1.1. Off by default.
+    http2: bool = false,
     /// SNI identities beyond the default certificate; absent or unmatched
     /// SNI gets the default.
     additional_identities: []const TlsIdentity = &.{},
@@ -180,6 +184,7 @@ const Dto = struct {
         certificate_file: []const u8,
         private_key_file: []const u8,
         kernel_offload: bool = true,
+        http2: bool = false,
         additional_identities: []const TlsIdentityDto = &.{},
     };
     const TlsIdentityDto = struct {
@@ -320,6 +325,7 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
             .certificate_file = try a.dupe(u8, dt.certificate_file),
             .private_key_file = try a.dupe(u8, dt.private_key_file),
             .kernel_offload = dt.kernel_offload,
+            .http2 = dt.http2,
             .additional_identities = identities,
         };
     } else null;
@@ -666,6 +672,17 @@ test "config: tls block is optional, parses paths, rejects empty ones" {
     defer with.deinit();
     try std.testing.expectEqualStrings("cert.pem", with.tls.?.certificate_file);
     try std.testing.expectEqualStrings("key.pem", with.tls.?.private_key_file);
+    try std.testing.expect(!with.tls.?.http2); // off unless asked
+
+    var with_h2 = try parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:443",
+        \\  "tls": { "certificate_file": "cert.pem", "private_key_file": "key.pem",
+        \\    "http2": true },
+        \\  "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    );
+    defer with_h2.deinit();
+    try std.testing.expect(with_h2.tls.?.http2);
 
     try std.testing.expectError(error.InvalidTls, parse(std.testing.allocator,
         \\{ "listen": "0.0.0.0:443",

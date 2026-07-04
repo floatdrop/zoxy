@@ -84,6 +84,9 @@ pub const Counters = struct {
     /// Downstream TLS handshakes that failed (bad ClientHello, no shared
     /// cipher, or the TLS heap load-shed the connection at accept).
     tls_handshake_failures: Counter = .{},
+    /// Terminated connections that negotiated `h2` in ALPN and were handed
+    /// from the HTTP/1.1 handshaker to the HTTP/2 data path (Phase 5).
+    tls_h2_handoffs: Counter = .{},
     /// Requests rejected by a cluster circuit breaker (max_requests).
     breaker_requests_rejected: Counter = .{},
     /// Upstream dials rejected by a cluster circuit breaker (max_pending or
