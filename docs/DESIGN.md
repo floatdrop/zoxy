@@ -271,8 +271,12 @@ runs) was proven to be the startup handshake burst under coordinated-omission
 correction, not a relay stall — it dilutes with run length. A
 constant-across-runs tail is a systematic effect; a spread is variance.
 
-HTTP/2 & HTTP/3: nothing usable in pure Zig; `nghttp2` / `quiche` FFI when
-their phases arrive.
+HTTP/2 & HTTP/3: pure-Zig stacks now exist (quic-zig, httpx.zig) but bundle
+their own runtime and an injected allocator — neither survives the zero-alloc
+gate or the own-the-ring model. The fit is a sans-io protocol core driven from
+completions like the `Channel` above: roll our own (§7 Phase 5), or FFI a
+sans-io C library (`nghttp2`; `ngtcp2`/`nghttp3` for H3) whose allocator routes
+through a reserved heap, as OpenSSL's does.
 
 ---
 
