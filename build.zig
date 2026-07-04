@@ -76,6 +76,8 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/sim.zig"),
             .target = target,
             .optimize = optimize,
+            .omit_frame_pointer = false,
+            .unwind_tables = .sync,
         }),
     });
     // The simulator imports proxy.zig, which now references the TLS

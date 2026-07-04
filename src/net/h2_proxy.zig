@@ -133,6 +133,9 @@ pub const StreamLeg = struct {
     pending_answer: Answer,
     /// The upstream close is in flight on `close_completion`.
     close_pending: bool,
+    /// A cancel of the pending connect is in flight (`connect_cancel_completion`);
+    /// the upstream fd stays open until the connect resolves, then closes.
+    connect_cancel_pending: bool,
     /// Detached from the connection: release to the pool once the last
     /// in-flight op drains. A leg with ring ops pending must NEVER be
     /// released — a reused completion corrupts the ring (the H1 seed-1693
@@ -161,6 +164,7 @@ pub const StreamLeg = struct {
     log_target_len: u8,
 
     connect_completion: Completion,
+    connect_cancel_completion: Completion,
     send_completion: Completion,
     recv_completion: Completion,
     close_completion: Completion,
@@ -210,6 +214,7 @@ pub const StreamLeg = struct {
         leg.staging_blocked = false;
         leg.pending_answer = .none;
         leg.close_pending = false;
+        leg.connect_cancel_pending = false;
         leg.orphaned = false;
         leg.endpoint_address = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 };
         leg.cluster_index = 0;
@@ -622,8 +627,19 @@ pub const H2Conn = struct {
         assert(leg.dial_pending);
         leg.dial_pending = false;
         conn.resilience.dial_finish(leg.cluster_index);
-        if (leg.orphaned) return conn.leg_maybe_release(leg);
+        if (leg.orphaned) {
+            // Disposed mid-dial: the connect has now resolved (or was
+            // cancelled), so run the fd close that leg_dispose_upstream
+            // deferred, then release once everything is quiescent.
+            conn.leg_dispose_upstream(leg); // dial_pending is false now: closes the fd
+            return conn.leg_maybe_release(leg);
+        }
         if (conn.closing) return;
+        // The client connection went fatal (engine `.failed`, GOAWAY staged,
+        // teardown pending): the engine will reject any stream op, so a leg
+        // completion must not drive it — settle and dispose quietly instead.
+        // Found by the simulator, seed 8.
+        if (conn.close_after_flush) return conn.leg_abort(leg);
         result catch return conn.leg_answer(leg, .bad_gateway);
         conn.pump_upstream_send(leg);
         conn.leg_arm_response_recv(leg);
@@ -722,6 +738,7 @@ pub const H2Conn = struct {
         leg.upstream_send_active = false;
         if (leg.orphaned) return conn.leg_maybe_release(leg);
         if (conn.closing) return;
+        if (conn.close_after_flush) return conn.leg_abort(leg); // engine .failed (seed 8)
         const m = result catch return conn.leg_upstream_failed(leg);
         conn.metrics.bytes_to_upstream.add(m);
         if (leg.head_sent < leg.head_len) {
@@ -806,6 +823,7 @@ pub const H2Conn = struct {
         leg.upstream_recv_active = false;
         if (leg.orphaned) return conn.leg_maybe_release(leg);
         if (conn.closing) return;
+        if (conn.close_after_flush) return conn.leg_abort(leg); // engine .failed (seed 8)
         const n = result catch return conn.leg_upstream_failed(leg);
         if (n == 0) return conn.leg_upstream_eof(leg);
         leg.response_started = true;
@@ -1143,6 +1161,25 @@ pub const H2Conn = struct {
 
     fn leg_dispose_upstream(conn: *H2Conn, leg: *StreamLeg) void {
         if (leg.upstream_fd < 0) return;
+        if (leg.dial_pending) {
+            // A pending connect must be cancelled, not closed: `ready` keeps a
+            // queued connect selectable even after its fd is closed, so a
+            // straight close would let it fire on a closed socket. Cancel it
+            // and defer the fd close to on_leg_connect, which always fires
+            // (even for a cancelled op). Found by the simulator, seed 17.
+            if (!leg.connect_cancel_pending) {
+                leg.connect_cancel_pending = true;
+                conn.retain();
+                conn.io.cancel(
+                    *StreamLeg,
+                    leg,
+                    on_leg_connect_cancel,
+                    &leg.connect_cancel_completion,
+                    &leg.connect_completion,
+                );
+            }
+            return; // the fd stays open until the connect resolves
+        }
         assert(!leg.close_pending); // one close per leg lifetime (then release)
         conn.io.shutdown_socket(leg.upstream_fd);
         leg.close_pending = true;
@@ -1161,6 +1198,13 @@ pub const H2Conn = struct {
     fn on_leg_closed(leg: *StreamLeg, _: *Completion, _: io_mod.CloseError!void) void {
         const conn = leg.conn;
         leg.close_pending = false;
+        if (leg.orphaned) conn.leg_maybe_release(leg);
+        conn.release_ref();
+    }
+
+    fn on_leg_connect_cancel(leg: *StreamLeg, _: *Completion, _: io_mod.CancelError!void) void {
+        const conn = leg.conn;
+        leg.connect_cancel_pending = false;
         if (leg.orphaned) conn.leg_maybe_release(leg);
         conn.release_ref();
     }
@@ -1188,7 +1232,9 @@ pub const H2Conn = struct {
     /// only when its last in-flight op drains (never with a completion
     /// still in the ring — a reused completion corrupts the ring).
     fn leg_detach(conn: *H2Conn, leg: *StreamLeg) void {
-        assert(leg.upstream_fd < 0); // handed to the pool or closing
+        // The fd is gone, unless a mid-dial disposal deferred its close to
+        // the connect completion (then a connect-cancel is in flight).
+        assert(leg.upstream_fd < 0 or leg.connect_cancel_pending);
         assert(!leg.orphaned);
         for (&conn.active_legs) |*slot| {
             if (slot.* != leg) continue;
@@ -1205,7 +1251,9 @@ pub const H2Conn = struct {
     fn leg_maybe_release(conn: *H2Conn, leg: *StreamLeg) void {
         assert(leg.orphaned);
         if (leg.dial_pending or leg.upstream_send_active or
-            leg.upstream_recv_active or leg.close_pending) return;
+            leg.upstream_recv_active or leg.close_pending or
+            leg.connect_cancel_pending) return;
+        assert(leg.upstream_fd < 0); // the deferred close ran before release
         leg.orphaned = false;
         conn.legs.release(leg);
     }
@@ -1537,8 +1585,11 @@ pub const H2Conn = struct {
         if (conn.closing) return;
         const now = conn.io.now_ns();
         if (now >= conn.deadline_ns) return conn.teardown();
-        // Per-stream deadlines ride the same tick.
+        // Per-stream deadlines ride the same tick — but only while the engine
+        // is live: fatal-pending (`close_after_flush`) tears down via the send
+        // flush, and answering a stream would drive the `.failed` engine.
         for (&conn.active_legs) |slot| {
+            if (conn.close_after_flush) break;
             const leg = slot orelse continue;
             if (leg.deadline_ns != 0 and now >= leg.deadline_ns) {
                 conn.metrics.upstream_errors.add(1);

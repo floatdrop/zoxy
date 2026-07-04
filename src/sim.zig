@@ -45,18 +45,31 @@ const Completion = io_mod.Completion;
 const constants = @import("constants.zig");
 const config_mod = @import("config.zig");
 const h1 = @import("http/h1.zig");
+const h2_frame = @import("http/h2_frame.zig");
+const hpack = @import("http/hpack.zig");
 const Router = @import("proxy/router.zig").Router;
 const HealthChecker = @import("proxy/health_check.zig").HealthChecker;
 const proxy_mod = @import("net/proxy.zig");
 const ProxyServer = proxy_mod.ProxyServer;
 const ConnPool = proxy_mod.ConnPool;
+const h2_proxy = @import("net/h2_proxy.zig");
+const H2Server = h2_proxy.H2Server;
+const H2ConnPool = h2_proxy.H2ConnPool;
+const H2LegPool = h2_proxy.LegPool;
 const Listener = @import("net/listener.zig").Listener;
 const Counters = @import("obs/metrics.zig").Counters;
 const AccessLog = @import("obs/access_log.zig").AccessLog;
 
 const proxy_port = 8080;
+/// The plaintext HTTP/2 (h2c) listener, run alongside the H1 proxy on the
+/// same origins and fault profile: the H2 data path — engine, per-stream
+/// legs, flow control — under the seeded adversarial schedule. h2 over TLS
+/// can't be simulated (the sim excludes OpenSSL); h2c exercises everything
+/// above the record layer, which is identical.
+const h2c_proxy_port = 8081;
 const origin_ports = [_]u16{ 9001, 9002, 9003 };
 const clients_max = 12;
+const h2_clients_max = 6;
 const connection_pool_capacity = 6;
 const step_cap = 500_000;
 const iterations_default = 50;
@@ -201,6 +214,29 @@ fn run_iteration(seed: u64) !u64 {
     var health = HealthChecker.init(&io, cfg.clusters, &server.resilience, &metrics);
     health.start();
 
+    // The h2c proxy: its own pools, metrics, and resilience (an independent
+    // worker sharing the origins), so the H1 invariant checks stay clean and
+    // the H2 path gets its own accounting to assert idle. MV scope: the h2c
+    // server is not drained (drain is the H1 path's job this slice); its
+    // clients conclude naturally and its pools must still reclaim every slot.
+    var h2_conn_pool = try H2ConnPool.init(arena, constants.h2_connections_max);
+    var h2_leg_pool = try H2LegPool.init(arena, constants.h2_legs_max);
+    var h2_metrics = Counters{};
+    var h2_access = AccessLog{ .fd = -1 };
+    var h2_server = H2Server.init(
+        &io,
+        &h2_conn_pool,
+        &h2_leg_pool,
+        Listener{ .fd = io.open_listener(h2c_proxy_port) },
+        &router,
+        &h2_metrics,
+        &h2_access,
+        5 * std.time.ns_per_s,
+        10 * std.time.ns_per_s,
+    );
+    h2_server.prng = .init(seed +% 0x2545F4914F6CDD1D);
+    h2_server.start();
+
     const clients = try arena.alloc(Client, clients_max);
     for (clients, 0..) |*client, index| {
         client.* = .{
@@ -212,17 +248,24 @@ fn run_iteration(seed: u64) !u64 {
         client.begin();
     }
 
+    const h2_clients = try arena.alloc(H2Client, h2_clients_max);
+    for (h2_clients, 0..) |*client, index| {
+        client.* = .{ .io = &io, .workload = &workload, .id = @intCast(index) };
+        client.begin();
+    }
+
     // Drive until every client concluded, then until the proxy reclaimed
     // every slot (teardowns, idle timeouts, pool checkins all complete).
     var steps: u64 = 0;
     var accepted_at_drain: ?u64 = null;
-    while (!clients_done(clients)) : (steps += 1) {
+    while (!clients_done(clients) or !h2_clients_done(h2_clients)) : (steps += 1) {
         if (drain_requested and accepted_at_drain == null and steps >= drain_after_steps) {
             server.begin_drain();
             accepted_at_drain = metrics.accepted.load();
         }
-        if (steps > step_cap) fail("hang: step cap with {d} clients unfinished", .{
+        if (steps > step_cap) fail("hang: step cap with {d} H1 + {d} h2c clients unfinished", .{
             clients_unfinished(clients),
+            h2_clients_unfinished(h2_clients),
         });
         io.run_once() catch fail("deadlock while clients still running", .{});
     }
@@ -277,8 +320,27 @@ fn run_iteration(seed: u64) !u64 {
     // data path (the standing invariant for every Phase-2 slice).
     if (!server.resilience.is_idle()) fail("resilience counters nonzero after drain", .{});
 
+    // The h2c server's every slot — connection and stream leg — must come
+    // home, and its resilience must settle, under the same fault schedule.
+    while (h2_conn_pool.free_count != h2_conn_pool.capacity or
+        h2_leg_pool.free_count != h2_leg_pool.capacity) : (steps += 1)
+    {
+        if (steps > step_cap) fail("h2c leak: {d} conn + {d} leg slots never reclaimed", .{
+            h2_conn_pool.capacity - h2_conn_pool.free_count,
+            h2_leg_pool.capacity - h2_leg_pool.free_count,
+        });
+        io.run_once() catch {
+            io.dump_pending();
+            fail("h2c leak: slot held with no pending operation", .{});
+        };
+    }
+    h2_server.deinit();
+    if (h2_metrics.active.load() != 0) fail("h2c metrics.active = {d}", .{h2_metrics.active.load()});
+    if (!h2_server.resilience.is_idle()) fail("h2c resilience counters nonzero", .{});
+
     var responses: u64 = 0;
     for (clients) |*client| responses += client.responses_ok;
+    for (h2_clients) |*client| responses += client.responses_ok;
     return responses;
 }
 
@@ -828,6 +890,273 @@ const Client = struct {
     }
 
     fn conclude(client: *Client) void {
+        if (client.done) return;
+        client.done = true;
+        if (client.fd >= 0) {
+            client.io.shutdown_socket(client.fd);
+            client.io.close_now(client.fd);
+            client.fd = -1;
+        }
+    }
+};
+
+// ---- virtual h2c client -----------------------------------------------------
+
+fn h2_clients_done(clients: []H2Client) bool {
+    for (clients) |*client| {
+        if (!client.done) return false;
+    }
+    return true;
+}
+
+fn h2_clients_unfinished(clients: []H2Client) u64 {
+    var count: u64 = 0;
+    for (clients) |*client| {
+        if (!client.done) count += 1;
+    }
+    return count;
+}
+
+/// A plaintext HTTP/2 client that opens several streams concurrently on one
+/// connection — the multiplexed shape the H1 client cannot exercise. Each
+/// stream carries a unique token in its `:path`; the origin echoes it back,
+/// so a per-stream integrity check catches cross-stream corruption (one
+/// stream's body leaking into another). Frames arrive under the sim's
+/// adversarial partial-IO and RST schedule; `END_STREAM` is the authoritative
+/// "this stream's body is complete" signal, so no close-delimited ambiguity.
+const H2Client = struct {
+    io: *IO,
+    workload: *Workload,
+    id: u32 = 0,
+    fd: posix.socket_t = -1,
+    send_buf: [1024]u8 = undefined,
+    send_len: usize = 0,
+    sent: usize = 0,
+    wire: [4096]u8 = undefined,
+    wire_len: usize = 0,
+    decoder: hpack.Decoder = .{},
+    fields: [16]hpack.Header = undefined,
+    fields_storage: [512]u8 = undefined,
+    streams: [3]Stream = .{ .{}, .{}, .{} },
+    stream_count: u32 = 0,
+    completed: u32 = 0,
+    responses_ok: u32 = 0,
+    done: bool = false,
+    connect_completion: Completion = undefined,
+    send_completion: Completion = undefined,
+    recv_completion: Completion = undefined,
+
+    const Stream = struct {
+        id: u31 = 0,
+        post: bool = false,
+        token: [48]u8 = undefined,
+        token_len: usize = 0,
+        status: u16 = 0,
+        body: [160]u8 = undefined,
+        body_len: usize = 0,
+        complete: bool = false,
+
+        fn path(stream: *const Stream) []const u8 {
+            return stream.token[0..stream.token_len];
+        }
+    };
+
+    fn begin(client: *H2Client) void {
+        client.fd = client.io.open_tcp_socket() orelse fail("virtual fds exhausted", .{});
+        client.io.connect(
+            *H2Client,
+            client,
+            on_connect,
+            &client.connect_completion,
+            client.fd,
+            .{
+                .family = std.os.linux.AF.INET,
+                .port = std.mem.nativeToBig(u16, h2c_proxy_port),
+                .addr = 0,
+            },
+        );
+    }
+
+    fn on_connect(client: *H2Client, _: *Completion, result: io_mod.ConnectError!void) void {
+        result catch return client.conclude(); // backlog full: acceptable
+        client.compose();
+        client.arm_recv();
+        client.arm_send();
+    }
+
+    /// Build the opening flight: preface, an (empty) SETTINGS, and 1–3 stream
+    /// requests staged back to back so they are all in flight at once.
+    fn compose(client: *H2Client) void {
+        var len: usize = 0;
+        @memcpy(client.send_buf[0..h2_frame.client_preface.len], h2_frame.client_preface);
+        len += h2_frame.client_preface.len;
+        len += h2_frame.write_settings(&.{}, client.send_buf[len..]);
+        client.stream_count = client.workload.prng.random().intRangeAtMost(u32, 1, 3);
+        for (0..client.stream_count) |i| {
+            const stream = &client.streams[i];
+            stream.id = @intCast(1 + 2 * i);
+            stream.post = client.workload.one_in(3);
+            const prefix: []const u8 = if (client.workload.prng.random().boolean()) "/a" else "/b";
+            const token = std.fmt.bufPrint(&stream.token, "{s}?token-c{d}s{d}", .{
+                prefix, client.id, i,
+            }) catch unreachable;
+            stream.token_len = token.len;
+
+            var block: [96]u8 = undefined;
+            var block_len: usize = 0;
+            block_len += encode(&block, block_len, ":method", if (stream.post) "POST" else "GET");
+            block_len += encode(&block, block_len, ":scheme", "http");
+            block_len += encode(&block, block_len, ":path", token);
+            block_len += encode(&block, block_len, ":authority", "sim");
+            var flags: u8 = h2_frame.Flags.end_headers;
+            if (!stream.post) flags |= h2_frame.Flags.end_stream;
+            h2_frame.write_frame_header(.{
+                .length = @intCast(block_len),
+                .type = .headers,
+                .flags = flags,
+                .stream_id = stream.id,
+            }, client.send_buf[len..][0..h2_frame.frame_header_bytes]);
+            len += h2_frame.frame_header_bytes;
+            @memcpy(client.send_buf[len..][0..block_len], block[0..block_len]);
+            len += block_len;
+            if (stream.post) {
+                const body = "h2-body!";
+                h2_frame.write_frame_header(.{
+                    .length = body.len,
+                    .type = .data,
+                    .flags = h2_frame.Flags.end_stream,
+                    .stream_id = stream.id,
+                }, client.send_buf[len..][0..h2_frame.frame_header_bytes]);
+                len += h2_frame.frame_header_bytes;
+                @memcpy(client.send_buf[len..][0..body.len], body);
+                len += body.len;
+            }
+        }
+        client.send_len = len;
+        assert(client.send_len <= client.send_buf.len);
+    }
+
+    fn encode(block: []u8, offset: usize, name: []const u8, value: []const u8) usize {
+        return hpack.encode_header(name, value, block[offset..]) catch unreachable;
+    }
+
+    fn arm_send(client: *H2Client) void {
+        if (client.sent >= client.send_len) return;
+        client.io.send(
+            *H2Client,
+            client,
+            on_send,
+            &client.send_completion,
+            client.fd,
+            client.send_buf[client.sent..client.send_len],
+        );
+    }
+
+    fn on_send(client: *H2Client, _: *Completion, result: io_mod.SendError!usize) void {
+        if (client.done) return;
+        client.sent += result catch return client.conclude();
+        if (client.sent < client.send_len) client.arm_send();
+    }
+
+    fn arm_recv(client: *H2Client) void {
+        if (client.wire_len == client.wire.len) return client.conclude(); // stuck: give up
+        client.io.recv(
+            *H2Client,
+            client,
+            on_recv,
+            &client.recv_completion,
+            client.fd,
+            client.wire[client.wire_len..],
+        );
+    }
+
+    fn on_recv(client: *H2Client, _: *Completion, result: io_mod.RecvError!usize) void {
+        if (client.done) return;
+        const n = result catch return client.conclude();
+        if (n == 0) return client.conclude(); // proxy closed
+        client.wire_len += n;
+        client.consume_frames();
+        if (!client.done) client.arm_recv();
+    }
+
+    fn consume_frames(client: *H2Client) void {
+        var offset: usize = 0;
+        while (true) {
+            const frame = (h2_frame.parse_frame(client.wire[offset..client.wire_len]) catch
+                fail("h2c: proxy emitted an unparseable frame", .{})) orelse break;
+            offset += frame.wire_bytes();
+            client.dispatch(frame);
+            if (client.done) return;
+        }
+        std.mem.copyForwards(u8, client.wire[0 .. client.wire_len - offset], client.wire[offset..client.wire_len]);
+        client.wire_len -= offset;
+    }
+
+    fn dispatch(client: *H2Client, frame: h2_frame.Frame) void {
+        switch (frame.header.type) {
+            .headers => {
+                const stream = client.stream_for(frame.header.stream_id) orelse return;
+                const decoded = client.decoder.decode(frame.payload, &client.fields, &client.fields_storage) catch
+                    fail("h2c: proxy emitted a bad HPACK block", .{});
+                if (decoded.len == 0) fail("h2c: response head with no fields", .{});
+                stream.status = std.fmt.parseInt(u16, decoded[0].value, 10) catch
+                    fail("h2c: response missing :status", .{});
+                if (frame.header.flags & h2_frame.Flags.end_stream != 0) client.stream_end(stream);
+            },
+            .data => {
+                const stream = client.stream_for(frame.header.stream_id) orelse return;
+                @memcpy(stream.body[stream.body_len..][0..frame.payload.len], frame.payload);
+                stream.body_len += @intCast(frame.payload.len);
+                if (frame.header.flags & h2_frame.Flags.end_stream != 0) client.stream_end(stream);
+            },
+            .rst_stream => {
+                const stream = client.stream_for(frame.header.stream_id) orelse return;
+                client.stream_reset(stream); // proxy aborted the stream (e.g. upstream fault)
+            },
+            .goaway => client.conclude(), // proxy draining: stop
+            else => {}, // SETTINGS, WINDOW_UPDATE, PING: ignored
+        }
+    }
+
+    fn stream_for(client: *H2Client, id: u31) ?*Stream {
+        for (client.streams[0..client.stream_count]) |*stream| {
+            if (stream.id == id) return stream;
+        }
+        return null;
+    }
+
+    /// A stream reached END_STREAM: a complete response. A 200 must echo this
+    /// stream's own token back, byte-exact — the multiplexed integrity check.
+    fn stream_end(client: *H2Client, stream: *Stream) void {
+        if (stream.complete) return;
+        stream.complete = true;
+        client.completed += 1;
+        client.responses_ok += 1;
+        if (stream.status == 200) {
+            var echo_buf: [64]u8 = undefined;
+            const echo = std.fmt.bufPrint(&echo_buf, "echo:{s}", .{stream.path()}) catch unreachable;
+            const body = stream.body[0..stream.body_len];
+            if (!std.mem.eql(u8, echo, body)) {
+                fail("h2c integrity: stream {d} expected \"{s}\", body was \"{s}\"", .{
+                    stream.id, echo, body,
+                });
+            }
+        }
+        client.maybe_conclude();
+    }
+
+    fn stream_reset(client: *H2Client, stream: *Stream) void {
+        if (stream.complete) return;
+        stream.complete = true;
+        client.completed += 1; // reset is an acceptable outcome, not a response
+        client.maybe_conclude();
+    }
+
+    fn maybe_conclude(client: *H2Client) void {
+        if (client.completed >= client.stream_count) client.conclude();
+    }
+
+    fn conclude(client: *H2Client) void {
         if (client.done) return;
         client.done = true;
         if (client.fd >= 0) {
