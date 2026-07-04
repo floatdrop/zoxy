@@ -30,6 +30,9 @@ pub const Router = @import("proxy/router.zig").Router;
 /// P2C least-request load balancing.
 pub const balancer = @import("proxy/balancer.zig");
 
+/// Maglev consistent hashing (per-cluster lookup tables).
+pub const maglev = @import("proxy/maglev.zig");
+
 /// Per-worker resilience state: LB/breaker/outlier/retry accounting (§7 Phase 2).
 pub const resilience = @import("proxy/resilience.zig");
 
@@ -71,6 +74,7 @@ test {
     _ = config;
     _ = @import("proxy/router.zig");
     _ = balancer;
+    _ = maglev;
     _ = resilience;
     _ = @import("proxy/health_check.zig");
     _ = @import("proxy/upstream_pool.zig");

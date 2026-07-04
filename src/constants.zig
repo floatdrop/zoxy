@@ -31,6 +31,13 @@ pub const clusters_max: usize = 64;
 /// statically, one slot per (cluster, endpoint).
 pub const endpoints_per_cluster_max: u32 = 16;
 
+/// Maglev lookup-table entries per consistent-hash cluster (built at config
+/// time, immutable after). Prime, per the algorithm ("Maglev: A Fast and
+/// Reliable Software Network Load Balancer", §3.4); Envoy's default. Balance
+/// error scales with endpoints/entries — at 16 endpoints it is under 0.1%.
+/// One byte per entry: 64 KiB per hashed cluster.
+pub const maglev_table_entries: u32 = 65537;
+
 /// Hard cap on a cluster's configured `retry.max`. Bounds the retry loop and
 /// the worst-case backoff shift (`base << attempts`).
 pub const retry_attempts_max: u8 = 5;

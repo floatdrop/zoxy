@@ -96,7 +96,8 @@ Consequences that bite if you forget them:
 | `src/http/chunked.zig` | incremental chunked-coding decoder — finds message ends, transforms nothing |
 | `src/proxy/upstream_pool.zig` | per-worker idle upstream connections, fixed slots keyed by endpoint |
 | `src/config.zig` | JSON config → immutable `Config` (owns an arena); the **only** place allocation is expected. Per-cluster resilience blocks resolve into a `ResiliencePolicy` here (ms→ns, validated) |
-| `src/proxy/router.zig`, `src/proxy/balancer.zig` | first-match host/path routing; P2C least-request balancing over per-worker in-flight counts, fail-open when no endpoint is available |
+| `src/proxy/router.zig`, `src/proxy/balancer.zig` | first-match host/path routing; P2C least-request balancing over per-worker in-flight counts and the Maglev consistent-hash pick (`pick_hashed`: deterministic forward-walk fallback, soft retry exclusion), fail-open when no endpoint is available |
+| `src/proxy/maglev.zig` | Maglev lookup tables: built once at config time (prime-sized, `u8` entries), data path = one wyhash + one index; knows nothing of config or balancer |
 | `src/proxy/resilience.zig` | per-worker mutable resilience state (Phase 2): request/attempt/dial/connection accounting, circuit-breaker admission, retry budget, passive outlier ejection — the narrow API the data path calls at fixed points; the sim asserts every counter drains to zero |
 | `src/proxy/health_check.zig` | active TCP-connect health probes, per worker, in-ring: one ticking scheduler, bounded probe slots, streak thresholds flip `EndpointState.healthy` |
 | `src/obs/metrics.zig`, `src/obs/access_log.zig` | atomic counters; fixed-buffer batched access log |

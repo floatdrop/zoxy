@@ -10,12 +10,13 @@ zoxy is built on the [TigerBeetle](https://tigerbeetle.com) I/O model — comple
 `io_uring` with caller-owned completions — and follows [TigerStyle](docs/TIGER_STYLE.md):
 **all memory is reserved at startup, and the request-serving path allocates nothing.**
 
-> **Status: experimental, Phase 4 operability in progress.** A working
+> **Status: experimental, Phase 4 operability complete.** A working
 > HTTPS/HTTP/1.1 reverse proxy: TLS termination with kernel-TLS offload, SNI
 > multi-cert, verified upstream re-encryption, keep-alive and pooling on both
-> sides, a resilience layer (P2C load balancing, retries, circuit breaking,
-> outlier detection, health checks), and graceful drain on SIGTERM — but not
-> yet production-ready — see [Scope & roadmap](#scope--roadmap). Linux only.
+> sides, a resilience layer (P2C and Maglev consistent-hash balancing,
+> retries, circuit breaking, outlier detection, health checks), graceful
+> drain, and zero-downtime hot restart — but not yet production-ready — see
+> [Scope & roadmap](#scope--roadmap). Linux only.
 
 ## Highlights
 

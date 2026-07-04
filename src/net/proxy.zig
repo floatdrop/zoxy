@@ -41,6 +41,7 @@ const h1 = @import("../http/h1.zig");
 const config = @import("../config.zig");
 const Router = @import("../proxy/router.zig").Router;
 const balancer = @import("../proxy/balancer.zig");
+const maglev = @import("../proxy/maglev.zig");
 const resilience_mod = @import("../proxy/resilience.zig");
 const Resilience = resilience_mod.Resilience;
 const UpstreamPool = @import("../proxy/upstream_pool.zig").UpstreamPool;
@@ -331,6 +332,13 @@ pub const ProxyConn = struct {
     /// The routed cluster (into the immutable Config; a retry re-picks its
     /// endpoint from here). Null between requests.
     cluster: ?*const config.Cluster,
+    /// Consistent-hash affinity for the current request (maglev clusters,
+    /// docs/DESIGN.md §7 Phase 4): the key's hash, kept so a retry can walk
+    /// the same table deterministically instead of re-randomizing.
+    affinity_hash: u64,
+    /// The pick above actually used the hash (the cluster is maglev AND the
+    /// key existed — a missing hash header falls back to P2C).
+    affinity_hashed: bool,
     /// Configured retries spent on this request (tier 2; the free stale-pool
     /// replay does not count). Bounded by `policy.retry_max`.
     attempts_used: u8,
@@ -679,6 +687,8 @@ pub const ProxyConn = struct {
         conn.endpoint_index = 0;
         conn.policy = &policy_default;
         conn.cluster = null;
+        conn.affinity_hash = 0;
+        conn.affinity_hashed = false;
         conn.attempts_used = 0;
         conn.retry_scheduled = false;
         conn.retry_pending = false;
@@ -1492,6 +1502,34 @@ pub const ProxyConn = struct {
         }
     }
 
+    /// Pick this request's endpoint: the cluster's Maglev table when it has
+    /// one and the request offers the key (the target, or the configured
+    /// header), P2C least-request otherwise. The affinity hash is stored so
+    /// retries walk the same table deterministically.
+    fn pick_endpoint(
+        conn: *ProxyConn,
+        cluster: *const config.Cluster,
+        request: *const h1.Request,
+    ) ?u32 {
+        assert(!conn.affinity_hashed); // fresh per request (reset_request_state)
+        assert(conn.cluster_index == cluster.index); // set by the caller just before
+        const state = conn.resilience.cluster_state(conn.cluster_index);
+        const now_ns = conn.io.now_ns();
+        if (cluster.maglev_table.len > 0) {
+            const key: ?[]const u8 = switch (cluster.hash_on) {
+                .target => request.target,
+                .header => request.header(cluster.hash_header),
+            };
+            if (key != null and key.?.len > 0) {
+                conn.affinity_hash = maglev.hash_key(key.?);
+                conn.affinity_hashed = true;
+                return balancer.pick_hashed(cluster, state, conn.affinity_hash, now_ns, null);
+            }
+            // Absent/empty key: nothing to be consistent about — P2C below.
+        }
+        return balancer.pick_least_request(cluster, state, conn.random, now_ns, null);
+    }
+
     fn route_and_connect(conn: *ProxyConn, request: *const h1.Request) void {
         assert(conn.upstream_fd < 0); // no upstream socket yet
         // A protocol upgrade cannot survive the forced `Connection: close`;
@@ -1518,13 +1556,8 @@ pub const ProxyConn = struct {
         }
         conn.resilience.request_start(conn.cluster_index);
         conn.request_admitted = true;
-        const endpoint_index = balancer.pick_least_request(
-            cluster,
-            conn.resilience.cluster_state(conn.cluster_index),
-            conn.random,
-            conn.io.now_ns(),
-            null,
-        ) orelse return conn.fail(response_503);
+        const endpoint_index = conn.pick_endpoint(cluster, request) orelse
+            return conn.fail(response_503);
         const endpoint = &cluster.endpoints[endpoint_index];
         // Body bytes already buffered behind the head count toward the frame;
         // anything past the request's end (a pipelined next request) must not
@@ -1787,14 +1820,26 @@ pub const ProxyConn = struct {
         assert(conn.request_replayable);
         assert(conn.upstream_fd < 0);
         const cluster = conn.cluster.?; // set at route time, request still active
-        // Prefer a different endpoint than the one that just failed.
-        const endpoint_index = balancer.pick_least_request(
-            cluster,
-            conn.resilience.cluster_state(conn.cluster_index),
-            conn.random,
-            conn.io.now_ns(),
-            conn.endpoint_index,
-        ) orelse return conn.fail(response_502); // unreachable: cluster routed non-empty
+        // Prefer a different endpoint than the one that just failed. A
+        // hashed request keeps walking its table (deterministic next),
+        // everything else re-draws P2C.
+        const state = conn.resilience.cluster_state(conn.cluster_index);
+        const endpoint_index = if (conn.affinity_hashed)
+            balancer.pick_hashed(
+                cluster,
+                state,
+                conn.affinity_hash,
+                conn.io.now_ns(),
+                conn.endpoint_index,
+            ) orelse return conn.fail(response_502) // unreachable: routed non-empty
+        else
+            balancer.pick_least_request(
+                cluster,
+                state,
+                conn.random,
+                conn.io.now_ns(),
+                conn.endpoint_index,
+            ) orelse return conn.fail(response_502); // unreachable: cluster routed non-empty
         conn.endpoint_address = cluster.endpoints[endpoint_index].address;
         conn.prime_segment_index = 0;
         conn.prime_sent = 0;
@@ -5835,6 +5880,92 @@ test "proxy: drain during a request completes it with Connection: close injected
     try std.testing.expect(server.resilience.is_idle());
 }
 
+test "proxy: maglev cluster pins a target to one endpoint and spreads targets" {
+    const gpa = std.testing.allocator;
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHELLO";
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    // Two origins = two endpoints; close-per-request so the
+    // single-connection TestOrigins re-arm between exchanges.
+    var listener_a = try Listener.open(Ip4Address.loopback(0), 8);
+    defer listener_a.close();
+    var origin_a = TestOrigin{ .io = &io, .listener = listener_a, .response = response };
+    origin_a.start();
+    var listener_b = try Listener.open(Ip4Address.loopback(0), 8);
+    defer listener_b.close();
+    var origin_b = TestOrigin{ .io = &io, .listener = listener_b, .response = response };
+    origin_b.start();
+
+    var json_buf: [384]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "lb": {{ "policy": "maglev" }},
+        \\     "endpoints": ["127.0.0.1:{d}", "127.0.0.1:{d}"] }}] }}
+    , .{ listener_a.bound_address().port, listener_b.bound_address().port });
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
+    );
+    defer server.deinit();
+    server.start();
+
+    const exchange = struct {
+        fn run(io_: *IO, port: u16, request: []const u8) !void {
+            const fd = try connect_loopback(port);
+            defer _ = linux.close(fd);
+            var c = DrainTestClient{ .io = io_, .fd = fd, .request = request };
+            c.go();
+            while (!c.eof) try io_.run_once();
+            try std.testing.expect(std.mem.endsWith(u8, c.buf[0..c.len], "\r\n\r\nHELLO"));
+        }
+    }.run;
+    const proxy_port = proxy_listener.bound_address().port;
+
+    // The same target, three times: every request must land on ONE origin.
+    const pinned = "GET /pin/me HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    const before_a = origin_a.request_len;
+    const before_b = origin_b.request_len;
+    for (0..3) |_| try exchange(&io, proxy_port, pinned);
+    const a_grew = origin_a.request_len > before_a;
+    const b_grew = origin_b.request_len > before_b;
+    try std.testing.expect(a_grew != b_grew); // exactly one endpoint served all three
+
+    // Distinct targets must spread: after a dozen, both origins have seen
+    // traffic (deterministic in the fixed hash — tuned once, stable forever).
+    var target_buf: [96]u8 = undefined;
+    for (0..12) |sequence| {
+        const request = try std.fmt.bufPrint(
+            &target_buf,
+            "GET /spread/{d} HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n",
+            .{sequence},
+        );
+        try exchange(&io, proxy_port, request);
+    }
+    try std.testing.expect(origin_a.request_len > before_a);
+    try std.testing.expect(origin_b.request_len > before_b);
+
+    while (pool.free_count != pool.capacity) try io.run_once();
+    try std.testing.expect(server.resilience.is_idle());
+}
+
 test "proxy: two servers share one listener and the last drain closes it once" {
     const gpa = std.testing.allocator;
     // Close-per-request on the upstream side: the single-connection
@@ -5993,11 +6124,15 @@ test "proxy: the serving path allocates nothing after startup (zero-alloc gate)"
     var origin = TestOrigin{ .io = &io, .listener = origin_listener, .response = response };
     origin.start();
 
-    var json_buf: [256]u8 = undefined;
+    var json_buf: [512]u8 = undefined;
     const cfg_text = try std.fmt.bufPrint(&json_buf,
-        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
-        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
-    , .{origin_listener.bound_address().port});
+        \\{{ "listen": "0.0.0.0:0",
+        \\   "routes": [{{ "path_prefix": "/m", "cluster": "m" }}, {{ "cluster": "o" }}],
+        \\   "clusters": [
+        \\     {{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }},
+        \\     {{ "name": "m", "lb": {{ "policy": "maglev" }},
+        \\       "endpoints": ["127.0.0.1:{d}"] }} ] }}
+    , .{ origin_listener.bound_address().port, origin_listener.bound_address().port });
     var cfg = try config.parse(gpa, cfg_text);
     defer cfg.deinit();
     const router = Router.init(&cfg);
@@ -6058,6 +6193,22 @@ test "proxy: the serving path allocates nothing after startup (zero-alloc gate)"
 
     // The full accept -> parse -> route -> connect -> relay -> log path must not
     // have touched the allocator.
+    try std.testing.expectEqual(baseline, counting.allocation_count());
+
+    // The consistent-hash path — key hash, Maglev table walk — is on the
+    // serving path too, and equally allocation-free (the table was built at
+    // config time, before the baseline snapshot).
+    const hashed_fd = try connect_loopback(proxy_listener.bound_address().port);
+    defer _ = linux.close(hashed_fd);
+    var hashed = DrainTestClient{
+        .io = &io,
+        .fd = hashed_fd,
+        .request = "GET /m/key HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n",
+    };
+    hashed.go();
+    while (!hashed.eof) try io.run_once();
+    try std.testing.expect(std.mem.endsWith(u8, hashed.buf[0..hashed.len], "HELLO"));
+    while (pool.free_count != pool.capacity) try io.run_once();
     try std.testing.expectEqual(baseline, counting.allocation_count());
 
     // Drain is on the serving path too (it runs while requests fly): the

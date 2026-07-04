@@ -706,7 +706,29 @@ catches the dominant failures), ejection-time multipliers.
   unprivileged BPF is disabled on modern kernels
   (`kernel.unprivileged_bpf_disabled=2` on the dev box), so it needs
   CAP_BPF even to load — revisit only if `shared` proves insufficient.
-- Consistent-hash LB (ring-hash / Maglev).
+- **Consistent-hash LB** — Maglev, done 2026-07-04. A cluster `lb` block
+  (`{ "policy": "maglev", "hash": "target" }`, or `"hash": "header"` with a
+  `"header"` name) builds a prime-sized lookup table (65,537 `u8` entries,
+  64 KiB per hashed cluster) at config time — the one place allocation is
+  allowed; the data path does one wyhash of the key (the request target,
+  or the named header — a request missing the header falls back to P2C)
+  and one table index. Availability (health + ejection, per worker) is
+  enforced at lookup, not by rebuild: an unavailable home endpoint falls
+  *forward through the table* deterministically (each endpoint tried once,
+  bitmask-bounded), so the fallback preserves consistency across workers
+  and time; the fail-open panic rule matches P2C (zero available → route
+  to the home endpoint, affinity intact). Retries keep the request's hash
+  and walk the same table excluding the failed endpoint (soft exclusion,
+  like P2C). Ring hash was rejected: same consistency guarantee, but
+  O(log n) lookups and worse balance per byte of table. Verified: slot
+  shares within ±1% of perfect at 5 endpoints; <5% of surviving slots
+  move when an endpoint leaves; identical tables across independent
+  builds (workers and restarted processes must agree); a pin/spread
+  integration test; the sim's cluster "two" is maglev (2 endpoints) under
+  every seed's faults and drains; the zero-alloc gate now runs a hashed
+  request inside it. Measured (3 alternating runs, c=64, R=40k): p50/p99
+  and throughput bands identical to P2C — the pick is one hash + one
+  index.
 - Distributed tracing (B3/W3C propagation) and Prometheus polish
   (histograms, labels): **deferred out of Phase 4** (2026-07-04). The
   operability core — drain, hot restart, stats continuity, accept

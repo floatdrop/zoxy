@@ -6,6 +6,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
+const maglev = @import("proxy/maglev.zig");
 const Ip4Address = std.Io.net.Ip4Address;
 
 pub const Endpoint = struct {
@@ -74,7 +75,18 @@ pub const Cluster = struct {
     policy: ResiliencePolicy,
     /// Re-encrypt traffic to this cluster's endpoints; null = plaintext.
     tls: ?ClusterTlsConfig,
+    /// What the consistent hash keys on (`lb` block; meaningful only when
+    /// `maglev_table` is non-empty).
+    hash_on: HashOn,
+    /// Header name for `hash_on = .header`; empty otherwise. A request
+    /// missing the header falls back to P2C for that request.
+    hash_header: []const u8,
+    /// Maglev lookup table (endpoint indices), built here at parse time —
+    /// the one place allocation is allowed. Empty = P2C least-request.
+    maglev_table: []const u8,
 };
+
+pub const HashOn = enum { target, header };
 
 pub const Route = struct {
     /// "*" matches any Host.
@@ -149,6 +161,7 @@ pub const ParseError = error{
     InvalidTls,
     InvalidHandoff,
     InvalidAcceptMode,
+    InvalidLb,
 } || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error;
 
 pub const AcceptMode = enum { reuseport, shared };
@@ -188,6 +201,7 @@ const Dto = struct {
         name: []const u8,
         endpoints: []const []const u8,
         tls: ?ClusterTlsDto = null,
+        lb: ?LbDto = null,
         retry: ?RetryDto = null,
         circuit_breaker: ?CircuitBreakerDto = null,
         outlier: ?OutlierDto = null,
@@ -196,6 +210,11 @@ const Dto = struct {
     };
     // Absent per-field values fall back to `constants` defaults during
     // lowering (kept out of the DTO so the defaults live in one place).
+    const LbDto = struct {
+        policy: []const u8,
+        hash: []const u8 = "target",
+        header: ?[]const u8 = null,
+    };
     const RetryDto = struct {
         max: u8,
         backoff_base_ms: ?u32 = null,
@@ -252,7 +271,11 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
             .index = index,
             .policy = try resolve_policy(&dc),
             .tls = try lower_cluster_tls(a, dc.tls),
+            .hash_on = .target,
+            .hash_header = "",
+            .maglev_table = &.{},
         };
+        try lower_lb(a, &dc, cluster);
     }
 
     const routes = try a.alloc(Route, dto.routes.len);
@@ -320,6 +343,48 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
         .routes = routes,
         .clusters = clusters,
     };
+}
+
+/// An `lb` block selects the balancing policy; absent means P2C
+/// least-request. `maglev` builds the cluster's consistent-hash lookup
+/// table right here — config time is the one place allocation is allowed —
+/// keyed on the request target or a named header. Every knob is validated
+/// strictly: hash options on a `least_request` block are refused rather
+/// than ignored.
+fn lower_lb(
+    a: std.mem.Allocator,
+    dc: *const Dto.ClusterDto,
+    cluster: *Cluster,
+) (error{InvalidLb} || std.mem.Allocator.Error)!void {
+    const lb = dc.lb orelse return;
+    assert(cluster.maglev_table.len == 0); // lowered exactly once per cluster
+    if (std.mem.eql(u8, lb.policy, "least_request")) {
+        // The default spelled out; hash knobs belong to maglev only.
+        if (lb.header != null) return error.InvalidLb;
+        if (!std.mem.eql(u8, lb.hash, "target")) return error.InvalidLb;
+        return;
+    }
+    if (!std.mem.eql(u8, lb.policy, "maglev")) return error.InvalidLb;
+    if (cluster.endpoints.len == 0) return error.InvalidLb; // nothing to hash onto
+    if (std.mem.eql(u8, lb.hash, "target")) {
+        if (lb.header != null) return error.InvalidLb;
+        cluster.hash_on = .target;
+    } else if (std.mem.eql(u8, lb.hash, "header")) {
+        const header = lb.header orelse return error.InvalidLb;
+        if (header.len == 0) return error.InvalidLb;
+        cluster.hash_on = .header;
+        cluster.hash_header = try a.dupe(u8, header);
+    } else {
+        return error.InvalidLb;
+    }
+    var addresses: [constants.endpoints_per_cluster_max]Ip4Address = undefined;
+    for (cluster.endpoints, addresses[0..cluster.endpoints.len]) |endpoint, *address| {
+        address.* = endpoint.address;
+    }
+    const table = try a.alloc(u8, constants.maglev_table_entries);
+    maglev.build(addresses[0..cluster.endpoints.len], table);
+    cluster.maglev_table = table;
+    assert(cluster.maglev_table.len == constants.maglev_table_entries);
 }
 
 /// An upstream TLS block must pick a verification posture explicitly:
@@ -534,6 +599,57 @@ test "config: accept_mode defaults to reuseport, parses shared, rejects junk" {
         \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
     );
     try std.testing.expectError(error.InvalidAcceptMode, junk);
+}
+
+test "config: lb block — maglev builds a table, knobs validated strictly" {
+    var plain = try parse(std.testing.allocator, test_config);
+    defer plain.deinit();
+    try std.testing.expectEqual(@as(usize, 0), plain.clusters[0].maglev_table.len);
+
+    var target_hashed = try parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "lb": { "policy": "maglev" },
+        \\    "endpoints": ["127.0.0.1:9000", "127.0.0.1:9001"] }] }
+    );
+    defer target_hashed.deinit();
+    const hashed = &target_hashed.clusters[0];
+    try std.testing.expectEqual(constants.maglev_table_entries, hashed.maglev_table.len);
+    try std.testing.expectEqual(HashOn.target, hashed.hash_on);
+    for (hashed.maglev_table) |entry| try std.testing.expect(entry < 2);
+
+    var header_hashed = try parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c",
+        \\    "lb": { "policy": "maglev", "hash": "header", "header": "x-user-id" },
+        \\    "endpoints": ["127.0.0.1:9000"] }] }
+    );
+    defer header_hashed.deinit();
+    try std.testing.expectEqual(HashOn.header, header_hashed.clusters[0].hash_on);
+    try std.testing.expectEqualStrings("x-user-id", header_hashed.clusters[0].hash_header);
+
+    // Strict knobs: unknown policy, unknown hash, header-hash without a
+    // header name, and a header name on a target hash are all refused.
+    const cases = [_][]const u8{
+        \\"lb": { "policy": "ring_of_power" }
+        ,
+        \\"lb": { "policy": "maglev", "hash": "cookie" }
+        ,
+        \\"lb": { "policy": "maglev", "hash": "header" }
+        ,
+        \\"lb": { "policy": "maglev", "header": "x-user-id" }
+        ,
+        \\"lb": { "policy": "least_request", "header": "x-user-id" }
+        ,
+    };
+    for (cases) |case| {
+        var buf: [512]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf,
+            \\{{ "listen": "0.0.0.0:80", "routes": [{{ "cluster": "c" }}],
+            \\  "clusters": [{{ "name": "c", {s},
+            \\    "endpoints": ["127.0.0.1:9000"] }}] }}
+        , .{case});
+        try std.testing.expectError(error.InvalidLb, parse(std.testing.allocator, text));
+    }
 }
 
 test "config: tls block is optional, parses paths, rejects empty ones" {

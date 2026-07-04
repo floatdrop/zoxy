@@ -69,6 +69,49 @@ pub fn pick_least_request(
     return least_loaded(state, first, second);
 }
 
+/// Consistent-hash pick (docs/DESIGN.md §7 Phase 4): the Maglev table maps
+/// the hash to its home endpoint; if that one is unavailable (or excluded —
+/// a retry's failed endpoint), walk forward through the table so the
+/// fallback is *deterministic* for the hash, not random. Each endpoint is
+/// considered once (a tried-bitmask bounds the walk). Same fail-open rule
+/// as P2C: zero available endpoints still routes — to the home endpoint.
+pub fn pick_hashed(
+    cluster: *const Cluster,
+    state: *const ClusterState,
+    hash: u64,
+    now_ns: u64,
+    exclude_index: ?u32,
+) ?u32 {
+    const count: u32 = @intCast(cluster.endpoints.len);
+    if (count == 0) return null;
+    assert(count <= constants.endpoints_per_cluster_max);
+    const table = cluster.maglev_table;
+    assert(table.len == constants.maglev_table_entries); // hashed clusters only
+    if (exclude_index) |exclude| assert(exclude < count);
+
+    const home: u32 = table[hash % table.len];
+    assert(home < count); // the build wrote only real endpoint indices
+    var tried: u32 = 0;
+    var tried_count: u32 = 0;
+    var step: u64 = 0;
+    while (tried_count < count and step < table.len) : (step += 1) {
+        const index: u32 = table[(hash + step) % table.len];
+        assert(index < count);
+        const bit = @as(u32, 1) << @intCast(index);
+        if (tried & bit != 0) continue;
+        tried |= bit;
+        tried_count += 1;
+        if (exclude_index != null and index == exclude_index.?) continue;
+        if (is_available(state, index, now_ns)) return index;
+    }
+    // The excluded endpoint beats an unavailable one.
+    if (exclude_index) |exclude| {
+        if (is_available(state, exclude, now_ns)) return exclude;
+    }
+    // Panic mode: fail open to the hash's home endpoint (affinity intact).
+    return home;
+}
+
 /// One uniform draw over [0, count), skipping `exclude` by drawing over
 /// count-1 and shifting past it. A single-endpoint cluster ignores the
 /// exclusion — the only option is better than none.
@@ -206,6 +249,99 @@ test "balancer: unavailable endpoints are skipped via the fallback scan" {
         if (index == 1) seen_one = true;
     }
     try testing.expect(seen_one);
+}
+
+fn test_hashed_cluster(gpa: std.mem.Allocator, endpoint_count: u32) !config.Config {
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try w.print(
+        \\{{ "listen": "0.0.0.0:80", "routes": [{{ "cluster": "c" }}],
+        \\   "clusters": [{{ "name": "c",
+        \\     "lb": {{ "policy": "maglev" }}, "endpoints": [
+    , .{});
+    var i: u32 = 0;
+    while (i < endpoint_count) : (i += 1) {
+        if (i > 0) try w.print(",", .{});
+        try w.print("\"127.0.0.1:{d}\"", .{9000 + i});
+    }
+    try w.print("] }}] }}", .{});
+    return config.parse(gpa, w.buffered());
+}
+
+test "balancer: hashed picks are consistent and walk deterministically" {
+    var cfg = try test_hashed_cluster(testing.allocator, 4);
+    defer cfg.deinit();
+    const cluster = cfg.find_cluster("c").?;
+
+    var state = ClusterState{};
+    const hash = std.hash.Wyhash.hash(0, "/users/42");
+    const home = pick_hashed(cluster, &state, hash, 0, null).?;
+    for (0..10) |_| { // affinity: the same key lands on the same endpoint
+        try testing.expectEqual(home, pick_hashed(cluster, &state, hash, 0, null).?);
+    }
+
+    // Home goes unhealthy: the fallback is deterministic too — and it is
+    // not a re-randomization (repeatable across calls).
+    state.endpoints[home].healthy = false;
+    const fallback = pick_hashed(cluster, &state, hash, 0, null).?;
+    try testing.expect(fallback != home);
+    for (0..10) |_| {
+        try testing.expectEqual(fallback, pick_hashed(cluster, &state, hash, 0, null).?);
+    }
+    // Home recovers: the key goes home again (consistency restored).
+    state.endpoints[home].healthy = true;
+    try testing.expectEqual(home, pick_hashed(cluster, &state, hash, 0, null).?);
+}
+
+test "balancer: hashed retry excludes the failed endpoint but not the last one" {
+    var cfg = try test_hashed_cluster(testing.allocator, 3);
+    defer cfg.deinit();
+    const cluster = cfg.find_cluster("c").?;
+
+    var state = ClusterState{};
+    const hash = std.hash.Wyhash.hash(0, "/session/abc");
+    const home = pick_hashed(cluster, &state, hash, 0, null).?;
+    const retry = pick_hashed(cluster, &state, hash, 0, home).?;
+    try testing.expect(retry != home);
+
+    // Everyone but the failed endpoint is unavailable: the exclusion is
+    // soft — the failed endpoint still beats an unavailable one.
+    for (0..3) |index| {
+        if (index != home) state.endpoints[index].healthy = false;
+    }
+    try testing.expectEqual(home, pick_hashed(cluster, &state, hash, 0, home).?);
+}
+
+test "balancer: hashed pick fails open to the home endpoint" {
+    var cfg = try test_hashed_cluster(testing.allocator, 3);
+    defer cfg.deinit();
+    const cluster = cfg.find_cluster("c").?;
+
+    var state = ClusterState{};
+    const hash = std.hash.Wyhash.hash(0, "/anything");
+    const home = pick_hashed(cluster, &state, hash, 0, null).?;
+    for (&state.endpoints) |*endpoint| endpoint.healthy = false;
+    // Panic mode keeps affinity: the dead home endpoint, not a random one.
+    try testing.expectEqual(home, pick_hashed(cluster, &state, hash, 0, null).?);
+}
+
+test "balancer: hashed picks spread distinct keys across endpoints" {
+    var cfg = try test_hashed_cluster(testing.allocator, 4);
+    defer cfg.deinit();
+    const cluster = cfg.find_cluster("c").?;
+
+    var state = ClusterState{};
+    var counts = [_]u32{0} ** 4;
+    var key_buf: [32]u8 = undefined;
+    for (0..400) |sequence| {
+        const key = std.fmt.bufPrint(&key_buf, "/item/{d}", .{sequence}) catch unreachable;
+        const hash = std.hash.Wyhash.hash(0, key);
+        counts[pick_hashed(cluster, &state, hash, 0, null).?] += 1;
+    }
+    for (counts) |count| { // 400 keys over 4 endpoints: each gets a real share
+        try testing.expect(count > 50);
+        try testing.expect(count < 150);
+    }
 }
 
 test "balancer: zero available endpoints fails open and still routes" {
