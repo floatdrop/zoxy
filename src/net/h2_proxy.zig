@@ -41,6 +41,7 @@ const h2 = @import("../http/h2.zig");
 const h2_frame = @import("../http/h2_frame.zig");
 const hpack = @import("../http/hpack.zig");
 const h2_translate = @import("../http/h2_translate.zig");
+const terminator = @import("../tls/terminator.zig");
 const maglev = @import("../proxy/maglev.zig");
 const balancer = @import("../proxy/balancer.zig");
 const resilience_mod = @import("../proxy/resilience.zig");
@@ -261,6 +262,25 @@ pub const H2Conn = struct {
     send_filled: usize,
     send_in_flight: bool,
 
+    /// Downstream TLS (h2 over TLS): the terminated channel, adopted
+    /// post-handshake from the H1 `ProxyConn` that ran the handshake and
+    /// read `h2` off ALPN. When non-null every downstream op is a ciphertext
+    /// op on the wire buffers below, feeding/draining the channel between
+    /// them and `recv_buf`/`send_buf` — the same BIO-pair relay ProxyConn
+    /// runs, adapted to H2's symmetric buffered model. Null = h2c (plaintext).
+    tls: ?terminator.Channel,
+    wire_recv_buf: [constants.tls_bio_pair_bytes]u8,
+    wire_recv_staged: u32,
+    wire_recv_in_flight: bool,
+    wire_send_buf: [constants.tls_bio_pair_bytes]u8,
+    wire_send_filled: u32,
+    wire_send_sent: u32,
+    wire_send_in_flight: bool,
+    /// A TLS close_notify or wire EOF arrived — teardown after the drain.
+    tls_eof: bool,
+    tls_wire_recv_completion: Completion,
+    tls_wire_send_completion: Completion,
+
     idle_timeout_ns: u63,
     request_timeout_ns: u63,
     /// Connection-level deadline: idle cutoff, refreshed on client bytes.
@@ -293,8 +313,17 @@ pub const H2Conn = struct {
         downstream_fd: posix.socket_t,
         request_timeout_ns: u63,
         idle_timeout_ns: u63,
+        /// The terminated TLS channel when this is an adopted h2-over-TLS
+        /// connection (the H1 handshaker read `h2` off ALPN); null = h2c.
+        tls: ?terminator.Channel,
+        /// Ciphertext the handshaker had already read past the handshake
+        /// (a coalesced client preface) — seeded into the wire buffer so the
+        /// first `tls_service` decrypts it. Empty for h2c.
+        staged_ciphertext: []const u8,
     ) void {
         assert(downstream_fd >= 0);
+        assert(staged_ciphertext.len <= constants.tls_bio_pair_bytes);
+        assert(tls != null or staged_ciphertext.len == 0);
         conn.io = io;
         conn.pool = pool;
         conn.legs = legs;
@@ -316,6 +345,16 @@ pub const H2Conn = struct {
         conn.send_sent = 0;
         conn.send_filled = 0;
         conn.send_in_flight = false;
+        conn.tls = tls;
+        conn.wire_recv_staged = @intCast(staged_ciphertext.len);
+        conn.wire_recv_in_flight = false;
+        conn.wire_send_filled = 0;
+        conn.wire_send_sent = 0;
+        conn.wire_send_in_flight = false;
+        conn.tls_eof = false;
+        if (staged_ciphertext.len > 0) {
+            @memcpy(conn.wire_recv_buf[0..staged_ciphertext.len], staged_ciphertext);
+        }
         conn.request_timeout_ns = request_timeout_ns;
         conn.idle_timeout_ns = idle_timeout_ns;
         conn.timeout_armed = false;
@@ -323,8 +362,8 @@ pub const H2Conn = struct {
         conn.metrics.active.add(1);
         conn.set_deadline(idle_timeout_ns);
         conn.arm_timeout();
-        conn.process(); // stages our SETTINGS + window boost
-        conn.arm_recv();
+        conn.process(); // stages our SETTINGS + window boost (flush sends them)
+        if (conn.tls != null) conn.tls_service() else conn.arm_recv();
     }
 
     // ---- downstream receive -> engine --------------------------------------
@@ -1203,6 +1242,7 @@ pub const H2Conn = struct {
     }
 
     fn flush_send(conn: *H2Conn) void {
+        if (conn.tls != null) return conn.tls_flush_send();
         if (conn.closing or conn.send_in_flight) return;
         if (conn.send_sent == conn.send_filled) {
             conn.send_sent = 0;
@@ -1233,10 +1273,23 @@ pub const H2Conn = struct {
         conn.send_sent = 0;
         conn.send_filled = 0;
         if (conn.close_after_flush) return conn.teardown();
-        // Staging drained: resume whoever was waiting on it.
+        conn.resume_after_send();
+    }
+
+    /// The send staging drained: let everyone who was blocked on it make
+    /// progress — a pending drain GOAWAY, matured window updates, blocked
+    /// relays, buffered input, and the next downstream read.
+    fn resume_after_send(conn: *H2Conn) void {
+        if (conn.closing or conn.close_after_flush) return;
         if (conn.drain_pending) conn.try_stage_drain();
         conn.pump_engine();
         conn.pump_blocked_streams(0);
+        if (conn.tls != null) {
+            // tls_service re-pumps plaintext (send room freed lets the
+            // engine consume more), processes, and re-arms the wire read.
+            conn.tls_service();
+            return;
+        }
         if (conn.recv_filled > 0) conn.process();
         if (!conn.recv_in_flight and !conn.closing and !conn.close_after_flush and
             conn.recv_filled < conn.recv_buf.len)
@@ -1244,6 +1297,183 @@ pub const H2Conn = struct {
             conn.arm_recv();
         }
         conn.flush_send();
+    }
+
+    // ---- downstream TLS relay (h2 over TLS) ------------------------------------
+    //
+    // The BIO-pair relay, mirroring ProxyConn's proven driver but simpler:
+    // the handshake is already done (adopted post-ALPN), there is one leg
+    // (downstream), and the logical endpoints are fixed — the "plaintext in"
+    // target is always `recv_buf`'s tail, the "plaintext out" source always
+    // `send_buf[send_sent..send_filled]`. Backpressure is unchanged: the
+    // plaintext staging buffers are the boundary; the wire buffers are fixed
+    // scratch drained across completions.
+
+    /// Feed staged wire ciphertext into the channel; a partial feed compacts
+    /// the remainder forward. Returns bytes fed (0 = pair full or nothing).
+    fn tls_feed_staged(conn: *H2Conn) u32 {
+        if (conn.wire_recv_staged == 0) return 0;
+        const fed: u32 = @intCast(conn.tls.?.feed_ciphertext(
+            conn.wire_recv_buf[0..conn.wire_recv_staged],
+        ));
+        if (fed == 0) return 0; // pair full: reads will drain it
+        if (fed < conn.wire_recv_staged) {
+            std.mem.copyForwards(
+                u8,
+                conn.wire_recv_buf[0 .. conn.wire_recv_staged - fed],
+                conn.wire_recv_buf[fed..conn.wire_recv_staged],
+            );
+        }
+        conn.wire_recv_staged -= fed;
+        return fed;
+    }
+
+    /// Decrypt available ciphertext into `recv_buf`, drive the engine, and
+    /// keep going while either makes progress — then arm the next wire read.
+    fn tls_service(conn: *H2Conn) void {
+        if (conn.closing) return;
+        // Bounded: each pass either pumps plaintext or the engine consumes,
+        // else it breaks; the recv buffer and the wire staging are finite.
+        var budget: u32 = @intCast(conn.recv_buf.len / 64 + 16);
+        while (budget > 0) : (budget -= 1) {
+            var pumped = conn.tls_feed_staged() > 0;
+            var reads: u32 = @intCast(conn.recv_buf.len / 16 + 16);
+            while (conn.recv_filled < conn.recv_buf.len and reads > 0) : (reads -= 1) {
+                switch (conn.tls.?.read_plaintext(conn.recv_buf[conn.recv_filled..])) {
+                    .bytes => |n| {
+                        conn.recv_filled += n;
+                        pumped = true;
+                    },
+                    .closed => {
+                        conn.tls_eof = true;
+                        break;
+                    },
+                    .want_io => {
+                        if (conn.tls_feed_staged() > 0) {
+                            pumped = true;
+                            continue;
+                        }
+                        break;
+                    },
+                    .failed => return conn.teardown(),
+                }
+            }
+            const before = conn.recv_filled;
+            conn.process(); // consumes recv_buf, stages+encrypts+sends via flush
+            if (conn.closing) return;
+            const consumed = before - conn.recv_filled;
+            if (!pumped and consumed == 0) break;
+            if (conn.tls_eof) break;
+        }
+        // Client activity resets the idle clock — never under drain.
+        if (!conn.engine.draining() and !conn.drain_pending) {
+            conn.set_deadline(conn.idle_timeout_ns);
+        }
+        if (conn.tls_eof) return conn.teardown(); // TLS EOF ends every stream
+        conn.tls_arm_wire_recv();
+    }
+
+    fn tls_arm_wire_recv(conn: *H2Conn) void {
+        if (conn.closing) return;
+        if (conn.wire_recv_in_flight) return;
+        // Staging full means the pair is full too; reads make the room and
+        // this re-arms on the next service pass.
+        if (conn.wire_recv_staged == conn.wire_recv_buf.len) return;
+        conn.wire_recv_in_flight = true;
+        conn.retain();
+        conn.io.recv(
+            *H2Conn,
+            conn,
+            on_tls_wire_recv,
+            &conn.tls_wire_recv_completion,
+            conn.downstream_fd,
+            conn.wire_recv_buf[conn.wire_recv_staged..],
+        );
+    }
+
+    fn on_tls_wire_recv(conn: *H2Conn, _: *Completion, result: io_mod.RecvError!usize) void {
+        defer conn.release_ref();
+        conn.wire_recv_in_flight = false;
+        if (conn.closing) return;
+        const n = result catch return conn.teardown();
+        if (n == 0) {
+            conn.tls_eof = true;
+            return conn.teardown(); // wire EOF without close_notify: abrupt end
+        }
+        conn.wire_recv_staged += @intCast(n);
+        assert(conn.wire_recv_staged <= conn.wire_recv_buf.len);
+        conn.tls_service();
+    }
+
+    /// Encrypt as much staged plaintext as the pair accepts, then push
+    /// ciphertext to the wire. The reset+resume happens in the wire-send
+    /// completion (no synchronous recursion), exactly like the plaintext
+    /// `on_send`.
+    fn tls_flush_send(conn: *H2Conn) void {
+        if (conn.closing) return;
+        var budget: u32 = 64; // bounded: each pass consumes plaintext or breaks
+        while (conn.send_sent < conn.send_filled and budget > 0) : (budget -= 1) {
+            switch (conn.tls.?.write_plaintext(conn.send_buf[conn.send_sent..conn.send_filled])) {
+                .bytes => |c| conn.send_sent += c,
+                .want_io => break, // pair full: drain to the wire, come back
+                .failed => return conn.teardown(),
+            }
+        }
+        conn.tls_flush_wire_send();
+        if (conn.tls_send_drained()) {
+            conn.send_sent = 0;
+            conn.send_filled = 0;
+            if (conn.close_after_flush) conn.teardown();
+        }
+    }
+
+    /// Every staged plaintext byte encrypted, all ciphertext sent, wire idle.
+    fn tls_send_drained(conn: *const H2Conn) bool {
+        return conn.send_sent == conn.send_filled and
+            conn.tls.?.pending_ciphertext() == 0 and
+            !conn.wire_send_in_flight and
+            conn.wire_send_sent == conn.wire_send_filled;
+    }
+
+    /// Keep exactly one wire send in flight while ciphertext is pending,
+    /// refilling the staging buffer from the pair between sends.
+    fn tls_flush_wire_send(conn: *H2Conn) void {
+        if (conn.closing) return;
+        if (conn.wire_send_in_flight) return;
+        if (conn.wire_send_sent == conn.wire_send_filled) {
+            conn.wire_send_filled = @intCast(conn.tls.?.drain_ciphertext(&conn.wire_send_buf));
+            conn.wire_send_sent = 0;
+            if (conn.wire_send_filled == 0) return; // nothing pending
+        }
+        assert(conn.wire_send_sent < conn.wire_send_filled);
+        conn.wire_send_in_flight = true;
+        conn.retain();
+        conn.io.send(
+            *H2Conn,
+            conn,
+            on_tls_wire_send,
+            &conn.tls_wire_send_completion,
+            conn.downstream_fd,
+            conn.wire_send_buf[conn.wire_send_sent..conn.wire_send_filled],
+        );
+    }
+
+    fn on_tls_wire_send(conn: *H2Conn, _: *Completion, result: io_mod.SendError!usize) void {
+        defer conn.release_ref();
+        conn.wire_send_in_flight = false;
+        if (conn.closing) return;
+        const m = result catch return conn.teardown();
+        conn.wire_send_sent += @intCast(m);
+        assert(conn.wire_send_sent <= conn.wire_send_filled);
+        // Drained a bit: encrypt more (the pair freed room) and keep sending.
+        conn.tls_flush_send();
+        if (conn.closing) return;
+        if (conn.tls_send_drained()) {
+            conn.send_sent = 0;
+            conn.send_filled = 0;
+            if (conn.close_after_flush) return conn.teardown();
+            conn.resume_after_send();
+        }
     }
 
     // ---- graceful drain (docs/DESIGN.md §7 Phase 4, extended to H2) ------------
@@ -1328,6 +1558,12 @@ pub const H2Conn = struct {
         assert(conn.refs > 0);
         conn.refs -= 1;
         if (conn.closing and conn.refs == 0) {
+            // Quiescent: no wire op can touch the channel. Its SSL + BIO
+            // pair return to the TLS heap with the slot.
+            if (conn.tls) |channel| {
+                channel.deinit();
+                conn.tls = null;
+            }
             conn.metrics.active.sub(1);
             conn.pool.release(conn);
         }
@@ -1470,6 +1706,8 @@ pub const H2Server = struct {
             fd,
             server.request_timeout_ns,
             server.idle_timeout_ns,
+            null, // h2c: plaintext listener
+            "",
         );
         server.start();
     }
@@ -1953,6 +2191,403 @@ test "h2_proxy: drain announces GOAWAY, completes in-flight streams, then closes
     // Both connections close themselves; every slot comes home.
     try harness.settle();
     try testing.expect(harness.server.resilience.is_idle());
+}
+
+// ---- h2 over TLS -----------------------------------------------------------
+
+const openssl = @import("../tls/openssl.zig");
+const install_tls_test_hook = openssl.install_memory_hook_for_tests;
+const test_certificate_pem = @embedFile("../tls/testdata/certificate.pem");
+const test_private_key_pem = @embedFile("../tls/testdata/private_key.pem");
+
+/// Complete both channels' handshakes in memory (no sockets), shuttling
+/// ciphertext directly between the pair — the transport-agnostic setup for
+/// the data phase that follows over a real socket.
+fn handshake_in_memory(client: *terminator.Channel, server: *terminator.Channel) !void {
+    var scratch: [constants.tls_bio_pair_bytes]u8 = undefined;
+    _ = client.handshake_step(); // ClientHello
+    var rounds: u32 = 0;
+    while (rounds < 40) : (rounds += 1) {
+        const moved = move_ciphertext(client, server, &scratch) +
+            move_ciphertext(server, client, &scratch);
+        _ = client.handshake_step();
+        _ = server.handshake_step();
+        if (client.handshake_done() and server.handshake_done()) return;
+        if (moved == 0) break;
+    }
+    return error.HandshakeStalled;
+}
+
+fn move_ciphertext(from: *terminator.Channel, to: *terminator.Channel, scratch: []u8) usize {
+    const drained = from.drain_ciphertext(scratch);
+    if (drained == 0) return 0;
+    const fed = to.feed_ciphertext(scratch[0..drained]);
+    assert(fed == drained); // an empty pair always accepts a flight
+    return drained;
+}
+
+/// An h2 client speaking TLS on a real socket: it wraps the plaintext frame
+/// staging in `terminator.Channel` encrypt/decrypt, otherwise mirroring the
+/// plaintext H2TestClient's frame handling.
+const TlsH2Client = struct {
+    io: *IO,
+    fd: posix.socket_t,
+    channel: terminator.Channel,
+    plain_out: [2048]u8 = undefined,
+    plain_out_len: usize = 0,
+    plain_out_encrypted: usize = 0,
+    wire_out: [constants.tls_bio_pair_bytes]u8 = undefined,
+    wire_out_filled: usize = 0,
+    wire_out_sent: usize = 0,
+    send_in_flight: bool = false,
+    wire_in: [constants.tls_bio_pair_bytes]u8 = undefined,
+    recv_in_flight: bool = false,
+    frames: H2FrameSink = .{},
+    send_c: Completion = undefined,
+    recv_c: Completion = undefined,
+
+    fn stage(client: *TlsH2Client, bytes: []const u8) void {
+        @memcpy(client.plain_out[client.plain_out_len..][0..bytes.len], bytes);
+        client.plain_out_len += bytes.len;
+    }
+
+    fn go(client: *TlsH2Client) void {
+        client.pump();
+    }
+
+    /// Encrypt staged plaintext, flush ciphertext, decrypt incoming frames,
+    /// re-arm the wire read — the client-side twin of the server relay.
+    fn pump(client: *TlsH2Client) void {
+        var budget: u32 = 32;
+        while (client.plain_out_encrypted < client.plain_out_len and budget > 0) : (budget -= 1) {
+            switch (client.channel.write_plaintext(client.plain_out[client.plain_out_encrypted..client.plain_out_len])) {
+                .bytes => |c| client.plain_out_encrypted += c,
+                .want_io => break,
+                .failed => return,
+            }
+        }
+        var read_budget: u32 = 64;
+        while (read_budget > 0) : (read_budget -= 1) {
+            var plain: [1024]u8 = undefined;
+            switch (client.channel.read_plaintext(&plain)) {
+                .bytes => |n| client.frames.feed(plain[0..n]),
+                .closed => {
+                    client.frames.done = true;
+                    break;
+                },
+                .want_io, .failed => break,
+            }
+        }
+        client.flush_wire();
+        client.arm_wire_recv();
+    }
+
+    fn flush_wire(client: *TlsH2Client) void {
+        if (client.send_in_flight) return;
+        if (client.wire_out_sent == client.wire_out_filled) {
+            client.wire_out_filled = client.channel.drain_ciphertext(&client.wire_out);
+            client.wire_out_sent = 0;
+            if (client.wire_out_filled == 0) return;
+        }
+        client.send_in_flight = true;
+        client.io.send(
+            *TlsH2Client,
+            client,
+            on_send,
+            &client.send_c,
+            client.fd,
+            client.wire_out[client.wire_out_sent..client.wire_out_filled],
+        );
+    }
+    fn on_send(client: *TlsH2Client, _: *Completion, result: io_mod.SendError!usize) void {
+        client.send_in_flight = false;
+        client.wire_out_sent += result catch return;
+        client.pump();
+    }
+    fn arm_wire_recv(client: *TlsH2Client) void {
+        if (client.recv_in_flight or client.frames.done) return;
+        client.recv_in_flight = true;
+        client.io.recv(*TlsH2Client, client, on_recv, &client.recv_c, client.fd, &client.wire_in);
+    }
+    fn on_recv(client: *TlsH2Client, _: *Completion, result: io_mod.RecvError!usize) void {
+        client.recv_in_flight = false;
+        const n = result catch 0;
+        if (n == 0) {
+            client.frames.done = true;
+            return;
+        }
+        const fed = client.channel.feed_ciphertext(client.wire_in[0..n]);
+        assert(fed == n);
+        client.pump();
+    }
+};
+
+/// Parses server frames out of a decrypted plaintext stream — the framing
+/// half of both H2 test clients, factored out.
+const H2FrameSink = struct {
+    buf: [8192]u8 = undefined,
+    len: usize = 0,
+    decoder: hpack.Decoder = .{},
+    fields: [16]hpack.Header = undefined,
+    fields_storage: [1024]u8 = undefined,
+    status: u16 = 0,
+    body: [512]u8 = undefined,
+    body_len: usize = 0,
+    done: bool = false,
+    reset: bool = false,
+
+    fn feed(sink: *H2FrameSink, plain: []const u8) void {
+        @memcpy(sink.buf[sink.len..][0..plain.len], plain);
+        sink.len += plain.len;
+        var offset: usize = 0;
+        while (true) {
+            const frame = (h2_frame.parse_frame(sink.buf[offset..sink.len]) catch {
+                sink.reset = true;
+                sink.done = true;
+                break;
+            }) orelse break;
+            offset += frame.wire_bytes();
+            switch (frame.header.type) {
+                .headers => {
+                    const decoded = sink.decoder.decode(frame.payload, &sink.fields, &sink.fields_storage) catch unreachable;
+                    sink.status = std.fmt.parseInt(u16, decoded[0].value, 10) catch 0;
+                    if (frame.header.flags & h2_frame.Flags.end_stream != 0) sink.done = true;
+                },
+                .data => {
+                    @memcpy(sink.body[sink.body_len..][0..frame.payload.len], frame.payload);
+                    sink.body_len += frame.payload.len;
+                    if (frame.header.flags & h2_frame.Flags.end_stream != 0) sink.done = true;
+                },
+                .rst_stream => {
+                    sink.reset = true;
+                    sink.done = true;
+                },
+                else => {},
+            }
+        }
+        std.mem.copyForwards(u8, sink.buf[0 .. sink.len - offset], sink.buf[offset..sink.len]);
+        sink.len -= offset;
+    }
+};
+
+/// Setup for adopting a TLS-terminated h2 connection into an H2Conn without
+/// the H1 handshaker (that path is exercised in proxy.zig): everything the
+/// H2Conn needs, plus a socketpair carrying ciphertext to a TlsH2Client.
+const TlsHarness = struct {
+    io: IO,
+    cfg: config.Config,
+    router: Router,
+    pool: H2ConnPool,
+    legs: LegPool,
+    resilience: Resilience,
+    upstream_pool: UpstreamPool,
+    metrics: Counters,
+    access: AccessLog,
+    prng: std.Random.DefaultPrng,
+    server_ctx: terminator.Context,
+    client_ctx: terminator.Context,
+
+    fn init(harness: *TlsHarness, gpa: std.mem.Allocator, origin_port: u16) !void {
+        install_tls_test_hook();
+        harness.io = try IO.init(64, 0);
+        var json_buf: [256]u8 = undefined;
+        const cfg_text = try std.fmt.bufPrint(&json_buf,
+            \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+            \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
+        , .{origin_port});
+        harness.cfg = try config.parse(gpa, cfg_text);
+        harness.router = Router.init(&harness.cfg);
+        harness.pool = try H2ConnPool.init(gpa, 2);
+        harness.legs = try LegPool.init(gpa, 4);
+        harness.resilience = .{};
+        harness.upstream_pool = .{};
+        harness.metrics = Counters{};
+        harness.access = AccessLog{ .fd = -1 };
+        harness.prng = std.Random.DefaultPrng.init(1);
+        harness.server_ctx = try terminator.Context.init_server(test_certificate_pem, test_private_key_pem);
+        terminator.enable_h2(&harness.server_ctx);
+        harness.client_ctx = try terminator.Context.init_client(.insecure);
+    }
+
+    fn deinit(harness: *TlsHarness, gpa: std.mem.Allocator) void {
+        harness.upstream_pool.drain(&harness.io);
+        harness.server_ctx.deinit();
+        harness.client_ctx.deinit();
+        harness.legs.deinit(gpa);
+        harness.pool.deinit(gpa);
+        harness.cfg.deinit();
+        harness.io.deinit();
+    }
+
+    /// Adopt a handshaken server channel + fd into a fresh H2Conn, exactly
+    /// as the ProxyConn handoff will.
+    fn adopt(harness: *TlsHarness, fd: posix.socket_t, channel: terminator.Channel, staged: []const u8) void {
+        const conn = harness.pool.acquire().?;
+        conn.start(
+            &harness.io,
+            &harness.pool,
+            &harness.legs,
+            &harness.router,
+            &harness.resilience,
+            &harness.upstream_pool,
+            &harness.metrics,
+            &harness.access,
+            harness.prng.random(),
+            fd,
+            constants.request_timeout_ns,
+            constants.idle_timeout_ns,
+            channel,
+            staged,
+        );
+    }
+
+    fn settle(harness: *TlsHarness) !void {
+        while (harness.pool.free_count != harness.pool.capacity or
+            harness.legs.free_count != harness.legs.capacity)
+        {
+            try harness.io.run_once();
+        }
+    }
+};
+
+/// A connected AF_UNIX stream pair for the ciphertext transport.
+fn socket_pair() ![2]posix.socket_t {
+    var fds: [2]i32 = undefined;
+    const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds);
+    try testing.expect(linux.errno(rc) == .SUCCESS);
+    return fds;
+}
+
+/// Build both channels, negotiate ALPN=h2 via an in-memory handshake.
+fn tls_h2_channels(harness: *TlsHarness) !struct { server: terminator.Channel, client: terminator.Channel } {
+    var server = try terminator.Channel.init(&harness.server_ctx);
+    errdefer server.deinit();
+    var client = try terminator.Channel.init(&harness.client_ctx);
+    errdefer client.deinit();
+    const alpn_offer = "\x02h2\x08http/1.1";
+    try testing.expectEqual(@as(c_int, 0), openssl.SSL_set_alpn_protos(client.ssl, alpn_offer, alpn_offer.len));
+    try handshake_in_memory(&client, &server);
+    try testing.expectEqualStrings("h2", server.alpn_selected().?);
+    return .{ .server = server, .client = client };
+}
+
+test "h2_proxy: terminates h2 over TLS end to end" {
+    const gpa = testing.allocator;
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+
+    var harness: TlsHarness = undefined;
+    try harness.init(gpa, origin_listener.bound_address().port);
+    defer harness.deinit(gpa);
+
+    var origin = TestOrigin{
+        .io = &harness.io,
+        .listener = origin_listener,
+        .response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO",
+    };
+    origin.start();
+
+    const channels = try tls_h2_channels(&harness);
+    const pair = try socket_pair();
+    harness.adopt(pair[1], channels.server, "");
+
+    var client = TlsH2Client{ .io = &harness.io, .fd = pair[0], .channel = channels.client };
+    defer client.channel.deinit();
+    client.stage(h2_frame.client_preface);
+    var settings: [64]u8 = undefined;
+    client.stage(settings[0..h2_frame.write_settings(&.{}, &settings)]);
+    stage_tls_request(&client, "/hello");
+    client.go();
+
+    try harness.io.run_until_done(&client.frames.done);
+    try testing.expect(!client.frames.reset);
+    try testing.expectEqual(@as(u16, 200), client.frames.status);
+    try testing.expectEqualStrings("HELLO", client.frames.body[0..client.frames.body_len]);
+    try testing.expect(std.mem.startsWith(u8, origin.request_buf[0..origin.request_len], "GET /hello HTTP/1.1\r\n"));
+
+    _ = linux.close(pair[0]);
+    try harness.settle();
+    try testing.expect(harness.resilience.is_idle());
+}
+
+test "h2_proxy: h2 over TLS with a preface coalesced into the handshake flight" {
+    const gpa = testing.allocator;
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+
+    var harness: TlsHarness = undefined;
+    try harness.init(gpa, origin_listener.bound_address().port);
+    defer harness.deinit(gpa);
+
+    var origin = TestOrigin{
+        .io = &harness.io,
+        .listener = origin_listener,
+        .response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+    };
+    origin.start();
+
+    var channels = try tls_h2_channels(&harness);
+    // The client encrypts its whole opening flight *before* the transport
+    // exists — the coalesced-preface case that defeats a kTLS switch. Those
+    // ciphertext bytes are handed to the H2Conn as `staged`, exactly as the
+    // H1 handshaker would have read them past the handshake.
+    var opening: [512]u8 = undefined;
+    var opening_len: usize = 0;
+    @memcpy(opening[0..h2_frame.client_preface.len], h2_frame.client_preface);
+    opening_len += h2_frame.client_preface.len;
+    var settings: [64]u8 = undefined;
+    const settings_len = h2_frame.write_settings(&.{}, &settings);
+    @memcpy(opening[opening_len..][0..settings_len], settings[0..settings_len]);
+    opening_len += settings_len;
+    opening_len += encode_tls_request(opening[opening_len..], "/coalesced");
+    try testing.expectEqual(
+        terminator.Channel.WriteResult{ .bytes = opening_len },
+        channels.client.write_plaintext(opening[0..opening_len]),
+    );
+    var staged: [constants.tls_bio_pair_bytes]u8 = undefined;
+    const staged_len = channels.client.drain_ciphertext(&staged);
+    try testing.expect(staged_len > 0);
+    try testing.expectEqual(@as(usize, 0), channels.client.pending_ciphertext());
+
+    const pair = try socket_pair();
+    harness.adopt(pair[1], channels.server, staged[0..staged_len]);
+
+    var client = TlsH2Client{ .io = &harness.io, .fd = pair[0], .channel = channels.client };
+    defer client.channel.deinit();
+    client.go(); // nothing to send: the request already rode the staged bytes
+
+    try harness.io.run_until_done(&client.frames.done);
+    try testing.expect(!client.frames.reset);
+    try testing.expectEqual(@as(u16, 200), client.frames.status);
+    try testing.expectEqualStrings("hi", client.frames.body[0..client.frames.body_len]);
+    try testing.expect(std.mem.startsWith(u8, origin.request_buf[0..origin.request_len], "GET /coalesced HTTP/1.1\r\n"));
+
+    _ = linux.close(pair[0]);
+    try harness.settle();
+    try testing.expect(harness.resilience.is_idle());
+}
+
+fn stage_tls_request(client: *TlsH2Client, path: []const u8) void {
+    var frame: [256]u8 = undefined;
+    client.stage(frame[0..encode_tls_request(&frame, path)]);
+}
+
+/// Encode a HEADERS frame (GET, END_STREAM|END_HEADERS) for `path`.
+fn encode_tls_request(out: []u8, path: []const u8) usize {
+    var block: [128]u8 = undefined;
+    var block_len: usize = 0;
+    block_len += hpack.encode_header(":method", "GET", block[block_len..]) catch unreachable;
+    block_len += hpack.encode_header(":scheme", "https", block[block_len..]) catch unreachable;
+    block_len += hpack.encode_header(":path", path, block[block_len..]) catch unreachable;
+    block_len += hpack.encode_header(":authority", "origin", block[block_len..]) catch unreachable;
+    h2_frame.write_frame_header(.{
+        .length = @intCast(block_len),
+        .type = .headers,
+        .flags = h2_frame.Flags.end_headers | h2_frame.Flags.end_stream,
+        .stream_id = 1,
+    }, out[0..h2_frame.frame_header_bytes]);
+    @memcpy(out[h2_frame.frame_header_bytes..][0..block_len], block[0..block_len]);
+    return h2_frame.frame_header_bytes + block_len;
 }
 
 test "h2_proxy: the H2 serving path allocates nothing after startup (zero-alloc gate)" {

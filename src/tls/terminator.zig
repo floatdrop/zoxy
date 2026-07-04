@@ -18,6 +18,7 @@ const constants = @import("../constants.zig");
 /// The ALPN identifier we speak today. h2 joins this list in the HTTP/2
 /// slice; preference order is ours (server-chosen), first match wins.
 pub const alpn_http1 = "http/1.1";
+pub const alpn_h2 = "h2";
 
 /// A connection's TLS 1.3 application traffic secrets, captured by the
 /// process-wide keylog callback while the handshake derives them (kTLS
@@ -230,6 +231,18 @@ pub fn enable_sni(default_context: *const Context, table: *const SniTable) void 
     );
 }
 
+/// The Phase 5 config gate (`http2: true`): swap the server context's ALPN
+/// callback for the h2-preferring one, so a client offering h2 negotiates
+/// it and everything else stays on http/1.1. Call once at startup, before
+/// any handshake, on the default context and every SNI context (each owns
+/// its own SSL_CTX callback slot). Applies to SNI-swapped connections too:
+/// `SSL_set_SSL_CTX` swaps the certificate, not the ALPN callback, so the
+/// original context's ALPN selection still runs.
+pub fn enable_h2(context: *const Context) void {
+    assert(context.role == .server);
+    openssl.SSL_CTX_set_alpn_select_cb(context.context, alpn_select_h2, null);
+}
+
 /// int (*cb)(SSL *s, int *al, void *arg): NOACK keeps the default identity
 /// (absent SNI, unmatched name, or a failed swap) — never a fatal alert.
 fn servername_select(ssl: *openssl.SSL, alert: ?*c_int, argument: ?*anyopaque) callconv(.c) c_int {
@@ -298,20 +311,51 @@ fn alpn_select(
 ) callconv(.c) c_int {
     _ = ssl;
     assert(argument == null); // registered with no state
-    var index: usize = 0;
-    // The client list is length-prefixed entries; a zero-length entry is
-    // malformed, so every iteration advances by at least one byte.
-    while (index < in_length) {
-        const length: usize = in[index];
-        if (length == 0 or index + 1 + length > in_length) break;
-        const protocol = in[index + 1 ..][0..length];
-        if (std.mem.eql(u8, protocol, alpn_http1)) {
-            // out points at our static string — valid for the SSL lifetime.
-            out.* = alpn_http1.ptr;
-            out_length.* = alpn_http1.len;
-            return openssl.SSL_TLSEXT_ERR_OK;
+    return alpn_pick(&.{alpn_http1}, out, out_length, in, in_length);
+}
+
+/// The h2-preferring variant, installed by `enable_h2` (the Phase 5 config
+/// gate): h2 when the client offers it, http/1.1 otherwise.
+fn alpn_select_h2(
+    ssl: *openssl.SSL,
+    out: *?[*]const u8,
+    out_length: *u8,
+    in: [*]const u8,
+    in_length: c_uint,
+    argument: ?*anyopaque,
+) callconv(.c) c_int {
+    _ = ssl;
+    assert(argument == null); // registered with no state
+    return alpn_pick(&.{ alpn_h2, alpn_http1 }, out, out_length, in, in_length);
+}
+
+/// Select the first of `preferences` present in the client's ALPN list, or
+/// answer "no overlap" (NOACK) — the handshake then completes without ALPN
+/// and HTTP/1.1 is assumed, which matches pre-ALPN clients.
+fn alpn_pick(
+    preferences: []const []const u8,
+    out: *?[*]const u8,
+    out_length: *u8,
+    in: [*]const u8,
+    in_length: c_uint,
+) c_int {
+    assert(preferences.len >= 1);
+    for (preferences) |preference| {
+        var index: usize = 0;
+        // The client list is length-prefixed entries; a zero-length entry
+        // is malformed, so every iteration advances by at least one byte.
+        while (index < in_length) {
+            const length: usize = in[index];
+            if (length == 0 or index + 1 + length > in_length) break;
+            const protocol = in[index + 1 ..][0..length];
+            if (std.mem.eql(u8, protocol, preference)) {
+                // out points at our static string — valid for the SSL lifetime.
+                out.* = preference.ptr;
+                out_length.* = @intCast(preference.len);
+                return openssl.SSL_TLSEXT_ERR_OK;
+            }
+            index += 1 + length;
         }
-        index += 1 + length;
     }
     return openssl.SSL_TLSEXT_ERR_NOACK;
 }
@@ -693,6 +737,44 @@ test "terminator: no ALPN overlap completes the handshake without ALPN" {
     );
     try test_handshaken_pair(&client, &server, constants.tls_bio_pair_bytes);
     try std.testing.expectEqual(@as(?[]const u8, null), server.alpn_selected());
+}
+
+test "terminator: enable_h2 prefers h2, falls back to http/1.1" {
+    install_test_hook();
+    const server_context = try Context.init_server(test_certificate_pem, test_private_key_pem);
+    defer server_context.deinit();
+    enable_h2(&server_context);
+    const client_context = try Context.init_client(.insecure);
+    defer client_context.deinit();
+
+    // A client offering both gets h2 (our preference).
+    {
+        var server = try Channel.init(&server_context);
+        defer server.deinit();
+        var client = try Channel.init(&client_context);
+        defer client.deinit();
+        const offer = "\x08http/1.1\x02h2";
+        try std.testing.expectEqual(
+            @as(c_int, 0),
+            openssl.SSL_set_alpn_protos(client.ssl, offer.ptr, offer.len),
+        );
+        try test_handshaken_pair(&client, &server, constants.tls_bio_pair_bytes);
+        try std.testing.expectEqualStrings(alpn_h2, server.alpn_selected().?);
+    }
+    // A client offering only http/1.1 still negotiates it.
+    {
+        var server = try Channel.init(&server_context);
+        defer server.deinit();
+        var client = try Channel.init(&client_context);
+        defer client.deinit();
+        const offer = "\x08http/1.1";
+        try std.testing.expectEqual(
+            @as(c_int, 0),
+            openssl.SSL_set_alpn_protos(client.ssl, offer.ptr, offer.len),
+        );
+        try test_handshaken_pair(&client, &server, constants.tls_bio_pair_bytes);
+        try std.testing.expectEqualStrings(alpn_http1, server.alpn_selected().?);
+    }
 }
 
 test "terminator: close_notify reads as clean TLS EOF" {
