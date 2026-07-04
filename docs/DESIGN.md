@@ -394,8 +394,13 @@ Slices, each behind the usual gates (zero-alloc, sim seeds, h2load bands):
    seed), h2load measurement gate including the few-hot-connections shape that
    accept balancing (Phase 4) exists to serve.
 
-Later slices: H2 upstream + multiplexed upstream pooling; CONTINUATION-flood
-and rapid-reset hardening beyond what the fixed slots already give.
+Later slices: H2 upstream + multiplexed upstream pooling; the retry tiers +
+per-try timeout for H2 legs (slice 4 shipped at H1's Phase-1 maturity — an
+attempt failure answers the stream 502/504 before the first response byte,
+resets it after; the Phase-2 treatment applies unchanged); upstream TLS
+re-encryption for H2 legs (clusters demanding it answer 502 until then);
+CONTINUATION-flood and rapid-reset hardening beyond what the fixed slots
+already give.
 
 ### Phase 6 — dynamic config (planned)
 xDS-style client or simpler custom protocol; apply via RCU pointer swap

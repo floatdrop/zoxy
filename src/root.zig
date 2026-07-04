@@ -33,6 +33,10 @@ pub const h2 = @import("http/h2.zig");
 /// H2 header lists ↔ H1 wire heads (docs/DESIGN.md §7 Phase 5, slice 4).
 pub const h2_translate = @import("http/h2_translate.zig");
 
+/// The HTTP/2-downstream data path: engine driver + per-stream H1 upstream
+/// legs (docs/DESIGN.md §7 Phase 5, slice 4).
+pub const h2_proxy = @import("net/h2_proxy.zig");
+
 /// Static proxy configuration (docs/DESIGN.md §7).
 pub const config = @import("config.zig");
 
@@ -93,6 +97,7 @@ test {
     _ = hpack;
     _ = h2;
     _ = h2_translate;
+    _ = h2_proxy;
     _ = config;
     _ = @import("proxy/router.zig");
     _ = balancer;

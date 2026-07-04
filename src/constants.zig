@@ -116,6 +116,24 @@ pub const h2_connection_window_bytes: u31 = h2_streams_max * h2_stream_window_by
 /// the connection (ENHANCE_YOUR_CALM).
 pub const h2_header_block_bytes_max: u32 = 16 * 1024;
 
+/// Concurrent HTTP/2 downstream connections per worker (each carries up to
+/// `h2_streams_max` streams). Beyond this, accepts are rejected.
+pub const h2_connections_max: u32 = 16;
+
+/// Stream legs (one H1 upstream transaction each) per worker, shared across
+/// every H2 connection — the true bound on concurrent H2 transactions.
+/// Exhaustion answers the stream 503, never grows.
+pub const h2_legs_max: u32 = 128;
+
+/// H2 downstream receive staging: must hold one maximum frame (header +
+/// payload) plus reassembly slack.
+pub const h2_recv_buf_bytes: usize = 24 * 1024;
+
+/// H2 downstream send staging (control frames, translated response heads,
+/// DATA): must exceed a full response head block plus the engine's
+/// worst-case control burst.
+pub const h2_send_buf_bytes: usize = 48 * 1024;
+
 /// Bounds inside the chunked transfer-coding decoder (http/chunked.zig):
 /// hex size digits (16 spans a full u64), extension bytes per chunk, and
 /// total trailer-section bytes. Beyond any of these the message is malformed.
