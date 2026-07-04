@@ -239,10 +239,6 @@ Design rationale and the Zig-0.16 findings behind these choices are in
 [`docs/DESIGN.md`](docs/DESIGN.md); the coding conventions are in
 [`docs/TIGER_STYLE.md`](docs/TIGER_STYLE.md).
 
-## Scope & roadmap
-
-See [`docs/DESIGN.md`](docs/DESIGN.md).
-
 ## License
 
 [MIT](LICENSE) © 2026 Vsevolod Strukchinsky
