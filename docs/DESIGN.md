@@ -316,6 +316,61 @@ std cannot terminate TLS. Options, re-surveyed 2026-07:
   bytes-in/bytes-out and gets its own deterministic unit tests (seeded RNG via
   `RAND_set_rand_method`).
 
+### kTLS design (slice 3 — decided 2026-07-04)
+
+Two ways to get the negotiated keys into the kernel were examined:
+
+**A. OpenSSL-driven** (`SSL_OP_ENABLE_KTLS`): OpenSSL configures the socket
+itself during the handshake. Rejected for zoxy's shape. It requires the SSL
+to sit on a *socket* BIO at cipher-install time, so the handshake would run
+on OpenSSL's own read/write syscalls against a non-blocking fd, driven by a
+new readiness op (`IORING_OP_POLL_ADD`) — a second I/O model inside the
+worker and a simulation-backend op nothing can exercise. It also needs the
+vendored OpenSSL rebuilt (`OPENSSL_NO_KTLS` is defined and `ktls_meth.c`
+excluded today), and the no-kTLS fallback would have to swap the SSL back
+onto memory BIOs after the handshake. What it buys — OpenSSL owning
+key install, sequence numbers, and control records — we can get cheaper.
+
+**B. Sans-io + manual key install — chosen.** The handshake stays exactly
+as shipped (BIO pair, every byte a ring op, deterministic tests intact):
+
+- *Keys*: `SSL_CTX_set_keylog_callback` (present in every OpenSSL build —
+  no rebuild) yields the TLS 1.3 traffic secrets per connection;
+  `std.crypto.tls.hkdfExpandLabel` (public in the pinned std) derives the
+  key/IV pair; a `tls12_crypto_info_*` struct goes to the kernel via
+  `setsockopt(TCP_ULP "tls")` + `SOL_TLS TLS_TX`/`TLS_RX` — a synchronous
+  IO-seam helper like `shutdown_socket`. Gated to the AES-GCM ciphers.
+- *Sequence numbers, eliminated rather than computed*: kTLS needs the next
+  record sequence per direction. Rule: switch only at handshake completion
+  when **zero application-epoch records** have flowed (TX is trivially 0 —
+  we switch before the first `SSL_write`; RX we verify by counting record
+  boundaries in the ciphertext staging we already pass every byte through).
+  A client whose first request rode in with the handshake flight simply
+  leaves that connection on the BIO-pair relay — the fallback is the
+  already-shipped path, so a missed switch costs performance, never
+  correctness.
+- *Steady state*: plain `io.recv`/`io.send` on the fd; the kernel does the
+  records; the relay is byte-identical to plaintext. The channel (SSL + BIO
+  pair, ~161 KiB) is freed at switchover — kTLS connections cost ~zero TLS
+  heap while streaming.
+- *Consequences owned*: a post-switch control record (client KeyUpdate,
+  client close_notify) surfaces as a `recv` error → teardown; KeyUpdate-ing
+  clients degrade to reconnect (rare; measured if the fallback counter says
+  otherwise). Our own polite close_notify needs one new ring op —
+  `sendmsg` with a `TLS_SET_RECORD_TYPE` cmsg. Any setsockopt failure
+  (module absent, old kernel, cipher mismatch) falls back to the pair relay
+  and is counted (`zoxy_tls_ktls_active` / `_fallbacks` gauges).
+
+Slices, in order: (1) IO seam — `enable_kernel_tls` + the `sendmsg` op;
+(2) keylog capture + HKDF derivation, unit-tested against the RFC 8448
+TLS 1.3 vectors (no kernel needed); (3) record-boundary counter +
+eligibility rule in the staging path; (4) the ProxyConn switchover +
+end-to-end test (must `error.SkipZigTest` when the environment cannot load
+the `tls` module — CI runners may not allow it; the dev box has
+`CONFIG_TLS=m`); (5) close_notify-over-cmsg + churn bench;
+(6) measurement gate: bands vs the userspace relay, heap occupancy drop,
+CPU per byte.
+
 HTTP/2 & HTTP/3: nothing usable in pure Zig. H2 → `nghttp2` FFI when needed;
 H3/QUIC → `quiche`/`ngtcp2`. Pure-Zig H3 is blocked on QUIC-aware TLS 1.3.
 
@@ -471,8 +526,12 @@ catches the dominant failures), ejection-time multipliers.
      servername callback is the extension point); shrinking the ~161 KiB
      per-connection cost (`SSL_MODE_RELEASE_BUFFERS`, tighter BIO sizing) if
      TLS density ever matters.
-  3. **kTLS fast path** — post-handshake `setsockopt(TLS_TX/TLS_RX)` behind a
-     config flag; relay code untouched; BIO-pair fallback on `ENOTSUPP`.
+  3. **kTLS fast path** — designed 2026-07-04 (§6 "kTLS design"): sans-io
+     handshake unchanged; keylog-callback secrets + `hkdfExpandLabel` install
+     the keys, the zero-records-flowed eligibility rule makes sequence
+     numbers trivially 0/0 (else the connection stays on the pair relay),
+     and the steady-state relay becomes byte-identical to plaintext. Six
+     sub-slices listed there, IO seam first.
   4. **Upstream re-encryption** — client-side TLS to origins, reusing the same
      arena + BIO/kTLS machinery; only after downstream termination is proven.
 - HTTP/2 downstream+upstream: per-stream state machines, **dual-level flow
