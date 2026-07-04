@@ -1326,6 +1326,183 @@ test "h2: drain refuses raced streams and existing ones complete" {
     try testing.expectEqualStrings("still on", event.data.bytes);
 }
 
+test "h2: seeded frame fuzz — no panic, output parses, stream slots drain to zero" {
+    // The simulator excludes OpenSSL and the H2 path is TLS-gated, so this
+    // sans-io engine gets its own seeded adversary instead: random frame
+    // streams delivered in random-sized chunks (partial-IO adversary), with
+    // per-seed invariants — the engine never panics, every byte it emits
+    // parses as a valid frame, and once the harness closes what it opened
+    // no stream slot is left allocated.
+    var seed: u64 = 0;
+    while (seed < 400) : (seed += 1) {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rand = prng.random();
+
+        var input: [8192]u8 = undefined;
+        var len: usize = 0;
+        @memcpy(input[0..h2_frame.client_preface.len], h2_frame.client_preface);
+        len += h2_frame.client_preface.len;
+        len += h2_frame.write_settings(&.{}, input[len..]);
+        var next_id: u31 = 1;
+        const frame_count = rand.intRangeAtMost(u32, 1, 40);
+        for (0..frame_count) |_| {
+            if (len + 512 > input.len) break;
+            len += fuzz_frame(rand, &next_id, input[len..]);
+        }
+
+        var conn = Connection{};
+        var out: [16384]u8 = undefined;
+        var open: [constants.h2_streams_max * 4]u31 = undefined;
+        var open_count: usize = 0;
+        var consumed: usize = 0;
+        var fatal = false;
+        // Deliver in random chunks; drive one frame per call over the window.
+        while (consumed < len and !fatal) {
+            const remaining = len - consumed;
+            const chunk = rand.intRangeAtMost(usize, 1, remaining);
+            const window_end = consumed + chunk;
+            while (consumed < window_end) {
+                const result = conn.drive(input[consumed..window_end], &out);
+                try verify_frames(out[0..result.produced]);
+                consumed += result.consumed;
+                if (result.event) |event| {
+                    fuzz_handle(&conn, event, &open, &open_count, &fatal);
+                }
+                if (result.consumed == 0 and result.event == null) break; // needs more input
+                if (fatal) break;
+            }
+        }
+        // Close everything still open; the engine must then hold no streams.
+        if (!fatal) {
+            for (open[0..open_count]) |stream_id| {
+                if (conn.stream_find(stream_id)) |_| conn.close_stream(stream_id);
+            }
+        } else {
+            // A fatal connection freed nothing; close its survivors directly.
+            for (&conn.streams) |*stream| {
+                if (stream.id != 0) conn.stream_free(stream);
+            }
+        }
+        try testing.expectEqual(@as(u32, 0), conn.streams_active);
+    }
+}
+
+/// Emit one frame biased toward the shapes that exercise the state machine
+/// (valid request HEADERS, DATA, control) with a tail of pure garbage.
+fn fuzz_frame(rand: std.Random, next_id: *u31, out: []u8) usize {
+    const roll = rand.intRangeAtMost(u32, 0, 99);
+    if (roll < 50) { // a valid request HEADERS on a fresh (mostly) id
+        const id = if (rand.boolean()) next_id.* else @as(u31, @intCast(rand.intRangeAtMost(u32, 1, 99) | 1));
+        if (id >= next_id.*) next_id.* = id + 2;
+        var block: [64]u8 = undefined;
+        var block_len: usize = 0;
+        block_len += encode_fuzz_header(":method", "GET", block[block_len..]);
+        block_len += encode_fuzz_header(":scheme", "https", block[block_len..]);
+        block_len += encode_fuzz_header(":path", "/", block[block_len..]);
+        block_len += encode_fuzz_header(":authority", "z", block[block_len..]);
+        var flags: u8 = h2_frame.Flags.end_headers;
+        if (rand.boolean()) flags |= h2_frame.Flags.end_stream;
+        h2_frame.write_frame_header(.{ .length = @intCast(block_len), .type = .headers, .flags = flags, .stream_id = id }, out[0..9]);
+        @memcpy(out[9..][0..block_len], block[0..block_len]);
+        return 9 + block_len;
+    }
+    if (roll < 70) { // DATA on some id
+        const id: u31 = @intCast(rand.intRangeAtMost(u32, 1, 99) | 1);
+        const payload_len = rand.intRangeAtMost(usize, 0, 32);
+        const flags: u8 = if (rand.boolean()) h2_frame.Flags.end_stream else 0;
+        h2_frame.write_frame_header(.{ .length = @intCast(payload_len), .type = .data, .flags = flags, .stream_id = id }, out[0..9]);
+        for (out[9..][0..payload_len]) |*b| b.* = rand.int(u8);
+        return 9 + payload_len;
+    }
+    if (roll < 85) { // a well-formed control frame
+        const id: u31 = @intCast(rand.intRangeAtMost(u32, 1, 99) | 1);
+        switch (rand.intRangeAtMost(u32, 0, 2)) {
+            0 => {
+                h2_frame.write_rst_stream(id, .cancel, out[0..h2_frame.rst_stream_frame_bytes]);
+                return h2_frame.rst_stream_frame_bytes;
+            },
+            1 => {
+                h2_frame.write_window_update(id, rand.intRangeAtMost(u31, 1, 65535), out[0..h2_frame.window_update_frame_bytes]);
+                return h2_frame.window_update_frame_bytes;
+            },
+            else => {
+                var data: [8]u8 = undefined;
+                for (&data) |*b| b.* = rand.int(u8);
+                h2_frame.write_ping(&data, false, out[0..h2_frame.ping_frame_bytes]);
+                return h2_frame.ping_frame_bytes;
+            },
+        }
+    }
+    // Pure garbage: a random-length, random-type, random-id, random-payload frame.
+    const payload_len = rand.intRangeAtMost(usize, 0, 16);
+    h2_frame.write_frame_header(.{
+        .length = @intCast(payload_len),
+        .type = @enumFromInt(rand.int(u8)),
+        .flags = rand.int(u8),
+        .stream_id = @intCast(rand.intRangeAtMost(u32, 0, 99)),
+    }, out[0..9]);
+    for (out[9..][0..payload_len]) |*b| b.* = rand.int(u8);
+    return 9 + payload_len;
+}
+
+fn encode_fuzz_header(name: []const u8, value: []const u8, out: []u8) usize {
+    return hpack.encode_header(name, value, out) catch unreachable;
+}
+
+/// React to an event the way a server harness would, tracking which streams
+/// remain open so the test can close them at the end.
+fn fuzz_handle(conn: *Connection, event: Event, open: []u31, open_count: *usize, fatal: *bool) void {
+    switch (event) {
+        .request => |request| {
+            if (request.end_stream) {
+                conn.close_stream(request.stream_id);
+            } else {
+                open[open_count.*] = request.stream_id;
+                open_count.* += 1;
+            }
+        },
+        .data => |data| {
+            if (data.end_stream and conn.stream_find(data.stream_id) != null) {
+                conn.close_stream(data.stream_id);
+                fuzz_forget(open, open_count, data.stream_id);
+            }
+        },
+        .trailers => |trailers| {
+            if (conn.stream_find(trailers.stream_id) != null) conn.close_stream(trailers.stream_id);
+            fuzz_forget(open, open_count, trailers.stream_id);
+        },
+        .reset => |reset| fuzz_forget(open, open_count, reset.stream_id),
+        .fatal => fatal.* = true,
+        .goaway, .window_open => {},
+    }
+}
+
+fn fuzz_forget(open: []u31, open_count: *usize, stream_id: u31) void {
+    var i: usize = 0;
+    while (i < open_count.*) : (i += 1) {
+        if (open[i] != stream_id) continue;
+        open[i] = open[open_count.* - 1];
+        open_count.* -= 1;
+        return;
+    }
+}
+
+/// Every byte the engine emits must parse as a sequence of whole frames.
+fn verify_frames(bytes: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const frame = (h2_frame.parse_frame(bytes[offset..]) catch |err| {
+            std.debug.print("engine emitted an unparseable frame: {s}\n", .{@errorName(err)});
+            return error.BadEngineOutput;
+        }) orelse {
+            std.debug.print("engine emitted a truncated frame\n", .{});
+            return error.BadEngineOutput;
+        };
+        offset += frame.wire_bytes();
+    }
+    try testing.expectEqual(bytes.len, offset);
+}
+
 test "h2: reset_stream stages RST and frees the slot" {
     var peer = TestPeer{};
     peer.open();
