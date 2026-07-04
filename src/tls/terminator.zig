@@ -342,14 +342,7 @@ fn test_handshaken_pair(client: *Channel, server: *Channel, chunk_bytes: usize) 
     try std.testing.expect(server.handshake_done());
 }
 
-var test_heap_region: [8 * 1024 * 1024]u8 align(hook.Heap.block_align) = undefined;
-
-fn install_test_hook() void {
-    hook.install_memory_hook(&test_heap_region) catch |err| switch (err) {
-        error.AlreadyInstalled => {},
-        error.OpenSslRejectedHook => unreachable, // tests install before other use
-    };
-}
+const install_test_hook = hook.install_memory_hook_for_tests;
 
 test "terminator: server context builds from the fixture identity" {
     install_test_hook();

@@ -11,7 +11,12 @@ const assert = std.debug.assert;
 
 const constants = @import("../constants.zig");
 const Metrics = @import("metrics.zig").Metrics;
+const tls = @import("../tls/openssl.zig");
 const Ip4Address = std.Io.net.Ip4Address;
+
+/// Gauge lines appended for the TLS hook heap when TLS is configured;
+/// counted into the body-size comptime check alongside the Metrics fields.
+const tls_heap_gauge_count = 5;
 
 /// Sized for every counter in `Metrics` plus one labeled series per worker
 /// slot; the comptime check in `serve_one` keeps this honest as counters grow.
@@ -90,10 +95,12 @@ pub const Admin = struct {
         var body_buf: [body_bytes_max]u8 = undefined;
         comptime { // every counter line must fit: name prefix + u64 digits + newline
             const fields = @typeInfo(Metrics).@"struct".fields;
-            assert((fields.len + constants.workers_max) * 64 <= body_bytes_max);
+            const lines = fields.len + constants.workers_max + tls_heap_gauge_count;
+            assert(lines * 64 <= body_bytes_max);
         }
         var body_writer = std.Io.Writer.fixed(&body_buf);
         admin.metrics.write_text(&body_writer) catch return;
+        write_tls_heap_stats(&body_writer) catch return;
         const body = body_writer.buffered();
         assert(body.len > 0);
         assert(body.len <= body_bytes_max);
@@ -107,6 +114,21 @@ pub const Admin = struct {
         write_all(fd, body);
     }
 };
+
+/// The TLS hook heap's gauges (docs/DESIGN.md §6) — absent entirely on a
+/// plaintext deployment (no hook installed). `live` is the FFI analogue of
+/// pool occupancy; `rejections` counts load-shed OpenSSL operations; carved
+/// vs capacity is how much of `tls_heap_bytes` has ever been needed.
+fn write_tls_heap_stats(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const stats = tls.memory_hook_stats_if_installed() orelse return;
+    assert(stats.region_bytes > 0); // an installed hook has a region
+    assert(stats.carved_bytes <= stats.region_bytes);
+    try writer.print("zoxy_tls_heap_live {d}\n", .{stats.live_count});
+    try writer.print("zoxy_tls_heap_allocations_total {d}\n", .{stats.allocation_count});
+    try writer.print("zoxy_tls_heap_rejections_total {d}\n", .{stats.rejection_count});
+    try writer.print("zoxy_tls_heap_carved_bytes {d}\n", .{stats.carved_bytes});
+    try writer.print("zoxy_tls_heap_capacity_bytes {d}\n", .{stats.region_bytes});
+}
 
 /// Blocking best-effort write of the whole buffer; gives up on any error.
 fn write_all(fd: posix.socket_t, bytes: []const u8) void {
@@ -132,6 +154,9 @@ fn sockaddr_in(address: Ip4Address) linux.sockaddr.in {
 // ---- tests ----------------------------------------------------------------
 
 test "admin: serves the metrics exposition over HTTP" {
+    // The mod test binary shares one process-global hook; with it installed
+    // the exposition must include the TLS heap gauges.
+    tls.install_memory_hook_for_tests();
     var metrics = Metrics{};
     metrics.requests.add(7);
     metrics.accepted.add(2);
@@ -170,4 +195,6 @@ test "admin: serves the metrics exposition over HTTP" {
     try std.testing.expect(std.mem.indexOf(u8, response, "zoxy_requests 7\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "zoxy_accepted 2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "zoxy_rejected 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "zoxy_tls_heap_live ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "zoxy_tls_heap_capacity_bytes ") != null);
 }

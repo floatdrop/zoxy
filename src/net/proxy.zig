@@ -2288,15 +2288,7 @@ const TlsTestClient = struct {
     }
 };
 
-var tls_proxy_test_heap: [16 * 1024 * 1024]u8 align(16) = undefined;
-
-fn install_proxy_test_hook() void {
-    const hook = @import("../tls/openssl.zig");
-    hook.install_memory_hook(&tls_proxy_test_heap) catch |err| switch (err) {
-        error.AlreadyInstalled => {}, // another test file's hook won the race
-        error.OpenSslRejectedHook => unreachable,
-    };
-}
+const install_proxy_test_hook = @import("../tls/openssl.zig").install_memory_hook_for_tests;
 
 test "proxy: terminates TLS end to end — handshake, relay, heap drain" {
     const gpa = std.testing.allocator;

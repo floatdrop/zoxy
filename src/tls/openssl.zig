@@ -74,6 +74,8 @@ pub const HeapStats = struct {
     allocation_count: u64,
     rejection_count: u64,
     carved_bytes: usize,
+    /// The reserved region's capacity — carved/capacity is heap pressure.
+    region_bytes: usize,
 };
 
 pub fn memory_hook_stats() HeapStats {
@@ -85,7 +87,15 @@ pub fn memory_hook_stats() HeapStats {
         .allocation_count = global_heap.allocation_count,
         .rejection_count = global_heap.rejection_count,
         .carved_bytes = global_heap.carved_bytes,
+        .region_bytes = global_heap.region.len,
     };
+}
+
+/// For observers that run whether or not TLS is configured (the admin
+/// exposition): null when no hook is installed.
+pub fn memory_hook_stats_if_installed() ?HeapStats {
+    if (!hook_installed) return null;
+    return memory_hook_stats();
 }
 
 fn hook_malloc(bytes: usize, file: [*c]const u8, line: c_int) callconv(.c) ?*anyopaque {
@@ -255,21 +265,29 @@ pub extern fn EVP_PKEY_free(key: *EVP_PKEY) void;
 extern fn X509_check_private_key(certificate: *const X509, key: *const EVP_PKEY) c_int;
 pub extern fn ERR_clear_error() void;
 
+/// Test-only: the hook installs once per process, so every test file that
+/// touches OpenSSL funnels through this one shared region (sized for lazy
+/// library init plus a handful of live handshakes).
+pub fn install_memory_hook_for_tests() void {
+    install_memory_hook(&test_heap_region) catch |err| switch (err) {
+        error.AlreadyInstalled => {}, // another test file got here first
+        // Only reachable if OpenSSL ran before any installer — a test
+        // ordering bug, not a runtime condition.
+        error.OpenSslRejectedHook => unreachable,
+    };
+    assert(memory_hook_installed());
+}
+
+var test_heap_region: [16 * 1024 * 1024]u8 align(Heap.block_align) = undefined;
+
 // -- tests --------------------------------------------------------------
 
 const test_certificate_pem = @embedFile("testdata/certificate.pem");
 const test_private_key_pem = @embedFile("testdata/private_key.pem");
 const test_other_key_pem = @embedFile("testdata/other_key.pem");
 
-/// The hook installs once per process, so every test funnels through this
-/// shared region (sized for OpenSSL's lazy library init plus PEM work).
-var test_heap_region: [4 * 1024 * 1024]u8 align(Heap.block_align) = undefined;
-
 fn install_test_hook() !void {
-    install_memory_hook(&test_heap_region) catch |err| switch (err) {
-        error.AlreadyInstalled => {}, // another test got here first
-        error.OpenSslRejectedHook => return err,
-    };
+    install_memory_hook_for_tests();
     try std.testing.expect(memory_hook_installed());
 }
 
