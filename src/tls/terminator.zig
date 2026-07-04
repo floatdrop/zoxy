@@ -18,6 +18,37 @@ const constants = @import("../constants.zig");
 /// slice; preference order is ours (server-chosen), first match wins.
 pub const alpn_http1 = "http/1.1";
 
+/// A connection's TLS 1.3 application traffic secrets, captured by the
+/// process-wide keylog callback while the handshake derives them (kTLS
+/// slice 2, docs/DESIGN.md §6). Armed per connection via
+/// `Channel.capture_secrets`; must sit at a stable address from arming
+/// until the channel is freed — OpenSSL holds a raw pointer to it.
+pub const TrafficSecrets = struct {
+    client: [secret_bytes_max]u8 = undefined,
+    client_length: u8 = 0,
+    server: [secret_bytes_max]u8 = undefined,
+    server_length: u8 = 0,
+
+    /// SHA-384 suites have the largest secrets.
+    pub const secret_bytes_max = 48;
+
+    pub fn complete(secrets: *const TrafficSecrets) bool {
+        return secrets.client_length > 0 and secrets.server_length > 0;
+    }
+
+    pub fn client_secret(secrets: *const TrafficSecrets) []const u8 {
+        assert(secrets.client_length > 0);
+        assert(secrets.client_length <= secret_bytes_max);
+        return secrets.client[0..secrets.client_length];
+    }
+
+    pub fn server_secret(secrets: *const TrafficSecrets) []const u8 {
+        assert(secrets.server_length > 0);
+        assert(secrets.server_length <= secret_bytes_max);
+        return secrets.server[0..secrets.server_length];
+    }
+};
+
 /// A process-lifetime SSL_CTX: the identity plus protocol policy every
 /// connection's SSL is stamped from. Startup-only; workers treat it as
 /// immutable (session cache and tickets are off, so OpenSSL does not
@@ -94,12 +125,54 @@ pub const Context = struct {
             null,
         );
         if (openssl.SSL_CTX_set_num_tickets(context, 0) != 1) return error.ContextSetupFailed;
+        // Keylog feeds the kTLS switchover (traffic secrets -> kernel keys).
+        // Registered unconditionally: the callback is inert for connections
+        // that never arm capture_secrets.
+        openssl.SSL_CTX_set_keylog_callback(context, keylog_capture);
     }
 
     pub fn deinit(context: Context) void {
         openssl.SSL_CTX_free(context.context);
     }
 };
+
+/// OpenSSL's reserved application-data ex_data slot (the SSL_set_app_data
+/// macro's index): holds the connection's `*TrafficSecrets` when capture
+/// is armed, null otherwise.
+const application_data_index: c_int = 0;
+
+/// The process-wide keylog callback: routes the NSS-format line
+/// ("<label> <client_random_hex> <secret_hex>") into the connection's
+/// armed `TrafficSecrets`. Runs on whichever worker drives the handshake;
+/// no shared state is touched.
+fn keylog_capture(ssl: *const openssl.SSL, line: [*:0]const u8) callconv(.c) void {
+    const data = openssl.SSL_get_ex_data(ssl, application_data_index) orelse return;
+    const secrets: *TrafficSecrets = @ptrCast(@alignCast(data));
+    store_keylog_line(secrets, std.mem.span(line));
+}
+
+fn store_keylog_line(secrets: *TrafficSecrets, line: []const u8) void {
+    assert(line.len < 1024); // keylog lines are label + random + secret
+    var parts = std.mem.splitScalar(u8, line, ' ');
+    const label = parts.next() orelse return;
+    _ = parts.next() orelse return; // client random: identifies, we already know
+    const secret_hex = parts.next() orelse return;
+    if (parts.next() != null) return; // malformed: extra fields
+    if (std.mem.eql(u8, label, "CLIENT_TRAFFIC_SECRET_0")) {
+        secrets.client_length = decode_secret(&secrets.client, secret_hex);
+    } else if (std.mem.eql(u8, label, "SERVER_TRAFFIC_SECRET_0")) {
+        secrets.server_length = decode_secret(&secrets.server, secret_hex);
+    }
+    // Handshake/exporter secrets and unknown labels fall through untouched.
+}
+
+fn decode_secret(target: *[TrafficSecrets.secret_bytes_max]u8, hex: []const u8) u8 {
+    if (hex.len == 0 or hex.len % 2 != 0) return 0;
+    if (hex.len / 2 > target.len) return 0;
+    const decoded = std.fmt.hexToBytes(target, hex) catch return 0;
+    assert(decoded.len == hex.len / 2);
+    return @intCast(decoded.len);
+}
 
 /// Server-side ALPN selection: pick `http/1.1` from the client's list, or
 /// answer "no overlap" (NOACK) — the handshake then completes without ALPN
@@ -242,6 +315,26 @@ pub const Channel = struct {
 
     pub fn handshake_done(channel: *const Channel) bool {
         return openssl.SSL_is_init_finished(channel.ssl) != 0;
+    }
+
+    /// Arm keylog capture: the handshake writes this connection's traffic
+    /// secrets into `secrets` as it derives them. Must be called before the
+    /// handshake runs, and `secrets` must keep its address until the
+    /// channel is freed (OpenSSL holds the raw pointer).
+    pub fn capture_secrets(channel: *Channel, secrets: *TrafficSecrets) void {
+        assert(!channel.handshake_done()); // arming afterwards captures nothing
+        assert(!secrets.complete()); // a fresh capture target
+        const stored = openssl.SSL_set_ex_data(channel.ssl, application_data_index, secrets);
+        assert(stored == 1);
+    }
+
+    /// The negotiated cipher suite's IANA id (0x1301, 0x1302, ...).
+    pub fn negotiated_cipher_suite(channel: *const Channel) u16 {
+        assert(channel.handshake_done());
+        const cipher = openssl.SSL_get_current_cipher(channel.ssl).?; // non-null post-handshake
+        const suite = openssl.SSL_CIPHER_get_protocol_id(cipher);
+        assert(suite != 0);
+        return suite;
     }
 
     /// The ALPN protocol both sides agreed on, if any. Valid post-handshake.
@@ -452,6 +545,47 @@ test "terminator: close_notify reads as clean TLS EOF" {
     try pump(&client, &server, constants.tls_bio_pair_bytes);
     var buffer: [64]u8 = undefined;
     try std.testing.expectEqual(Channel.ReadResult.closed, server.read_plaintext(&buffer));
+}
+
+test "terminator: keylog capture yields identical kernel parameters on both ends" {
+    const kernel = @import("kernel.zig");
+    install_test_hook();
+    const server_context = try Context.init_server(test_certificate_pem, test_private_key_pem);
+    defer server_context.deinit();
+    const client_context = try Context.init_client();
+    defer client_context.deinit();
+
+    var server = try Channel.init(&server_context);
+    defer server.deinit();
+    var client = try Channel.init(&client_context);
+    defer client.deinit();
+    var server_secrets = TrafficSecrets{};
+    var client_secrets = TrafficSecrets{};
+    server.capture_secrets(&server_secrets);
+    client.capture_secrets(&client_secrets);
+
+    try test_handshaken_pair(&client, &server, constants.tls_bio_pair_bytes);
+    try std.testing.expect(server_secrets.complete());
+    try std.testing.expect(client_secrets.complete());
+
+    const suite = server.negotiated_cipher_suite();
+    try std.testing.expectEqual(suite, client.negotiated_cipher_suite());
+    try std.testing.expect(suite == kernel.cipher_suite_aes_128_gcm_sha256 or
+        suite == kernel.cipher_suite_aes_256_gcm_sha384);
+
+    // Both ends captured independently through their own callbacks; the
+    // derived kernel parameters must agree per direction — the server's TX
+    // (server secret) is the client's RX, and vice versa.
+    const server_tx = try kernel.derive_crypto_parameters(suite, server_secrets.server_secret());
+    const client_rx = try kernel.derive_crypto_parameters(suite, client_secrets.server_secret());
+    try std.testing.expectEqualSlices(u8, server_tx.bytes(), client_rx.bytes());
+
+    const server_rx = try kernel.derive_crypto_parameters(suite, server_secrets.client_secret());
+    const client_tx = try kernel.derive_crypto_parameters(suite, client_secrets.client_secret());
+    try std.testing.expectEqualSlices(u8, server_rx.bytes(), client_tx.bytes());
+
+    // The two directions must never share keys.
+    try std.testing.expect(!std.mem.eql(u8, server_tx.bytes(), server_rx.bytes()));
 }
 
 test "terminator: channels drain the hook heap to baseline" {

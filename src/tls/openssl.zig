@@ -21,6 +21,7 @@ pub const EVP_PKEY = opaque {};
 pub const SSL_CTX = opaque {};
 pub const SSL = opaque {};
 pub const SSL_METHOD = opaque {};
+pub const SSL_CIPHER = opaque {};
 
 // Values verified against the vendored OpenSSL 3.3.2 headers (ssl.h.in,
 // tls1.h, prov_ssl.h) — mirrored here because the C names are macros with no
@@ -213,6 +214,9 @@ pub extern fn SSL_CTX_set_alpn_select_cb(
     callback: *const AlpnSelectCallback,
     argument: ?*anyopaque,
 ) void;
+/// void (*cb)(const SSL *ssl, const char *line) — NSS key-log format lines.
+pub const KeylogCallback = fn (ssl: *const SSL, line: [*:0]const u8) callconv(.c) void;
+pub extern fn SSL_CTX_set_keylog_callback(context: *SSL_CTX, callback: *const KeylogCallback) void;
 
 pub extern fn SSL_new(context: *SSL_CTX) ?*SSL;
 pub extern fn SSL_free(ssl: *SSL) void;
@@ -229,6 +233,13 @@ pub extern fn SSL_shutdown(ssl: *SSL) c_int;
 /// Returns 0 on success (inverted vs the rest of the API).
 pub extern fn SSL_set_alpn_protos(ssl: *SSL, protocols: [*]const u8, length: c_uint) c_int;
 pub extern fn SSL_get0_alpn_selected(ssl: *const SSL, data: *?[*]const u8, length: *c_uint) void;
+/// ex_data index 0 is the traditional application-data slot (what the
+/// SSL_set_app_data macro wraps).
+pub extern fn SSL_set_ex_data(ssl: *SSL, index: c_int, data: ?*anyopaque) c_int;
+pub extern fn SSL_get_ex_data(ssl: *const SSL, index: c_int) ?*anyopaque;
+pub extern fn SSL_get_current_cipher(ssl: *const SSL) ?*const SSL_CIPHER;
+/// The IANA cipher-suite id (0x1301 = TLS_AES_128_GCM_SHA256, ...).
+pub extern fn SSL_CIPHER_get_protocol_id(cipher: *const SSL_CIPHER) u16;
 
 pub extern fn BIO_new_bio_pair(
     bio1: *?*BIO,

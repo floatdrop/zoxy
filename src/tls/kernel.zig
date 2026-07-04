@@ -34,6 +34,10 @@ pub const record_type_application_data: u8 = 23;
 /// A close_notify alert body: level warning(1), description close_notify(0).
 pub const alert_close_notify = [2]u8{ 1, 0 };
 
+/// IANA TLS 1.3 cipher-suite ids (what SSL_CIPHER_get_protocol_id returns).
+pub const cipher_suite_aes_128_gcm_sha256: u16 = 0x1301;
+pub const cipher_suite_aes_256_gcm_sha384: u16 = 0x1302;
+
 /// struct tls_crypto_info.
 pub const CryptoInfo = extern struct {
     version: u16,
@@ -71,6 +75,74 @@ comptime {
     assert(@offsetOf(CryptoInfoAesGcm256, "record_sequence") == 48);
 }
 
+/// The kernel install parameters for one direction, ready for
+/// `IO.enable_kernel_tls`. A tagged union rather than raw bytes so the
+/// cipher is visible at the call site and in asserts.
+pub const CryptoParameters = union(enum) {
+    aes_gcm_128: CryptoInfoAesGcm128,
+    aes_gcm_256: CryptoInfoAesGcm256,
+
+    /// The raw struct bytes setsockopt wants.
+    pub fn bytes(parameters: *const CryptoParameters) []const u8 {
+        return switch (parameters.*) {
+            .aes_gcm_128 => |*info| std.mem.asBytes(info),
+            .aes_gcm_256 => |*info| std.mem.asBytes(info),
+        };
+    }
+};
+
+pub const DeriveError = error{
+    /// Not a cipher suite we hand to the kernel (ChaCha20 is a later add).
+    CipherSuiteUnsupported,
+    /// The traffic secret's length does not match the suite's hash.
+    SecretLengthInvalid,
+};
+
+/// RFC 8446 §7.3: key = HKDF-Expand-Label(secret, "key", "", key_length),
+/// iv = HKDF-Expand-Label(secret, "iv", "", 12). The kernel wants the
+/// 12-byte IV split as salt (first 4 bytes) + iv (last 8). The record
+/// sequence is zero by construction: the §6 eligibility rule installs
+/// these parameters only when no application record has flowed.
+pub fn derive_crypto_parameters(
+    cipher_suite: u16,
+    traffic_secret: []const u8,
+) DeriveError!CryptoParameters {
+    assert(traffic_secret.len > 0);
+    switch (cipher_suite) {
+        cipher_suite_aes_128_gcm_sha256 => {
+            const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
+            if (traffic_secret.len != Hkdf.prk_length) return error.SecretLengthInvalid;
+            const secret: [Hkdf.prk_length]u8 = traffic_secret[0..Hkdf.prk_length].*;
+            const key = std.crypto.tls.hkdfExpandLabel(Hkdf, secret, "key", "", 16);
+            const iv = std.crypto.tls.hkdfExpandLabel(Hkdf, secret, "iv", "", 12);
+            return .{ .aes_gcm_128 = .{
+                .info = .{ .version = version_1_3, .cipher_type = cipher_aes_gcm_128 },
+                .iv = iv[4..12].*,
+                .key = key,
+                .salt = iv[0..4].*,
+                .record_sequence = @splat(0),
+            } };
+        },
+        cipher_suite_aes_256_gcm_sha384 => {
+            const Hkdf = HkdfSha384;
+            if (traffic_secret.len != Hkdf.prk_length) return error.SecretLengthInvalid;
+            const secret: [Hkdf.prk_length]u8 = traffic_secret[0..Hkdf.prk_length].*;
+            const key = std.crypto.tls.hkdfExpandLabel(Hkdf, secret, "key", "", 32);
+            const iv = std.crypto.tls.hkdfExpandLabel(Hkdf, secret, "iv", "", 12);
+            return .{ .aes_gcm_256 = .{
+                .info = .{ .version = version_1_3, .cipher_type = cipher_aes_gcm_256 },
+                .iv = iv[4..12].*,
+                .key = key,
+                .salt = iv[0..4].*,
+                .record_sequence = @splat(0),
+            } };
+        },
+        else => return error.CipherSuiteUnsupported,
+    }
+}
+
+const HkdfSha384 = std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384);
+
 /// One TLS_SET_RECORD_TYPE control message, laid out for `msghdr.control`
 /// (cmsghdr + one type byte, padded to cmsg alignment). Build once next to
 /// the iovec; both must outlive the send_message completion.
@@ -98,6 +170,72 @@ comptime {
 }
 
 // ---- tests ----------------------------------------------------------------
+
+test "kernel tls: derivation matches the RFC 8448 1-RTT vectors (server direction)" {
+    // RFC 8448 §3, TLS_AES_128_GCM_SHA256: server application_traffic_secret_0.
+    var secret: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(
+        &secret,
+        "a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643",
+    );
+    const parameters = try derive_crypto_parameters(cipher_suite_aes_128_gcm_sha256, &secret);
+    const info = parameters.aes_gcm_128;
+    try std.testing.expectEqual(version_1_3, info.info.version);
+
+    var expected_key: [16]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected_key, "9f02283b6c9c07efc26bb9f2ac92e356");
+    try std.testing.expectEqualSlices(u8, &expected_key, &info.key);
+
+    // RFC iv "cf782b88dd83549aadf1e984": salt is the first 4, iv the last 8.
+    var expected_salt: [4]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected_salt, "cf782b88");
+    var expected_iv: [8]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected_iv, "dd83549aadf1e984");
+    try std.testing.expectEqualSlices(u8, &expected_salt, &info.salt);
+    try std.testing.expectEqualSlices(u8, &expected_iv, &info.iv);
+    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 8, &info.record_sequence);
+}
+
+test "kernel tls: derivation matches the RFC 8448 1-RTT vectors (client direction)" {
+    var secret: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(
+        &secret,
+        "9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5",
+    );
+    const parameters = try derive_crypto_parameters(cipher_suite_aes_128_gcm_sha256, &secret);
+    const info = parameters.aes_gcm_128;
+
+    var expected_key: [16]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected_key, "17422dda596ed5d9acd890e3c63f5051");
+    try std.testing.expectEqualSlices(u8, &expected_key, &info.key);
+
+    var expected_salt: [4]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected_salt, "5b78923d");
+    var expected_iv: [8]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected_iv, "ee08579033e523d9");
+    try std.testing.expectEqualSlices(u8, &expected_salt, &info.salt);
+    try std.testing.expectEqualSlices(u8, &expected_iv, &info.iv);
+}
+
+test "kernel tls: derivation rejects unknown suites and wrong secret lengths" {
+    const secret_32 = [_]u8{0xab} ** 32;
+    try std.testing.expectError(
+        error.CipherSuiteUnsupported,
+        derive_crypto_parameters(0x1303, &secret_32), // ChaCha20: not yet
+    );
+    try std.testing.expectError(
+        error.SecretLengthInvalid,
+        derive_crypto_parameters(cipher_suite_aes_256_gcm_sha384, &secret_32), // needs 48
+    );
+    const secret_48 = [_]u8{0xcd} ** 48;
+    try std.testing.expectError(
+        error.SecretLengthInvalid,
+        derive_crypto_parameters(cipher_suite_aes_128_gcm_sha256, &secret_48), // needs 32
+    );
+    // The 256 path derives with the right length (vector-checked above for 128).
+    const parameters = try derive_crypto_parameters(cipher_suite_aes_256_gcm_sha384, &secret_48);
+    try std.testing.expectEqual(@as(usize, 56), parameters.bytes().len);
+}
 
 const io_mod = @import("../io/io.zig");
 const IO = io_mod.IO;
