@@ -84,6 +84,16 @@ pub const relay_buf_bytes: usize = 16 * 1024;
 /// frame's payload always fits a relay buffer.
 pub const h2_frame_payload_bytes_max: u24 = 16384;
 
+/// HPACK dynamic-table capacity we advertise (SETTINGS_HEADER_TABLE_SIZE)
+/// and reserve, per decoder — the RFC 7541 default. Peer size updates may
+/// shrink the table, never exceed this.
+pub const h2_header_table_bytes: u32 = 4096;
+
+/// Decoded header-list bound we advertise (SETTINGS_MAX_HEADER_LIST_SIZE)
+/// and enforce: the sum over fields of name + value + 32 (RFC 9113 §10.5.1).
+/// Matches the HTTP/1.1 head budget (`read_buf_bytes`).
+pub const h2_header_list_bytes_max: u32 = 16 * 1024;
+
 /// Bounds inside the chunked transfer-coding decoder (http/chunked.zig):
 /// hex size digits (16 spans a full u64), extension bytes per chunk, and
 /// total trailer-section bytes. Beyond any of these the message is malformed.
