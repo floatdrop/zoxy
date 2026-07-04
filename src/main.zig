@@ -37,6 +37,9 @@ pub fn main(init: std.process.Init) !void {
     };
     const router = Router.init(&cfg);
 
+    const worker_count = std.Thread.getCpuCount() catch 1;
+    assert(worker_count >= 1); // one worker thread is spawned even if the count fails
+
     // TLS termination (docs/DESIGN.md §6): reserve the FFI heap, install the
     // process-global memory hook (must precede any other OpenSSL call), and
     // build the shared server context — an unloadable identity fails startup,
@@ -44,8 +47,13 @@ pub fn main(init: std.process.Init) !void {
     // cache and tickets off), so one instance serves every worker.
     var tls_context: ?*const zoxy.terminator.Context = null;
     if (cfg.tls) |tls_config| {
+        // Sized so every connection slot on every worker can be a TLS
+        // connection (per-connection cost measured; see constants.zig).
+        // Virtual reservation: pages are touched only as connections carve.
+        const tls_heap_bytes = constants.tls_heap_base_bytes +
+            constants.tls_heap_per_connection_bytes * constants.connections_max * worker_count;
         const alignment = comptime std.mem.Alignment.fromByteUnits(zoxy.tls.Heap.block_align);
-        const region = try gpa.alignedAlloc(u8, alignment, constants.tls_heap_bytes);
+        const region = try gpa.alignedAlloc(u8, alignment, tls_heap_bytes);
         try zoxy.tls.install_memory_hook(region);
         const context = try gpa.create(zoxy.terminator.Context);
         context.* = load_tls_identity(init.io, gpa, tls_config) catch |err| {
@@ -59,9 +67,6 @@ pub fn main(init: std.process.Init) !void {
         tls_context = context;
         std.log.info("zoxy tls listener: {s}", .{tls_config.certificate_file});
     }
-
-    const worker_count = std.Thread.getCpuCount() catch 1;
-    assert(worker_count >= 1); // one worker thread is spawned even if the count fails
 
     // Shared counters (atomic) and per-worker access logs, reserved up front.
     var metrics: Metrics = .{};

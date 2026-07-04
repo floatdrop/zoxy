@@ -118,7 +118,7 @@ pub const Admin = struct {
 /// The TLS hook heap's gauges (docs/DESIGN.md §6) — absent entirely on a
 /// plaintext deployment (no hook installed). `live` is the FFI analogue of
 /// pool occupancy; `rejections` counts load-shed OpenSSL operations; carved
-/// vs capacity is how much of `tls_heap_bytes` has ever been needed.
+/// vs capacity is how much of the reserved TLS heap has ever been needed.
 fn write_tls_heap_stats(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     const stats = tls.memory_hook_stats_if_installed() orelse return;
     assert(stats.region_bytes > 0); // an installed hook has a region

@@ -104,12 +104,20 @@ pub const workers_max: usize = 64;
 /// 100% CPU for as long as the condition persists.
 pub const accept_retry_delay_ns: u63 = 100 * std.time.ns_per_ms;
 
-/// The heap behind OpenSSL's process-global memory hook, reserved at startup
-/// only when TLS is configured. Exhaustion fails the OpenSSL operation and
-/// that handshake is rejected — load-shedding, never OOM, never growth.
-/// Sized generously for now; Phase 3's termination slice measures actual
-/// per-handshake usage and re-derives this from connections_max * workers.
-pub const tls_heap_bytes: usize = 64 * 1024 * 1024;
+/// The heap behind OpenSSL's process-global memory hook is reserved at
+/// startup (TLS configured only) as
+///   tls_heap_base_bytes + tls_heap_per_connection_bytes * connections_max * workers.
+/// Exhaustion fails the OpenSSL operation and that handshake is rejected —
+/// load-shedding, never OOM, never growth. The reservation is virtual;
+/// pages are touched only as the heap carves (measured RSS follows load).
+///
+/// Measured 2026-07-04 (zoxy_tls_heap_carved_bytes, TLS 1.3, EC P-256):
+/// one live TLS connection costs ~161 KiB of heap (consistent at 64 and
+/// 256 concurrent connections: 11.1 MiB and 42.2 MiB carved) — the BIO
+/// pair plus OpenSSL's per-SSL state, doubled-ish by power-of-two class
+/// rounding. Process baseline (library init + SSL_CTX) was 0.9 MiB.
+pub const tls_heap_base_bytes: usize = 8 * 1024 * 1024;
+pub const tls_heap_per_connection_bytes: usize = 192 * 1024;
 
 /// Bounds a TLS certificate/private-key PEM file read at startup. Real cert
 /// chains are a few KB; anything near this limit is a misconfiguration. Must

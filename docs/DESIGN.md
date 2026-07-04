@@ -455,9 +455,22 @@ catches the dominant failures), ejection-time multipliers.
      The hook heap exposes gauges via /metrics (`zoxy_tls_heap_*`);
      measured churn high-water: ~10.6 MiB carved of 64 MiB at 64 concurrent
      full-handshake connections, live-block count flat across runs (no
-     per-connection leakage). Still deferred: SNI multi-cert (single
-     identity in config today; the servername callback is the extension
-     point) and re-deriving `tls_heap_bytes` from measured usage.
+     per-connection leakage).
+     Measurement gate (2026-07-04, band procedure, R=20k c=64 ×3 alternating
+     runs): steady-state TLS ≈ plaintext — throughput identical (~19.92k),
+     p50 139–148µs vs 153–157µs, p99 681–788µs vs 622–675µs. The TLS p99.9
+     band sat at a constant ~32.5ms vs ~5.5ms plaintext; a 30s run shrank it
+     to 13.3ms (burst moved to p99.99), proving it is the *startup handshake
+     burst* under coordinated-omission correction, not a steady-state stall —
+     amortized by connection lifetime; session resumption would shrink the
+     burst itself. Heap: ~161 KiB per live TLS connection (consistent at
+     c=64/c=256), 0.9 MiB process baseline → the reservation is now derived
+     at startup as base + per_connection × connections_max × workers
+     (constants.zig; virtual, pages touch as connections carve). Still
+     deferred: SNI multi-cert (single identity in config today; the
+     servername callback is the extension point); shrinking the ~161 KiB
+     per-connection cost (`SSL_MODE_RELEASE_BUFFERS`, tighter BIO sizing) if
+     TLS density ever matters.
   3. **kTLS fast path** — post-handshake `setsockopt(TLS_TX/TLS_RX)` behind a
      config flag; relay code untouched; BIO-pair fallback on `ENOTSUPP`.
   4. **Upstream re-encryption** — client-side TLS to origins, reusing the same
