@@ -21,6 +21,9 @@ pub const h1 = @import("http/h1.zig");
 /// Chunked transfer-coding decoder (finds message ends; relays verbatim).
 pub const chunked = @import("http/chunked.zig");
 
+/// Sans-io HTTP/2 frame codec (docs/DESIGN.md §7 Phase 5, slice 1).
+pub const h2_frame = @import("http/h2_frame.zig");
+
 /// Static proxy configuration (docs/DESIGN.md §7).
 pub const config = @import("config.zig");
 
@@ -77,6 +80,7 @@ test {
     _ = handoff;
     _ = h1;
     _ = chunked;
+    _ = h2_frame;
     _ = config;
     _ = @import("proxy/router.zig");
     _ = balancer;

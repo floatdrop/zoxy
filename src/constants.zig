@@ -77,6 +77,13 @@ pub const health_tick_ns: u63 = 100 * std.time.ns_per_ms;
 /// Per-direction relay buffer for streaming request bodies and responses.
 pub const relay_buf_bytes: usize = 16 * 1024;
 
+/// HTTP/2 frame payload bound: the SETTINGS_MAX_FRAME_SIZE we advertise to
+/// peers and enforce on every received frame header (a longer frame is a
+/// FRAME_SIZE_ERROR connection error before its payload arrives). The
+/// RFC 9113 minimum-and-default 16 KiB, matching `relay_buf_bytes` so one
+/// frame's payload always fits a relay buffer.
+pub const h2_frame_payload_bytes_max: u24 = 16384;
+
 /// Bounds inside the chunked transfer-coding decoder (http/chunked.zig):
 /// hex size digits (16 spans a full u64), extension bytes per chunk, and
 /// total trailer-section bytes. Beyond any of these the message is malformed.

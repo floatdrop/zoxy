@@ -95,6 +95,7 @@ Consequences that bite if you forget them:
 | `src/net/pool.zig` | generic `Pool(T)` over an **intrusive free list** (requires `T.free_next: ?*T`); exhaustion rejects, never grows |
 | `src/http/h1.zig` | zero-copy HTTP/1.1 request+response parsers, RFC 9112 §6.3 body-framing decisions (smuggling shapes rejected), `BodyFramer` message-end tracker |
 | `src/http/chunked.zig` | incremental chunked-coding decoder — finds message ends, transforms nothing |
+| `src/http/h2_frame.zig` | sans-io HTTP/2 frame codec (Phase 5, slice 1): client preface, 9-byte header parse/write, per-type structural rules (fixed sizes, stream-id zero/nonzero, advertised frame-size bound), SETTINGS/PING/RST_STREAM/GOAWAY/WINDOW_UPDATE payloads; stream/connection semantics live in later slices |
 | `src/proxy/upstream_pool.zig` | per-worker idle upstream connections, fixed slots keyed by endpoint |
 | `src/config.zig` | JSON config → immutable `Config` (owns an arena); the **only** place allocation is expected. Per-cluster resilience blocks resolve into a `ResiliencePolicy` here (ms→ns, validated) |
 | `src/proxy/router.zig`, `src/proxy/balancer.zig` | first-match host/path routing; P2C least-request balancing over per-worker in-flight counts and the Maglev consistent-hash pick (`pick_hashed`: deterministic forward-walk fallback, soft retry exclusion), fail-open when no endpoint is available |
