@@ -37,14 +37,18 @@ pub fn main(init: std.process.Init) !void {
     };
     const router = Router.init(&cfg);
 
-    // TLS foundation (docs/DESIGN.md §6): reserve the FFI heap, install the
+    // TLS termination (docs/DESIGN.md §6): reserve the FFI heap, install the
     // process-global memory hook (must precede any other OpenSSL call), and
-    // fail startup on an unloadable identity — not on the first handshake.
+    // build the shared server context — an unloadable identity fails startup,
+    // not the first handshake. The context is immutable once built (session
+    // cache and tickets off), so one instance serves every worker.
+    var tls_context: ?*const zoxy.terminator.Context = null;
     if (cfg.tls) |tls_config| {
         const alignment = comptime std.mem.Alignment.fromByteUnits(zoxy.tls.Heap.block_align);
         const region = try gpa.alignedAlloc(u8, alignment, constants.tls_heap_bytes);
         try zoxy.tls.install_memory_hook(region);
-        load_tls_identity(init.io, gpa, tls_config) catch |err| {
+        const context = try gpa.create(zoxy.terminator.Context);
+        context.* = load_tls_identity(init.io, gpa, tls_config) catch |err| {
             std.log.err("zoxy: cannot load tls identity ({s} / {s}): {s}", .{
                 tls_config.certificate_file,
                 tls_config.private_key_file,
@@ -52,7 +56,8 @@ pub fn main(init: std.process.Init) !void {
             });
             return err;
         };
-        std.log.info("zoxy tls identity validated: {s}", .{tls_config.certificate_file});
+        tls_context = context;
+        std.log.info("zoxy tls listener: {s}", .{tls_config.certificate_file});
     }
 
     const worker_count = std.Thread.getCpuCount() catch 1;
@@ -79,7 +84,7 @@ pub fn main(init: std.process.Init) !void {
         thread.* = try std.Thread.spawn(
             .{},
             run_worker,
-            .{ cfg.listen, pool, &router, &metrics, access, seed_base, cpu },
+            .{ cfg.listen, pool, &router, &metrics, access, seed_base, cpu, tls_context },
         );
     }
 
@@ -103,14 +108,14 @@ pub fn main(init: std.process.Init) !void {
     for (threads) |thread| thread.join();
 }
 
-/// Read the configured PEM files (startup-time, bounded) and prove the
-/// certificate and private key parse and match — via OpenSSL, so the exact
-/// stack that will terminate TLS is the one that vets the identity.
+/// Read the configured PEM files (startup-time, bounded) and build the TLS
+/// server context from them — parsing, cross-checking, and installing the
+/// identity via the exact stack that will terminate TLS.
 fn load_tls_identity(
     io: std.Io,
     gpa: std.mem.Allocator,
     tls_config: zoxy.config.TlsConfig,
-) !void {
+) !zoxy.terminator.Context {
     assert(tls_config.certificate_file.len > 0); // config.parse rejects empty
     assert(tls_config.private_key_file.len > 0);
     const limit = std.Io.Limit.limited(constants.tls_pem_bytes_max);
@@ -118,7 +123,7 @@ fn load_tls_identity(
         .readFileAlloc(io, tls_config.certificate_file, gpa, limit);
     const private_key_pem = try std.Io.Dir.cwd()
         .readFileAlloc(io, tls_config.private_key_file, gpa, limit);
-    try zoxy.tls.validate_identity(certificate_pem, private_key_pem);
+    return zoxy.terminator.Context.init_server(certificate_pem, private_key_pem);
 }
 
 /// One share-nothing worker: its own IO ring, SO_REUSEPORT listener, and pool,
@@ -131,6 +136,7 @@ fn run_worker(
     access: *AccessLog,
     seed_base: u64,
     cpu: usize,
+    tls_context: ?*const zoxy.terminator.Context,
 ) void {
     assert(pool.capacity > 0);
     pin_to_cpu(cpu);
@@ -156,6 +162,7 @@ fn run_worker(
     // Workers beyond the metrics table share its last slot (diagnostic only).
     server.worker_index = @intCast(@min(cpu, constants.workers_max - 1));
     server.prng = .init(seed_base +% cpu);
+    server.tls_context = tls_context;
     server.start();
 
     // Active health checks ride the same ring; arms only when configured.

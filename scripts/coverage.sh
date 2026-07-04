@@ -27,7 +27,8 @@ echo "== build (LLVM backend, for kcov-readable DWARF) =="
 zig build
 zig test src/root.zig --test-no-exec -fllvm -femit-bin=zig-out/bin/coverage_tests \
     -lc zig-out/lib/libopenssl.a
-zig build-exe src/sim.zig -ODebug -fllvm -femit-bin=zig-out/bin/coverage_sim
+zig build-exe src/sim.zig -ODebug -fllvm -femit-bin=zig-out/bin/coverage_sim \
+    -lc zig-out/lib/libopenssl.a
 
 echo "== unit tests under kcov =="
 kcov --include-path="$ROOT/src" "$OUT/tests" zig-out/bin/coverage_tests

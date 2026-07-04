@@ -78,6 +78,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    // The simulator imports proxy.zig, which now references the TLS
+    // terminator's externs — linked even though the sim runs plaintext
+    // (its ProxyServer keeps tls_context = null).
+    sim_exe.root_module.linkLibrary(openssl_library);
     const run_sim = b.addRunArtifact(sim_exe);
     if (b.args) |args| run_sim.addArgs(args);
     const sim_step = b.step("sim", "Run the deterministic simulator (args: [seed] [iterations])");

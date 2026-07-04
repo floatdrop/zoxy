@@ -426,19 +426,29 @@ catches the dominant failures), ejection-time multipliers.
      block (paths only — config stays FFI-free for the simulator); main
      validates the PEM identity via OpenSSL at startup, so a bad cert kills
      boot, not the first handshake.
-  2. **BIO-pair terminator** — in progress. Done: `src/tls/terminator.zig`,
-     the sans-io half — `Context` (SSL_CTX: identity install + cross-check,
-     TLS >= 1.2, ALPN select preferring `http/1.1` with NOACK fallback,
-     session cache/tickets off so every handshake is full and the context
-     stays immutable across workers) and `Channel` (per-connection SSL over
-     a fixed-size BIO pair; feed/drain ciphertext, handshake_step,
-     read/write plaintext, close_notify — pure byte transformer, tested by
-     deterministic in-memory loopback down to 1-byte adversarial delivery,
-     with heap-drain-to-baseline assertions). Remaining: drive it from
-     `ProxyConn` recv/send completions and wire `main` to build per-worker
-     contexts. SNI multi-cert select deferred until config carries multiple
-     identities (single `tls` block today; the ALPN/servername callbacks are
-     the extension point).
+  2. **BIO-pair terminator** — done 2026-07, in two halves.
+     *Sans-io* (`src/tls/terminator.zig`): `Context` (SSL_CTX: identity
+     install + cross-check, TLS >= 1.2, ALPN select preferring `http/1.1`
+     with NOACK fallback, session cache/tickets off so every handshake is
+     full and the context stays immutable across workers) and `Channel`
+     (per-connection SSL over a fixed-size BIO pair; feed/drain ciphertext,
+     handshake_step, read/write plaintext — a pure byte transformer, tested
+     by deterministic in-memory loopback down to 1-byte adversarial
+     delivery). *Data path* (`net/proxy.zig`): every downstream I/O site
+     (`arm_recv_head`, the request pipe's recv, the response pipe's send,
+     the fail send) branches to logical `tls_recv_start`/`tls_send_start`;
+     a single `tls_progress` pump drives handshake and streaming off wire
+     completions, buffered plaintext is delivered via a zero-delay yield
+     timer (no recursion), and the channel frees with the slot — a TLS
+     connection drains the hook heap to baseline (asserted end-to-end).
+     Channel init at accept load-sheds on heap exhaustion. Verified with
+     curl: TLS 1.3, ALPN `http/1.1` picked from `h2,http/1.1`, keep-alive
+     and pipelined requests on one handshake. Deferred, recorded here:
+     SNI multi-cert (single identity in config today; the servername
+     callback is the extension point), close_notify on teardown (abrupt
+     close like the plaintext path — an `until_close` response to a TLS
+     client is indistinguishable from truncation), and TLS-heap sizing from
+     measured per-handshake usage.
   3. **kTLS fast path** — post-handshake `setsockopt(TLS_TX/TLS_RX)` behind a
      config flag; relay code untouched; BIO-pair fallback on `ENOTSUPP`.
   4. **Upstream re-encryption** — client-side TLS to origins, reusing the same

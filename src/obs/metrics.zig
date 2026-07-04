@@ -50,6 +50,11 @@ pub const Metrics = struct {
     health_probes: Counter = .{},
     /// Active health probes that failed (refused, reset, or timed out).
     health_probe_failures: Counter = .{},
+    /// Downstream TLS handshakes completed.
+    tls_handshakes: Counter = .{},
+    /// Downstream TLS handshakes that failed (bad ClientHello, no shared
+    /// cipher, or the TLS heap load-shed the connection at accept).
+    tls_handshake_failures: Counter = .{},
     /// Requests rejected by a cluster circuit breaker (max_requests).
     breaker_requests_rejected: Counter = .{},
     /// Upstream dials rejected by a cluster circuit breaker (max_pending or
