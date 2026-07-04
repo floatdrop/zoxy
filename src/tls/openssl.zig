@@ -22,6 +22,7 @@ pub const SSL_CTX = opaque {};
 pub const SSL = opaque {};
 pub const SSL_METHOD = opaque {};
 pub const SSL_CIPHER = opaque {};
+pub const X509_STORE = opaque {};
 
 // Values verified against the vendored OpenSSL 3.3.2 headers (ssl.h.in,
 // tls1.h, prov_ssl.h) — mirrored here because the C names are macros with no
@@ -38,6 +39,9 @@ pub const SSL_SESS_CACHE_OFF: c_long = 0x0000;
 pub const TLS1_2_VERSION: c_long = 0x0303;
 pub const SSL_TLSEXT_ERR_OK: c_int = 0;
 pub const SSL_TLSEXT_ERR_NOACK: c_int = 3;
+pub const SSL_VERIFY_PEER: c_int = 0x01;
+pub const SSL_CTRL_SET_TLSEXT_HOSTNAME: c_int = 55;
+pub const TLSEXT_NAMETYPE_host_name: c_long = 0;
 
 var global_heap: Heap = undefined;
 var hook_installed: bool = false;
@@ -243,6 +247,36 @@ pub extern fn SSL_get_rbio(ssl: *const SSL) ?*BIO;
 /// 1 when the SSL buffers any received data — decrypted-but-undelivered
 /// plaintext or a processed-but-undecrypted record.
 pub extern fn SSL_has_pending(ssl: *const SSL) c_int;
+
+// Upstream verification (docs/DESIGN.md §6, re-encryption).
+pub extern fn SSL_CTX_set_verify(context: *SSL_CTX, mode: c_int, callback: ?*anyopaque) void;
+pub extern fn SSL_CTX_get_cert_store(context: *const SSL_CTX) ?*X509_STORE;
+pub extern fn X509_STORE_add_cert(store: *X509_STORE, certificate: *X509) c_int;
+/// Hostname the peer's certificate must match (SAN, or CN fallback).
+pub extern fn SSL_set1_host(ssl: *SSL, hostname: [*:0]const u8) c_int;
+/// The macro escape hatch (SSL_set_tlsext_host_name = ctrl 55).
+pub extern fn SSL_ctrl(ssl: *SSL, command: c_int, argument: c_long, pointer: ?*anyopaque) c_long;
+
+/// Add every certificate of a PEM bundle to a store (a private CA plus any
+/// intermediates); returns how many were added.
+pub fn store_add_pem_bundle(store: *X509_STORE, bundle_pem: []const u8) u32 {
+    assert(bundle_pem.len > 0);
+    assert(bundle_pem.len <= std.math.maxInt(c_int));
+    defer ERR_clear_error(); // the terminating read leaves PEM_R_NO_START_LINE
+    const bio = BIO_new_mem_buf(bundle_pem.ptr, @intCast(bundle_pem.len)) orelse return 0;
+    defer _ = BIO_free(bio);
+    var count: u32 = 0;
+    while (count < bundle_certificates_max) {
+        const certificate = PEM_read_bio_X509(bio, null, null, null) orelse break;
+        defer X509_free(certificate);
+        if (X509_STORE_add_cert(store, certificate) != 1) break;
+        count += 1;
+    }
+    return count;
+}
+
+/// Bounds the bundle walk; a trust bundle beyond this is a config mistake.
+const bundle_certificates_max = 64;
 /// The IANA cipher-suite id (0x1301 = TLS_AES_128_GCM_SHA256, ...).
 pub extern fn SSL_CIPHER_get_protocol_id(cipher: *const SSL_CIPHER) u16;
 

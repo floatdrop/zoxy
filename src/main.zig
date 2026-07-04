@@ -40,21 +40,31 @@ pub fn main(init: std.process.Init) !void {
     const worker_count = std.Thread.getCpuCount() catch 1;
     assert(worker_count >= 1); // one worker thread is spawned even if the count fails
 
-    // TLS termination (docs/DESIGN.md §6): reserve the FFI heap, install the
-    // process-global memory hook (must precede any other OpenSSL call), and
-    // build the shared server context — an unloadable identity fails startup,
-    // not the first handshake. The context is immutable once built (session
-    // cache and tickets off), so one instance serves every worker.
-    var tls_context: ?*const zoxy.terminator.Context = null;
-    if (cfg.tls) |tls_config| {
-        // Sized so every connection slot on every worker can be a TLS
-        // connection (per-connection cost measured; see constants.zig).
-        // Virtual reservation: pages are touched only as connections carve.
+    // TLS (docs/DESIGN.md §6): reserve the FFI heap and install the
+    // process-global memory hook (must precede any other OpenSSL call) when
+    // any hop is TLS — the terminating listener or a re-encrypting cluster.
+    var clusters_with_tls: usize = 0;
+    for (cfg.clusters) |cluster| {
+        if (cluster.tls != null) clusters_with_tls += 1;
+    }
+    if (cfg.tls != null or clusters_with_tls > 0) {
+        // Sized so every connection slot on every worker can be TLS on both
+        // hops (per-connection cost measured; see constants.zig). Virtual
+        // reservation: pages are touched only as connections carve.
+        const hops: usize = if (cfg.tls != null and clusters_with_tls > 0) 2 else 1;
         const tls_heap_bytes = constants.tls_heap_base_bytes +
-            constants.tls_heap_per_connection_bytes * constants.connections_max * worker_count;
+            constants.tls_heap_per_connection_bytes *
+                constants.connections_max * worker_count * hops;
         const alignment = comptime std.mem.Alignment.fromByteUnits(zoxy.tls.Heap.block_align);
         const region = try gpa.alignedAlloc(u8, alignment, tls_heap_bytes);
         try zoxy.tls.install_memory_hook(region);
+    }
+
+    // Downstream termination: the shared server context — an unloadable
+    // identity fails startup, not the first handshake. Immutable once built
+    // (session cache and tickets off), so one instance serves every worker.
+    var tls_context: ?*const zoxy.terminator.Context = null;
+    if (cfg.tls) |tls_config| {
         const context = try gpa.create(zoxy.terminator.Context);
         context.* = load_tls_identity(init.io, gpa, tls_config) catch |err| {
             std.log.err("zoxy: cannot load tls identity ({s} / {s}): {s}", .{
@@ -69,6 +79,27 @@ pub fn main(init: std.process.Init) !void {
         std.log.info("zoxy tls listener: {s} (kernel_offload={})", .{
             tls_config.certificate_file,
             tls_config.kernel_offload,
+        });
+    }
+
+    // Upstream re-encryption: one verifying client context per TLS cluster,
+    // indexed by cluster position (the data path routes by cluster_index).
+    const upstream_tls = try gpa.alloc(?*const zoxy.terminator.Context, cfg.clusters.len);
+    for (cfg.clusters, upstream_tls) |cluster, *slot| {
+        slot.* = null;
+        const cluster_tls = cluster.tls orelse continue;
+        const context = try gpa.create(zoxy.terminator.Context);
+        context.* = build_upstream_context(init.io, gpa, cluster_tls) catch |err| {
+            std.log.err("zoxy: cluster {s}: cannot build upstream tls: {s}", .{
+                cluster.name,
+                @errorName(err),
+            });
+            return err;
+        };
+        slot.* = context;
+        std.log.info("zoxy cluster {s}: upstream tls ({s})", .{
+            cluster.name,
+            if (cluster_tls.insecure) "insecure" else cluster_tls.server_name.?,
         });
     }
 
@@ -93,7 +124,11 @@ pub fn main(init: std.process.Init) !void {
         thread.* = try std.Thread.spawn(
             .{},
             run_worker,
-            .{ cfg.listen, pool, &router, &metrics, access, seed_base, cpu, tls_context },
+            .{
+                cfg.listen,   pool,      &router, &metrics,
+                access,       seed_base, cpu,     tls_context,
+                upstream_tls,
+            },
         );
     }
 
@@ -115,6 +150,28 @@ pub fn main(init: std.process.Init) !void {
 
     std.log.info("zoxy listening on {f} across {d} worker(s)", .{ cfg.listen, worker_count });
     for (threads) |thread| thread.join();
+}
+
+/// Build one cluster's upstream (client-role) context: read the CA bundle
+/// when verification is on, or honor the explicit `insecure`.
+fn build_upstream_context(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    cluster_tls: zoxy.config.ClusterTlsConfig,
+) !zoxy.terminator.Context {
+    if (cluster_tls.insecure) {
+        assert(cluster_tls.ca_file == null); // config.parse rejects the mix
+        return zoxy.terminator.Context.init_client(.insecure);
+    }
+    const ca_file = cluster_tls.ca_file.?; // config.parse guarantees the pair
+    const server_name = cluster_tls.server_name.?;
+    assert(server_name.len > 0);
+    const limit = std.Io.Limit.limited(constants.tls_pem_bytes_max);
+    const bundle_pem = try std.Io.Dir.cwd().readFileAlloc(io, ca_file, gpa, limit);
+    return zoxy.terminator.Context.init_client(.{ .authority = .{
+        .bundle_pem = bundle_pem,
+        .host = server_name,
+    } });
 }
 
 /// Read the configured PEM files (startup-time, bounded) and build the TLS
@@ -146,6 +203,7 @@ fn run_worker(
     seed_base: u64,
     cpu: usize,
     tls_context: ?*const zoxy.terminator.Context,
+    upstream_tls: []const ?*const zoxy.terminator.Context,
 ) void {
     assert(pool.capacity > 0);
     pin_to_cpu(cpu);
@@ -172,6 +230,7 @@ fn run_worker(
     server.worker_index = @intCast(@min(cpu, constants.workers_max - 1));
     server.prng = .init(seed_base +% cpu);
     server.tls_context = tls_context;
+    server.upstream_tls_contexts = upstream_tls;
     server.start();
 
     // Active health checks ride the same ring; arms only when configured.

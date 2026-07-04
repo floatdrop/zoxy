@@ -50,6 +50,17 @@ pub const TrafficSecrets = struct {
     }
 };
 
+/// How a client-role context treats the peer's certificate.
+pub const ClientVerification = union(enum) {
+    /// Verify the chain against this PEM bundle (a private CA and any
+    /// intermediates) and require the certificate to match `host`, which
+    /// is also sent as SNI. Both must outlive the Context.
+    authority: struct { bundle_pem: []const u8, host: [:0]const u8 },
+    /// No verification. Tests, and clusters explicitly configured
+    /// `"insecure": true` — never a silent default.
+    insecure,
+};
+
 /// A process-lifetime SSL_CTX: the identity plus protocol policy every
 /// connection's SSL is stamped from. Startup-only; workers treat it as
 /// immutable (session cache and tickets are off, so OpenSSL does not
@@ -61,6 +72,9 @@ pub const Context = struct {
     /// possible (docs/DESIGN.md §6). Config-controlled ops escape hatch
     /// (`tls.kernel_offload`); set post-init like ProxyServer.worker_index.
     kernel_offload: bool = true,
+    /// Client role with verification: the hostname every channel from this
+    /// context checks the peer certificate against and offers as SNI.
+    client_host: ?[:0]const u8 = null,
 
     pub const Role = enum { server, client };
 
@@ -102,14 +116,28 @@ pub const Context = struct {
         return .{ .context = context, .role = .server };
     }
 
-    /// Test-side peer: drives the server Channel deterministically through
-    /// memory. No verification — the fixtures are self-signed.
-    pub fn init_client() InitError!Context {
+    /// Client side: upstream re-encryption (per TLS cluster), and the test
+    /// peer for the server channel (with `.insecure`).
+    pub fn init_client(verification: ClientVerification) InitError!Context {
         const context = openssl.SSL_CTX_new(openssl.TLS_client_method()) orelse
             return error.ContextCreateFailed;
         errdefer openssl.SSL_CTX_free(context);
         try harden(context);
-        return .{ .context = context, .role = .client };
+        var client_host: ?[:0]const u8 = null;
+        switch (verification) {
+            .authority => |authority| {
+                assert(authority.host.len > 0);
+                const store = openssl.SSL_CTX_get_cert_store(context) orelse
+                    return error.ContextSetupFailed;
+                if (openssl.store_add_pem_bundle(store, authority.bundle_pem) == 0) {
+                    return error.InvalidCertificate; // no certificate in the bundle
+                }
+                openssl.SSL_CTX_set_verify(context, openssl.SSL_VERIFY_PEER, null);
+                client_host = authority.host;
+            },
+            .insecure => {},
+        }
+        return .{ .context = context, .role = .client, .client_host = client_host };
     }
 
     /// TLS >= 1.2 only, no session cache, no tickets: every handshake is
@@ -259,7 +287,23 @@ pub const Channel = struct {
         openssl.SSL_set_bio(ssl, internal_bio.?, internal_bio.?);
         switch (context.role) {
             .server => openssl.SSL_set_accept_state(ssl),
-            .client => openssl.SSL_set_connect_state(ssl),
+            .client => {
+                openssl.SSL_set_connect_state(ssl);
+                if (context.client_host) |host| {
+                    // Pin the peer identity and offer SNI (the ctrl is the
+                    // SSL_set_tlsext_host_name macro's body).
+                    if (openssl.SSL_set1_host(ssl, host) != 1) {
+                        return error.ChannelCreateFailed;
+                    }
+                    const named = openssl.SSL_ctrl(
+                        ssl,
+                        openssl.SSL_CTRL_SET_TLSEXT_HOSTNAME,
+                        openssl.TLSEXT_NAMETYPE_host_name,
+                        @constCast(host.ptr),
+                    );
+                    if (named != 1) return error.ChannelCreateFailed;
+                }
+            },
         }
         return .{ .ssl = ssl, .network_bio = network_bio.? };
     }
@@ -498,7 +542,7 @@ test "terminator: full handshake, ALPN http/1.1, plaintext echo both ways" {
     install_test_hook();
     const server_context = try Context.init_server(test_certificate_pem, test_private_key_pem);
     defer server_context.deinit();
-    const client_context = try Context.init_client();
+    const client_context = try Context.init_client(.insecure);
     defer client_context.deinit();
 
     var server = try Channel.init(&server_context);
@@ -541,7 +585,7 @@ test "terminator: handshake survives 1-byte adversarial ciphertext delivery" {
     install_test_hook();
     const server_context = try Context.init_server(test_certificate_pem, test_private_key_pem);
     defer server_context.deinit();
-    const client_context = try Context.init_client();
+    const client_context = try Context.init_client(.insecure);
     defer client_context.deinit();
 
     var server = try Channel.init(&server_context);
@@ -556,7 +600,7 @@ test "terminator: no ALPN overlap completes the handshake without ALPN" {
     install_test_hook();
     const server_context = try Context.init_server(test_certificate_pem, test_private_key_pem);
     defer server_context.deinit();
-    const client_context = try Context.init_client();
+    const client_context = try Context.init_client(.insecure);
     defer client_context.deinit();
 
     var server = try Channel.init(&server_context);
@@ -577,7 +621,7 @@ test "terminator: close_notify reads as clean TLS EOF" {
     install_test_hook();
     const server_context = try Context.init_server(test_certificate_pem, test_private_key_pem);
     defer server_context.deinit();
-    const client_context = try Context.init_client();
+    const client_context = try Context.init_client(.insecure);
     defer client_context.deinit();
 
     var server = try Channel.init(&server_context);
@@ -596,7 +640,7 @@ test "terminator: keylog capture yields identical kernel parameters on both ends
     install_test_hook();
     const server_context = try Context.init_server(test_certificate_pem, test_private_key_pem);
     defer server_context.deinit();
-    const client_context = try Context.init_client();
+    const client_context = try Context.init_client(.insecure);
     defer client_context.deinit();
 
     var server = try Channel.init(&server_context);
@@ -636,7 +680,7 @@ test "terminator: a clean handshake is kernel-switch eligible; composition works
     install_test_hook();
     const server_context = try Context.init_server(test_certificate_pem, test_private_key_pem);
     defer server_context.deinit();
-    const client_context = try Context.init_client();
+    const client_context = try Context.init_client(.insecure);
     defer client_context.deinit();
 
     var server = try Channel.init(&server_context);
@@ -668,7 +712,7 @@ test "terminator: a request riding the handshake flight defeats eligibility" {
     install_test_hook();
     const server_context = try Context.init_server(test_certificate_pem, test_private_key_pem);
     defer server_context.deinit();
-    const client_context = try Context.init_client();
+    const client_context = try Context.init_client(.insecure);
     defer client_context.deinit();
 
     var server = try Channel.init(&server_context);
@@ -717,11 +761,87 @@ test "terminator: a request riding the handshake flight defeats eligibility" {
     }
 }
 
+test "terminator: a verifying client accepts the right authority and host" {
+    install_test_hook();
+    const server_context = try Context.init_server(test_certificate_pem, test_private_key_pem);
+    defer server_context.deinit();
+    // The self-signed fixture is its own authority; its CN is zoxy.test.
+    const client_context = try Context.init_client(.{ .authority = .{
+        .bundle_pem = test_certificate_pem,
+        .host = "zoxy.test",
+    } });
+    defer client_context.deinit();
+
+    var server = try Channel.init(&server_context);
+    defer server.deinit();
+    var client = try Channel.init(&client_context);
+    defer client.deinit();
+    try test_handshaken_pair(&client, &server, constants.tls_bio_pair_bytes);
+
+    // Round-trip to prove the verified session carries data.
+    switch (client.write_plaintext("ping")) {
+        .bytes => |n| try std.testing.expectEqual(@as(usize, 4), n),
+        else => return error.TestUnexpectedResult,
+    }
+    try pump(&client, &server, constants.tls_bio_pair_bytes);
+    var buffer: [16]u8 = undefined;
+    switch (server.read_plaintext(&buffer)) {
+        .bytes => |n| try std.testing.expectEqualStrings("ping", buffer[0..n]),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "terminator: a verifying client refuses a wrong host or unknown authority" {
+    install_test_hook();
+    const server_context = try Context.init_server(test_certificate_pem, test_private_key_pem);
+    defer server_context.deinit();
+
+    // Right authority, wrong hostname.
+    {
+        const client_context = try Context.init_client(.{ .authority = .{
+            .bundle_pem = test_certificate_pem,
+            .host = "not.zoxy.test",
+        } });
+        defer client_context.deinit();
+        var server = try Channel.init(&server_context);
+        defer server.deinit();
+        var client = try Channel.init(&client_context);
+        defer client.deinit();
+        _ = client.handshake_step();
+        try pump(&client, &server, constants.tls_bio_pair_bytes);
+        try std.testing.expect(!client.handshake_done());
+        try std.testing.expectEqual(Channel.HandshakeStatus.failed, client.handshake_step());
+    }
+
+    // Right hostname, wrong authority (the other fixture's self-signed CA).
+    {
+        const client_context = try Context.init_client(.{ .authority = .{
+            .bundle_pem = @embedFile("testdata/other_certificate.pem"),
+            .host = "zoxy.test",
+        } });
+        defer client_context.deinit();
+        var server = try Channel.init(&server_context);
+        defer server.deinit();
+        var client = try Channel.init(&client_context);
+        defer client.deinit();
+        _ = client.handshake_step();
+        try pump(&client, &server, constants.tls_bio_pair_bytes);
+        try std.testing.expect(!client.handshake_done());
+        try std.testing.expectEqual(Channel.HandshakeStatus.failed, client.handshake_step());
+    }
+
+    // An empty bundle is a config error, refused at context build.
+    try std.testing.expectError(error.InvalidCertificate, Context.init_client(.{ .authority = .{
+        .bundle_pem = "not a pem",
+        .host = "zoxy.test",
+    } }));
+}
+
 test "terminator: channels drain the hook heap to baseline" {
     install_test_hook();
     const server_context = try Context.init_server(test_certificate_pem, test_private_key_pem);
     defer server_context.deinit();
-    const client_context = try Context.init_client();
+    const client_context = try Context.init_client(.insecure);
     defer client_context.deinit();
 
     // Warm-up handshake so OpenSSL's lazy one-time allocations are done.

@@ -1999,6 +1999,10 @@ pub const ProxyServer = struct {
     /// end-to-end case). Shared across workers: with the session cache and
     /// tickets off it is immutable, and SSL_new only bumps its refcount.
     tls_context: ?*const terminator.Context,
+    /// Upstream re-encryption contexts, one slot per cluster (by
+    /// `cluster.index`; null = plaintext upstream). Set by the worker after
+    /// init; empty means "no cluster re-encrypts". Used from U2 onward.
+    upstream_tls_contexts: []const ?*const terminator.Context,
     request_timeout_ns: u63,
     idle_timeout_ns: u63,
     accept_completion: Completion,
@@ -2026,6 +2030,7 @@ pub const ProxyServer = struct {
             .prng = .init(0),
             .worker_index = 0,
             .tls_context = null,
+            .upstream_tls_contexts = &.{},
             .request_timeout_ns = request_timeout_ns,
             .idle_timeout_ns = idle_timeout_ns,
             .accept_completion = undefined,
@@ -2551,7 +2556,7 @@ test "proxy: terminates TLS end to end — handshake, relay, heap drain" {
         @embedFile("../tls/testdata/private_key.pem"),
     );
     defer server_context.deinit();
-    const client_context = try terminator.Context.init_client();
+    const client_context = try terminator.Context.init_client(.insecure);
     defer client_context.deinit();
 
     var pool = try Pool.init(gpa, 4);
@@ -2632,7 +2637,7 @@ test "proxy: TLS keep-alive carries pipelined requests on one handshake" {
         @embedFile("../tls/testdata/private_key.pem"),
     );
     defer server_context.deinit();
-    const client_context = try terminator.Context.init_client();
+    const client_context = try terminator.Context.init_client(.insecure);
     defer client_context.deinit();
 
     var pool = try Pool.init(gpa, 4);
@@ -2714,7 +2719,7 @@ test "proxy: hands the record layer to the kernel after a quiet handshake" {
         @embedFile("../tls/testdata/private_key.pem"),
     );
     defer server_context.deinit();
-    const client_context = try terminator.Context.init_client();
+    const client_context = try terminator.Context.init_client(.insecure);
     defer client_context.deinit();
 
     var pool = try Pool.init(gpa, 4);

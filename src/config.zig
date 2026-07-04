@@ -53,6 +53,18 @@ pub const ResiliencePolicy = struct {
     health_threshold_unhealthy: u16 = constants.health_threshold_unhealthy_default,
 };
 
+/// Upstream re-encryption for one cluster (docs/DESIGN.md §6): connect to
+/// its endpoints over TLS. Verification posture is explicit — a private CA
+/// bundle plus the hostname to require (and offer as SNI), or `insecure`.
+/// FFI-free (paths only): main loads and builds the client context.
+pub const ClusterTlsConfig = struct {
+    /// Certificate hostname requirement + SNI; null only when insecure.
+    server_name: ?[:0]const u8,
+    /// PEM bundle path for the trust store; null only when insecure.
+    ca_file: ?[]const u8,
+    insecure: bool,
+};
+
 pub const Cluster = struct {
     name: []const u8,
     endpoints: []const Endpoint,
@@ -60,6 +72,8 @@ pub const Cluster = struct {
     /// per-cluster balancer state, which is reserved statically per worker.
     index: usize,
     policy: ResiliencePolicy,
+    /// Re-encrypt traffic to this cluster's endpoints; null = plaintext.
+    tls: ?ClusterTlsConfig,
 };
 
 pub const Route = struct {
@@ -128,6 +142,11 @@ const Dto = struct {
         private_key_file: []const u8,
         kernel_offload: bool = true,
     };
+    const ClusterTlsDto = struct {
+        server_name: ?[]const u8 = null,
+        ca_file: ?[]const u8 = null,
+        insecure: bool = false,
+    };
     const RouteDto = struct {
         host: []const u8 = "*",
         path_prefix: []const u8 = "/",
@@ -136,6 +155,7 @@ const Dto = struct {
     const ClusterDto = struct {
         name: []const u8,
         endpoints: []const []const u8,
+        tls: ?ClusterTlsDto = null,
         retry: ?RetryDto = null,
         circuit_breaker: ?CircuitBreakerDto = null,
         outlier: ?OutlierDto = null,
@@ -199,6 +219,7 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
             .endpoints = endpoints,
             .index = index,
             .policy = try resolve_policy(&dc),
+            .tls = try lower_cluster_tls(a, dc.tls),
         };
     }
 
@@ -235,6 +256,29 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
         .tls = tls,
         .routes = routes,
         .clusters = clusters,
+    };
+}
+
+/// An upstream TLS block must pick a verification posture explicitly:
+/// either a CA bundle *and* the hostname to require, or a spelled-out
+/// `"insecure": true` — a silently-unverified default would be a trap.
+fn lower_cluster_tls(
+    a: std.mem.Allocator,
+    dto: ?Dto.ClusterTlsDto,
+) (error{InvalidTls} || std.mem.Allocator.Error)!?ClusterTlsConfig {
+    const dt = dto orelse return null;
+    if (dt.insecure) {
+        // Verification fields are contradictory next to `insecure`.
+        if (dt.ca_file != null or dt.server_name != null) return error.InvalidTls;
+        return .{ .server_name = null, .ca_file = null, .insecure = true };
+    }
+    const server_name = dt.server_name orelse return error.InvalidTls;
+    const ca_file = dt.ca_file orelse return error.InvalidTls;
+    if (server_name.len == 0 or ca_file.len == 0) return error.InvalidTls;
+    return .{
+        .server_name = try a.dupeZ(u8, server_name),
+        .ca_file = try a.dupe(u8, ca_file),
+        .insecure = false,
     };
 }
 
@@ -397,6 +441,44 @@ test "config: tls block is optional, parses paths, rejects empty ones" {
         \\  "tls": { "certificate_file": "", "private_key_file": "key.pem" },
         \\  "routes": [{ "cluster": "c" }],
         \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    ));
+}
+
+test "config: cluster tls block demands an explicit verification posture" {
+    var verified = try parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"],
+        \\    "tls": { "server_name": "origin.internal", "ca_file": "ca.pem" } }] }
+    );
+    defer verified.deinit();
+    const tls = verified.clusters[0].tls.?;
+    try std.testing.expectEqualStrings("origin.internal", tls.server_name.?);
+    try std.testing.expectEqualStrings("ca.pem", tls.ca_file.?);
+    try std.testing.expect(!tls.insecure);
+
+    var insecure = try parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"],
+        \\    "tls": { "insecure": true } }] }
+    );
+    defer insecure.deinit();
+    try std.testing.expect(insecure.clusters[0].tls.?.insecure);
+
+    // Neither posture chosen (or half of one) is a refusal, not a default.
+    try std.testing.expectError(error.InvalidTls, parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"], "tls": {} }] }
+    ));
+    try std.testing.expectError(error.InvalidTls, parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"],
+        \\    "tls": { "server_name": "origin.internal" } }] }
+    ));
+    // Contradiction: verification material next to insecure.
+    try std.testing.expectError(error.InvalidTls, parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"],
+        \\    "tls": { "insecure": true, "ca_file": "ca.pem" } }] }
     ));
 }
 
