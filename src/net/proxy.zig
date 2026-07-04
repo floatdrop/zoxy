@@ -4495,11 +4495,11 @@ test "proxy: the serving path allocates nothing after startup (zero-alloc gate)"
 
 fn connect_loopback(port: u16) !posix.socket_t {
     const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
-    try std.testing.expect(posix.errno(rc) == .SUCCESS);
+    try std.testing.expect(linux.errno(rc) == .SUCCESS);
     const fd: posix.socket_t = @intCast(rc);
     const sa = sockaddr_in(Ip4Address.loopback(port));
     try std.testing.expect(
-        posix.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) == .SUCCESS,
+        linux.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) == .SUCCESS,
     );
     return fd;
 }

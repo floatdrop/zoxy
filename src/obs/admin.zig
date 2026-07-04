@@ -39,7 +39,7 @@ pub const Admin = struct {
     /// is drained by a dedicated thread, not an io_uring loop).
     pub fn open(address: Ip4Address, metrics: *const Metrics) OpenError!Admin {
         const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
-        if (posix.errno(rc) != .SUCCESS) return error.SocketCreateFailed;
+        if (linux.errno(rc) != .SUCCESS) return error.SocketCreateFailed;
         const fd: posix.socket_t = @intCast(rc);
         assert(fd >= 0);
         errdefer _ = linux.close(fd);
@@ -49,10 +49,10 @@ pub const Admin = struct {
             return error.SetSockOptFailed;
 
         var sa = sockaddr_in(address);
-        if (posix.errno(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
+        if (linux.errno(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
             return error.BindFailed;
         }
-        if (posix.errno(linux.listen(fd, accept_backlog)) != .SUCCESS) {
+        if (linux.errno(linux.listen(fd, accept_backlog)) != .SUCCESS) {
             return error.ListenFailed;
         }
         return .{ .fd = fd, .metrics = metrics };
@@ -68,7 +68,7 @@ pub const Admin = struct {
         var sa: linux.sockaddr.in = undefined;
         var len: posix.socklen_t = @sizeOf(linux.sockaddr.in);
         const rc = linux.getsockname(admin.fd, @ptrCast(&sa), &len);
-        assert(posix.errno(rc) == .SUCCESS);
+        assert(linux.errno(rc) == .SUCCESS);
         assert(sa.family == linux.AF.INET);
         return .{ .bytes = @bitCast(sa.addr), .port = std.mem.bigToNative(u16, sa.port) };
     }
@@ -82,7 +82,7 @@ pub const Admin = struct {
     /// Accept one connection, answer it with the metrics exposition, close it.
     pub fn serve_one(admin: *Admin) void {
         const rc = linux.accept4(admin.fd, null, null, linux.SOCK.CLOEXEC);
-        if (posix.errno(rc) != .SUCCESS) return;
+        if (linux.errno(rc) != .SUCCESS) return;
         const fd: posix.socket_t = @intCast(rc);
         assert(fd >= 0);
         defer _ = linux.close(fd);
@@ -136,7 +136,7 @@ fn write_all(fd: posix.socket_t, bytes: []const u8) void {
     var sent: usize = 0;
     while (sent < bytes.len) { // bounded: every iteration sends >= 1 byte or returns
         const rc = linux.write(fd, bytes[sent..].ptr, bytes.len - sent);
-        if (posix.errno(rc) != .SUCCESS) return;
+        if (linux.errno(rc) != .SUCCESS) return;
         if (rc == 0) return;
         sent += rc;
         assert(sent <= bytes.len);
@@ -169,13 +169,13 @@ test "admin: serves the metrics exposition over HTTP" {
     // (same thread) accept and respond before we read the reply back.
     const client: posix.socket_t = blk: {
         const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
-        try std.testing.expect(posix.errno(rc) == .SUCCESS);
+        try std.testing.expect(linux.errno(rc) == .SUCCESS);
         break :blk @intCast(rc);
     };
     defer _ = linux.close(client);
     var sa = sockaddr_in(Ip4Address.loopback(port));
     try std.testing.expect(
-        posix.errno(linux.connect(client, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) == .SUCCESS,
+        linux.errno(linux.connect(client, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) == .SUCCESS,
     );
     const request = "GET /metrics HTTP/1.0\r\n\r\n";
     _ = linux.write(client, request, request.len);
@@ -186,7 +186,7 @@ test "admin: serves the metrics exposition over HTTP" {
     var response_len: usize = 0;
     while (true) { // read to EOF (serve_one closed its end)
         const rc = linux.read(client, response_buf[response_len..].ptr, 512);
-        try std.testing.expect(posix.errno(rc) == .SUCCESS);
+        try std.testing.expect(linux.errno(rc) == .SUCCESS);
         if (rc == 0) break;
         response_len += rc;
     }

@@ -29,10 +29,10 @@ pub const Listener = struct {
         set_reuse(fd) catch return error.SetSockOptFailed;
 
         var sa = sockaddr_in(address);
-        if (posix.errno(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
+        if (linux.errno(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
             return error.BindFailed;
         }
-        if (posix.errno(linux.listen(fd, backlog)) != .SUCCESS) {
+        if (linux.errno(linux.listen(fd, backlog)) != .SUCCESS) {
             return error.ListenFailed;
         }
         return .{ .fd = fd };
@@ -48,7 +48,7 @@ pub const Listener = struct {
         var sa: linux.sockaddr.in = undefined;
         var len: posix.socklen_t = @sizeOf(linux.sockaddr.in);
         const rc = linux.getsockname(listener.fd, @ptrCast(&sa), &len);
-        assert(posix.errno(rc) == .SUCCESS);
+        assert(linux.errno(rc) == .SUCCESS);
         assert(sa.family == linux.AF.INET);
         return .{ .bytes = @bitCast(sa.addr), .port = std.mem.bigToNative(u16, sa.port) };
     }
@@ -57,7 +57,7 @@ pub const Listener = struct {
 fn create_socket() ?posix.socket_t {
     const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK;
     const rc = linux.socket(linux.AF.INET, flags, 0);
-    if (posix.errno(rc) != .SUCCESS) return null;
+    if (linux.errno(rc) != .SUCCESS) return null;
     return @intCast(rc);
 }
 
@@ -90,14 +90,14 @@ test "listener: accepts a loopback connection" {
     // Blocking loopback connect completes the handshake into the accept queue.
     const client: posix.socket_t = blk: {
         const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
-        try std.testing.expect(posix.errno(rc) == .SUCCESS);
+        try std.testing.expect(linux.errno(rc) == .SUCCESS);
         break :blk @intCast(rc);
     };
     defer _ = linux.close(client);
     {
         var sa = sockaddr_in(Ip4Address.loopback(port));
         const rc = linux.connect(client, @ptrCast(&sa), @sizeOf(linux.sockaddr.in));
-        try std.testing.expect(posix.errno(rc) == .SUCCESS);
+        try std.testing.expect(linux.errno(rc) == .SUCCESS);
     }
 
     var io = try IO.init(8, 0);
