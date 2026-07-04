@@ -51,6 +51,9 @@ pub const Admin = @import("obs/admin.zig").Admin;
 /// Allocation guard for the zero-alloc acceptance gate (docs/DESIGN.md §4).
 pub const guard = @import("mem/guard.zig");
 
+/// TLS termination via OpenSSL FFI (docs/DESIGN.md §6, Phase 3).
+pub const tls = @import("tls/openssl.zig");
+
 test {
     _ = io;
     _ = @import("io/test_io.zig");
@@ -69,4 +72,7 @@ test {
     _ = @import("obs/access_log.zig");
     _ = @import("obs/admin.zig");
     _ = guard;
+    _ = tls;
+    _ = @import("tls/heap.zig");
+    _ = @import("mem/futex_mutex.zig");
 }

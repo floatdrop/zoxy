@@ -416,9 +416,16 @@ catches the dominant failures), ejection-time multipliers.
 
 ### Phase 3 — Protocol depth
 - TLS termination (design in §6), sliced:
-  1. **FFI foundation** — vendor OpenSSL (`allyourcodebase`), route
-     `CRYPTO_set_mem_functions` into a startup-reserved arena + the counting
-     gate, load certs/keys (PEM) into `Config` at parse time.
+  1. **FFI foundation** — done 2026-07. OpenSSL vendored (`third_party/openssl`,
+     patched: the upstream recipe shipped C fallbacks alongside the x86_64 asm
+     that replaces them — duplicate symbols under Zig's strict linker).
+     `CRYPTO_set_mem_functions` → `src/tls/heap.zig`, a fixed size-class heap
+     behind a raw-futex mutex (0.16 removed `std.Thread.Mutex`); exhaustion
+     fails the OpenSSL call, tests assert identity validation drains to
+     baseline on success *and* error paths. Config grew an optional `tls`
+     block (paths only — config stays FFI-free for the simulator); main
+     validates the PEM identity via OpenSSL at startup, so a bad cert kills
+     boot, not the first handshake.
   2. **BIO-pair terminator** — handshake state machine driven by recv/send
      completions inside `ProxyConn`; SNI cert select, ALPN `http/1.1`;
      BIO-pair relay (correct everywhere, slower).

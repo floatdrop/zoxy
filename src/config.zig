@@ -70,12 +70,22 @@ pub const Route = struct {
     cluster: []const u8,
 };
 
+/// TLS termination identity (Phase 3, docs/DESIGN.md §6): file paths only.
+/// This module stays FFI-free (the simulator imports it); reading and
+/// validating the PEM files happens at startup in main via `tls/openssl.zig`.
+pub const TlsConfig = struct {
+    certificate_file: []const u8,
+    private_key_file: []const u8,
+};
+
 pub const Config = struct {
     gpa: std.mem.Allocator,
     arena: *std.heap.ArenaAllocator,
     listen: Ip4Address,
     /// Address of the admin/metrics endpoint; null disables it.
     admin: ?Ip4Address,
+    /// TLS termination on the listener; null = plaintext.
+    tls: ?TlsConfig,
     routes: []const Route,
     clusters: []const Cluster,
 
@@ -99,15 +109,21 @@ pub const ParseError = error{
     TooManyClusters,
     TooManyEndpoints,
     InvalidLimit,
+    InvalidTls,
 } || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error;
 
 /// JSON shape mirrored 1:1 for decoding, then lowered into `Config`.
 const Dto = struct {
     listen: []const u8,
     admin: ?[]const u8 = null,
+    tls: ?TlsDto = null,
     routes: []const RouteDto,
     clusters: []const ClusterDto,
 
+    const TlsDto = struct {
+        certificate_file: []const u8,
+        private_key_file: []const u8,
+    };
     const RouteDto = struct {
         host: []const u8 = "*",
         path_prefix: []const u8 = "/",
@@ -197,11 +213,21 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
         if (find_cluster_in(clusters, route.cluster) == null) return error.UnknownCluster;
     }
 
+    const tls: ?TlsConfig = if (dto.tls) |dt| lower: {
+        if (dt.certificate_file.len == 0) return error.InvalidTls;
+        if (dt.private_key_file.len == 0) return error.InvalidTls;
+        break :lower .{
+            .certificate_file = try a.dupe(u8, dt.certificate_file),
+            .private_key_file = try a.dupe(u8, dt.private_key_file),
+        };
+    } else null;
+
     return .{
         .gpa = gpa,
         .arena = arena,
         .listen = try parse_address(dto.listen),
         .admin = if (dto.admin) |text_addr| try parse_address(text_addr) else null,
+        .tls = tls,
         .routes = routes,
         .clusters = clusters,
     };
@@ -344,6 +370,29 @@ test "config: admin endpoint is optional and parses when present" {
     );
     defer with.deinit();
     try std.testing.expectEqual(@as(u16, 9901), with.admin.?.port);
+}
+
+test "config: tls block is optional, parses paths, rejects empty ones" {
+    var without = try parse(std.testing.allocator, test_config);
+    defer without.deinit();
+    try std.testing.expect(without.tls == null);
+
+    var with = try parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:443",
+        \\  "tls": { "certificate_file": "cert.pem", "private_key_file": "key.pem" },
+        \\  "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    );
+    defer with.deinit();
+    try std.testing.expectEqualStrings("cert.pem", with.tls.?.certificate_file);
+    try std.testing.expectEqualStrings("key.pem", with.tls.?.private_key_file);
+
+    try std.testing.expectError(error.InvalidTls, parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:443",
+        \\  "tls": { "certificate_file": "", "private_key_file": "key.pem" },
+        \\  "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    ));
 }
 
 test "config: rejects a route to an unknown cluster" {

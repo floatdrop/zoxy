@@ -99,6 +99,10 @@ Consequences that bite if you forget them:
 | `src/proxy/health_check.zig` | active TCP-connect health probes, per worker, in-ring: one ticking scheduler, bounded probe slots, streak thresholds flip `EndpointState.healthy` |
 | `src/obs/metrics.zig`, `src/obs/access_log.zig` | atomic counters; fixed-buffer batched access log |
 | `src/mem/guard.zig` | `CountingAllocator` — the zero-alloc acceptance gate (baseline count == final count) |
+| `src/tls/openssl.zig` | OpenSSL FFI seam (Phase 3): hand-written externs (no @cImport), the process-global `CRYPTO_set_mem_functions` hook, PEM identity validation. **Install the hook before any other OpenSSL call** — OpenSSL refuses it after its first allocation |
+| `src/tls/heap.zig` | fixed-capacity size-class heap behind the memory hook — reserved at startup, exhaustion fails the OpenSSL operation (load-shedding), never grows |
+| `src/mem/futex_mutex.zig` | blocking mutex over the raw Linux futex (0.16 removed `std.Thread.Mutex`); off the data path only (TLS heap, handshake-time) |
+| `third_party/openssl/` | vendored allyourcodebase/openssl build recipe (MIT) with local duplicate-symbol fixes (see its README); OpenSSL *sources* still fetched by content hash. Linked into the `zoxy` module only — the simulator never sees it |
 | `src/constants.zig` | **every static limit** (connections_max, buffer sizes, ring depth, timeouts, pool sizes). Sizing the proxy = choosing these; total memory is a function of them. |
 
 ### Zig 0.16 API notes (verified against the pinned toolchain, not guessed)
@@ -113,6 +117,9 @@ Consequences that bite if you forget them:
   (strict, always a syscall).
 - **kcov cannot read the self-hosted Debug backend's DWARF** (finds 0 lines);
   coverage builds must pass `-fllvm` (see `scripts/coverage.sh`).
+- `std.Thread.Mutex` is gone; its replacement `std.Io.Mutex` requires an `Io`
+  instance the workers deliberately don't carry → use
+  `src/mem/futex_mutex.zig` (raw futex, off the data path only).
 - `std.time.Timer`/`Instant` are gone; the idiomatic replacement is
   `std.Io.Clock` — `std.Io.Clock.awake.now(io)` (CLOCK_MONOTONIC on Linux)
   returns an `Io.Timestamp` with `durationTo`/`fromNow` arithmetic. Our
@@ -139,5 +146,7 @@ that are actually enforced and easy to violate:
 - `snake_case` for functions, variables, and **file names**. No abbreviations
   (`source`/`target`, not `src`/`dest`). Units/qualifiers last (`connections_max`,
   `header_bytes_max`). Struct order: fields, then types, then methods.
-- **Zero dependencies beyond the Zig toolchain.** Any C-FFI dependency (e.g. a future
-  OpenSSL TLS terminator) is a deliberate, justified exception.
+- **Zero dependencies beyond the Zig toolchain, with one deliberate exception:** the
+  vendored OpenSSL for TLS (docs/DESIGN.md §6). Its allocations route through the
+  reserved TLS heap, so "no allocation outside pre-reserved pools" survives the FFI
+  boundary. Don't add others.

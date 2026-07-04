@@ -103,3 +103,15 @@ pub const workers_max: usize = 64;
 /// An immediate re-arm would fail again instantly and spin the worker at
 /// 100% CPU for as long as the condition persists.
 pub const accept_retry_delay_ns: u63 = 100 * std.time.ns_per_ms;
+
+/// The heap behind OpenSSL's process-global memory hook, reserved at startup
+/// only when TLS is configured. Exhaustion fails the OpenSSL operation and
+/// that handshake is rejected — load-shedding, never OOM, never growth.
+/// Sized generously for now; Phase 3's termination slice measures actual
+/// per-handshake usage and re-derives this from connections_max * workers.
+pub const tls_heap_bytes: usize = 64 * 1024 * 1024;
+
+/// Bounds a TLS certificate/private-key PEM file read at startup. Real cert
+/// chains are a few KB; anything near this limit is a misconfiguration. Must
+/// stay below maxInt(c_int): the PEM bytes cross the OpenSSL FFI boundary.
+pub const tls_pem_bytes_max: u32 = 256 * 1024;

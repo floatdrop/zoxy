@@ -37,6 +37,24 @@ pub fn main(init: std.process.Init) !void {
     };
     const router = Router.init(&cfg);
 
+    // TLS foundation (docs/DESIGN.md §6): reserve the FFI heap, install the
+    // process-global memory hook (must precede any other OpenSSL call), and
+    // fail startup on an unloadable identity — not on the first handshake.
+    if (cfg.tls) |tls_config| {
+        const alignment = comptime std.mem.Alignment.fromByteUnits(zoxy.tls.Heap.block_align);
+        const region = try gpa.alignedAlloc(u8, alignment, constants.tls_heap_bytes);
+        try zoxy.tls.install_memory_hook(region);
+        load_tls_identity(init.io, gpa, tls_config) catch |err| {
+            std.log.err("zoxy: cannot load tls identity ({s} / {s}): {s}", .{
+                tls_config.certificate_file,
+                tls_config.private_key_file,
+                @errorName(err),
+            });
+            return err;
+        };
+        std.log.info("zoxy tls identity validated: {s}", .{tls_config.certificate_file});
+    }
+
     const worker_count = std.Thread.getCpuCount() catch 1;
     assert(worker_count >= 1); // one worker thread is spawned even if the count fails
 
@@ -83,6 +101,24 @@ pub fn main(init: std.process.Init) !void {
 
     std.log.info("zoxy listening on {f} across {d} worker(s)", .{ cfg.listen, worker_count });
     for (threads) |thread| thread.join();
+}
+
+/// Read the configured PEM files (startup-time, bounded) and prove the
+/// certificate and private key parse and match — via OpenSSL, so the exact
+/// stack that will terminate TLS is the one that vets the identity.
+fn load_tls_identity(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    tls_config: zoxy.config.TlsConfig,
+) !void {
+    assert(tls_config.certificate_file.len > 0); // config.parse rejects empty
+    assert(tls_config.private_key_file.len > 0);
+    const limit = std.Io.Limit.limited(constants.tls_pem_bytes_max);
+    const certificate_pem = try std.Io.Dir.cwd()
+        .readFileAlloc(io, tls_config.certificate_file, gpa, limit);
+    const private_key_pem = try std.Io.Dir.cwd()
+        .readFileAlloc(io, tls_config.private_key_file, gpa, limit);
+    try zoxy.tls.validate_identity(certificate_pem, private_key_pem);
 }
 
 /// One share-nothing worker: its own IO ring, SO_REUSEPORT listener, and pool,

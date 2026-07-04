@@ -11,6 +11,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    // OpenSSL (vendored, built by the Zig build system — no system library).
+    // Linked into the "zoxy" module only: src/tls/ holds the FFI, and the
+    // simulator (which imports source files directly, not the module) stays
+    // free of it — TLS never enters the simulated data path.
+    const openssl_dependency = b.dependency("openssl", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    mod.linkLibrary(openssl_dependency.artifact("openssl"));
+
     const exe = b.addExecutable(.{
         .name = "zoxy",
         .root_module = b.createModule(.{
