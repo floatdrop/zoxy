@@ -30,6 +30,9 @@ pub const hpack = @import("http/hpack.zig");
 /// Sans-io HTTP/2 server connection engine (docs/DESIGN.md §7 Phase 5, slice 3).
 pub const h2 = @import("http/h2.zig");
 
+/// H2 header lists ↔ H1 wire heads (docs/DESIGN.md §7 Phase 5, slice 4).
+pub const h2_translate = @import("http/h2_translate.zig");
+
 /// Static proxy configuration (docs/DESIGN.md §7).
 pub const config = @import("config.zig");
 
@@ -89,6 +92,7 @@ test {
     _ = h2_frame;
     _ = hpack;
     _ = h2;
+    _ = h2_translate;
     _ = config;
     _ = @import("proxy/router.zig");
     _ = balancer;

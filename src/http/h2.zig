@@ -43,6 +43,10 @@ pub const Event = union(enum) {
     /// The client sent GOAWAY. Streams at or below `last_stream_id` are
     /// still expected to complete.
     goaway: struct { last_stream_id: u31, code: ErrorCode },
+    /// The peer opened send-window credit: retry blocked `send_data` calls.
+    /// `stream_id` 0 means connection-level credit — recheck every blocked
+    /// stream — else just that stream's.
+    window_open: struct { stream_id: u31 },
     /// Connection-fatal failure: a GOAWAY is staged in the output — flush
     /// it, then tear the connection down. The engine ignores further input.
     fatal: struct { code: ErrorCode },
@@ -64,6 +68,8 @@ pub const Stream = struct {
     send_window: i64 = 0,
     /// Consumed receive bytes not yet returned via WINDOW_UPDATE.
     recv_pending: u32 = 0,
+    /// Our response is complete (END_STREAM sent) — nothing more may go out.
+    end_stream_sent: bool = false,
 
     pub const State = enum { open, half_closed_remote };
 };
@@ -156,6 +162,104 @@ pub const Connection = struct {
         connection.stream_free(stream);
     }
 
+    /// Encode a response head for `stream_id`: a HEADERS frame, plus
+    /// CONTINUATIONs when the hpack-encoded `block` exceeds the frame-size
+    /// cap. `output` must hold the whole sequence: block bytes plus one
+    /// 9-byte header per frame. Header frames ignore flow control (§6.9).
+    pub fn send_headers(
+        connection: *Connection,
+        stream_id: u31,
+        block: []const u8,
+        end_stream: bool,
+        output: []u8,
+    ) usize {
+        assert(connection.state == .frames);
+        assert(block.len > 0); // a response head always carries :status
+        const stream = connection.stream_find(stream_id).?;
+        assert(!stream.end_stream_sent);
+        const fragment_max: u32 =
+            @min(connection.peer_settings.max_frame_size, constants.h2_frame_payload_bytes_max);
+        var produced: usize = 0;
+        var offset: usize = 0;
+        // Bounded: every frame carries at least one block byte.
+        while (offset < block.len) {
+            const fragment_len: u32 = @intCast(@min(block.len - offset, fragment_max));
+            const first = offset == 0;
+            const last = offset + fragment_len == block.len;
+            var flags: u8 = 0;
+            if (last) flags |= h2_frame.Flags.end_headers;
+            if (first and end_stream) flags |= h2_frame.Flags.end_stream;
+            h2_frame.write_frame_header(.{
+                .length = @intCast(fragment_len),
+                .type = if (first) .headers else .continuation,
+                .flags = flags,
+                .stream_id = stream_id,
+            }, output[produced..][0..h2_frame.frame_header_bytes]);
+            produced += h2_frame.frame_header_bytes;
+            @memcpy(output[produced..][0..fragment_len], block[offset..][0..fragment_len]);
+            produced += fragment_len;
+            offset += fragment_len;
+        }
+        if (end_stream) stream.end_stream_sent = true;
+        assert(produced > block.len);
+        return produced;
+    }
+
+    pub const DataSent = struct {
+        accepted: u32,
+        produced: usize,
+        /// END_STREAM went out: every byte fit and `end_stream` was asked.
+        complete: bool,
+    };
+
+    /// Send response-body bytes as one DATA frame, limited by both send
+    /// windows, the frame-size cap, and output space. `accepted` may fall
+    /// short of `bytes` — even to 0 (blocked): hold the rest, wait for a
+    /// `window_open` event, retry. This is where H2 flow control meets the
+    /// §1.4 backpressure model: an unwilling client stalls exactly this
+    /// stream's relay, one buffer deep.
+    pub fn send_data(
+        connection: *Connection,
+        stream_id: u31,
+        bytes: []const u8,
+        end_stream: bool,
+        output: []u8,
+    ) DataSent {
+        assert(connection.state == .frames);
+        const stream = connection.stream_find(stream_id).?;
+        assert(!stream.end_stream_sent);
+        assert(output.len > h2_frame.frame_header_bytes);
+        const window = @max(0, @min(connection.send_window, stream.send_window));
+        const frame_cap: u32 =
+            @min(connection.peer_settings.max_frame_size, constants.h2_frame_payload_bytes_max);
+        const output_cap = output.len - h2_frame.frame_header_bytes;
+        var accepted: u32 = @intCast(@min(bytes.len, @as(u64, @intCast(window))));
+        accepted = @min(accepted, frame_cap, @as(u32, @intCast(@min(output_cap, std.math.maxInt(u32)))));
+        const complete = end_stream and accepted == bytes.len;
+        // An empty DATA frame consumes no window, so a bare END_STREAM
+        // always goes through; otherwise zero accepted means blocked.
+        if (accepted == 0 and !complete) {
+            return .{ .accepted = 0, .produced = 0, .complete = false };
+        }
+        h2_frame.write_frame_header(.{
+            .length = @intCast(accepted),
+            .type = .data,
+            .flags = if (complete) h2_frame.Flags.end_stream else 0,
+            .stream_id = stream_id,
+        }, output[0..h2_frame.frame_header_bytes]);
+        @memcpy(output[h2_frame.frame_header_bytes..][0..accepted], bytes[0..accepted]);
+        connection.send_window -= accepted;
+        stream.send_window -= accepted;
+        assert(connection.send_window >= 0);
+        assert(stream.send_window >= 0);
+        if (complete) stream.end_stream_sent = true;
+        return .{
+            .accepted = accepted,
+            .produced = h2_frame.frame_header_bytes + accepted,
+            .complete = complete,
+        };
+    }
+
     /// Abort a stream: stage RST_STREAM into `output` and free the slot.
     pub fn reset_stream(connection: *Connection, stream_id: u31, code: ErrorCode, output: []u8) usize {
         assert(output.len >= h2_frame.rst_stream_frame_bytes);
@@ -237,7 +341,15 @@ pub const Connection = struct {
         }
         h2_frame.write_settings_ack(output[produced..][0..h2_frame.frame_header_bytes]);
         produced += h2_frame.frame_header_bytes;
-        return .{ .consumed = consumed, .produced = produced, .event = null };
+        return .{
+            .consumed = consumed,
+            .produced = produced,
+            .event = if (delta > 0)
+                // Widened initial windows may unblock stalled streams.
+                .{ .window_open = .{ .stream_id = 0 } }
+            else
+                null,
+        };
     }
 
     fn on_window_update(connection: *Connection, frame: h2_frame.Frame, output: []u8, staged: usize, consumed: usize) Result {
@@ -253,14 +365,20 @@ pub const Connection = struct {
             if (connection.send_window > std.math.maxInt(u31)) {
                 return connection.fail(.flow_control_error, output, staged, consumed);
             }
-            return .{ .consumed = consumed, .produced = staged, .event = null };
+            return .{ .consumed = consumed, .produced = staged, .event = .{
+                .window_open = .{ .stream_id = 0 },
+            } };
         }
         if (connection.stream_find(frame.header.stream_id)) |stream| {
             stream.send_window += increment;
             if (stream.send_window > std.math.maxInt(u31)) {
                 return connection.reset_on_error(stream.id, .flow_control_error, output, staged, consumed);
             }
-        } else if (!connection.stream_closed(frame.header.stream_id)) {
+            return .{ .consumed = consumed, .produced = staged, .event = .{
+                .window_open = .{ .stream_id = stream.id },
+            } };
+        }
+        if (!connection.stream_closed(frame.header.stream_id)) {
             // Idle stream: never legal (§5.1). Closed: ignored (§5.1, §6.9).
             return connection.fail(.protocol_error, output, staged, consumed);
         }
@@ -1056,6 +1174,101 @@ test "h2: goaway from the client surfaces and serving continues" {
     const data_len = TestPeer.data_frame_bytes(1, "still here", true, &frame);
     const data = peer.feed(frame[0..data_len]).?;
     try testing.expectEqualStrings("still here", data.data.bytes);
+}
+
+test "h2: send_headers frames a block, splitting past the frame cap" {
+    var peer = TestPeer{};
+    peer.open();
+    var frame: [256]u8 = undefined;
+    _ = peer.feed(frame[0..TestPeer.request_bytes(1, true, &frame)]);
+
+    var out: [64]u8 = undefined;
+    const small = peer.connection.send_headers(1, "\x88", false, &out); // :status 200
+    const headers_frame = (try h2_frame.parse_frame(out[0..small])).?;
+    try testing.expectEqual(h2_frame.FrameType.headers, headers_frame.header.type);
+    try testing.expect(headers_frame.header.flags & h2_frame.Flags.end_headers != 0);
+    try testing.expect(headers_frame.header.flags & h2_frame.Flags.end_stream == 0);
+    try testing.expectEqual(small, headers_frame.wire_bytes());
+
+    // A block past the 16 KiB frame cap splits into HEADERS + CONTINUATION,
+    // END_HEADERS only on the last, END_STREAM only on the first.
+    var block: [20000]u8 = undefined;
+    @memset(&block, 0x88);
+    var big_out: [20064]u8 = undefined;
+    const big = peer.connection.send_headers(1, &block, true, &big_out);
+    try testing.expectEqual(block.len + 2 * h2_frame.frame_header_bytes, big);
+    const first = (try h2_frame.parse_frame(big_out[0..big])).?;
+    try testing.expectEqual(h2_frame.FrameType.headers, first.header.type);
+    try testing.expect(first.header.flags & h2_frame.Flags.end_headers == 0);
+    try testing.expect(first.header.flags & h2_frame.Flags.end_stream != 0);
+    const second = (try h2_frame.parse_frame(big_out[first.wire_bytes()..big])).?;
+    try testing.expectEqual(h2_frame.FrameType.continuation, second.header.type);
+    try testing.expect(second.header.flags & h2_frame.Flags.end_headers != 0);
+    try testing.expect(peer.connection.streams[0].end_stream_sent);
+}
+
+test "h2: send_data paces on both windows and completes with END_STREAM" {
+    var peer = TestPeer{};
+    peer.open();
+    var frame: [256]u8 = undefined;
+    _ = peer.feed(frame[0..TestPeer.request_bytes(1, true, &frame)]);
+
+    var out: [128]u8 = undefined;
+    // The stream window throttles first.
+    peer.connection.streams[0].send_window = 5;
+    var sent = peer.connection.send_data(1, "hello world", true, &out);
+    try testing.expectEqual(@as(u32, 5), sent.accepted);
+    try testing.expect(!sent.complete);
+    const data = (try h2_frame.parse_frame(out[0..sent.produced])).?;
+    try testing.expectEqualStrings("hello", data.payload);
+    try testing.expect(data.header.flags & h2_frame.Flags.end_stream == 0);
+    try testing.expectEqual(@as(i64, 0), peer.connection.streams[0].send_window);
+
+    // Blocked entirely: zero accepted, nothing produced.
+    sent = peer.connection.send_data(1, " world", true, &out);
+    try testing.expectEqual(@as(u32, 0), sent.accepted);
+    try testing.expectEqual(@as(usize, 0), sent.produced);
+
+    // The client's WINDOW_UPDATE surfaces as window_open; the retry drains.
+    var update: [h2_frame.window_update_frame_bytes]u8 = undefined;
+    h2_frame.write_window_update(1, 100, &update);
+    const event = peer.feed(&update).?;
+    try testing.expectEqual(@as(u31, 1), event.window_open.stream_id);
+    sent = peer.connection.send_data(1, " world", true, &out);
+    try testing.expectEqual(@as(u32, 6), sent.accepted);
+    try testing.expect(sent.complete);
+    const fin = (try h2_frame.parse_frame(out[0..sent.produced])).?;
+    try testing.expect(fin.header.flags & h2_frame.Flags.end_stream != 0);
+    try testing.expect(peer.connection.streams[0].end_stream_sent);
+}
+
+test "h2: send_data respects the connection window and empty END_STREAM" {
+    var peer = TestPeer{};
+    peer.open();
+    var frame: [256]u8 = undefined;
+    _ = peer.feed(frame[0..TestPeer.request_bytes(1, true, &frame)]);
+    _ = peer.feed(frame[0..TestPeer.request_bytes(3, true, &frame)]);
+
+    var out: [128]u8 = undefined;
+    peer.connection.send_window = 4; // connection-level, shared by both
+    var sent = peer.connection.send_data(1, "aaaa", false, &out);
+    try testing.expectEqual(@as(u32, 4), sent.accepted);
+    sent = peer.connection.send_data(3, "bbbb", false, &out);
+    try testing.expectEqual(@as(u32, 0), sent.accepted);
+
+    // A bare END_STREAM needs no window at all.
+    sent = peer.connection.send_data(3, "", true, &out);
+    try testing.expect(sent.complete);
+    try testing.expectEqual(@as(u32, 0), sent.accepted);
+    const fin = (try h2_frame.parse_frame(out[0..sent.produced])).?;
+    try testing.expectEqual(@as(u24, 0), fin.header.length);
+    try testing.expect(fin.header.flags & h2_frame.Flags.end_stream != 0);
+
+    // Connection-level credit announces stream id 0.
+    var update: [h2_frame.window_update_frame_bytes]u8 = undefined;
+    h2_frame.write_window_update(0, 100, &update);
+    const event = peer.feed(&update).?;
+    try testing.expectEqual(@as(u31, 0), event.window_open.stream_id);
 }
 
 test "h2: reset_stream stages RST and frees the slot" {

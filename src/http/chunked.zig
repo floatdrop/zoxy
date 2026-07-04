@@ -35,6 +35,34 @@ pub const ChunkedDecoder = struct {
         return decoder.state == .done;
     }
 
+    pub const Extracted = struct {
+        consumed: usize,
+        /// The chunk-data bytes within `consumed` — a sub-slice of the
+        /// input; empty when the consumed bytes were pure framing.
+        payload: []const u8,
+    };
+
+    /// Like `feed`, but separates payload from framing — for relays that
+    /// re-frame the body instead of forwarding the wire verbatim (the
+    /// H2 downstream leg turns chunks into DATA frames). Consumes until it
+    /// has one contiguous payload span, the message ends, or input runs
+    /// out; call in a loop.
+    pub fn extract(decoder: *ChunkedDecoder, bytes: []const u8) error{Malformed}!Extracted {
+        var consumed: usize = 0;
+        // Bounded: every step consumes >= 1 byte or the state is `.done`.
+        while (consumed < bytes.len and decoder.state != .done) {
+            if (decoder.state == .chunk_data) {
+                const start = consumed;
+                consumed += try decoder.step(bytes[consumed..]); // data bytes only
+                assert(consumed > start);
+                return .{ .consumed = consumed, .payload = bytes[start..consumed] };
+            }
+            consumed += try decoder.step(bytes[consumed..]);
+        }
+        assert(consumed <= bytes.len);
+        return .{ .consumed = consumed, .payload = bytes[0..0] };
+    }
+
     /// Feed wire bytes; returns how many were consumed. Consumption stops at
     /// the end of the chunked message — call `done` to distinguish "message
     /// complete" from "need more input".
@@ -183,6 +211,37 @@ test "chunked: survives byte-at-a-time delivery" {
     }
     try std.testing.expect(decoder.done());
     try std.testing.expectEqual(wire.len, consumed);
+}
+
+test "chunked: extract separates payload from framing" {
+    var decoder = ChunkedDecoder{};
+    const wire = "5\r\nHELLO\r\n3\r\nabc\r\n0\r\nX-T: 1\r\n\r\nNEXT";
+    var payload: [16]u8 = undefined;
+    var payload_used: usize = 0;
+    var offset: usize = 0;
+    while (!decoder.done()) {
+        const result = try decoder.extract(wire[offset..]);
+        @memcpy(payload[payload_used..][0..result.payload.len], result.payload);
+        payload_used += result.payload.len;
+        offset += result.consumed;
+    }
+    try std.testing.expectEqualStrings("HELLOabc", payload[0..payload_used]);
+    try std.testing.expectEqualStrings("NEXT", wire[offset..]);
+}
+
+test "chunked: extract survives byte-at-a-time delivery" {
+    var decoder = ChunkedDecoder{};
+    const wire = "2\r\nhi\r\n0\r\n\r\n";
+    var payload: [8]u8 = undefined;
+    var payload_used: usize = 0;
+    for (wire) |byte| {
+        const result = try decoder.extract(&[_]u8{byte});
+        @memcpy(payload[payload_used..][0..result.payload.len], result.payload);
+        payload_used += result.payload.len;
+        try std.testing.expectEqual(@as(usize, 1), result.consumed);
+    }
+    try std.testing.expect(decoder.done());
+    try std.testing.expectEqualStrings("hi", payload[0..payload_used]);
 }
 
 test "chunked: rejects malformed input" {
