@@ -273,10 +273,17 @@ constant-across-runs tail is a systematic effect; a spread is variance.
 
 HTTP/2 & HTTP/3: pure-Zig stacks now exist (quic-zig, httpx.zig) but bundle
 their own runtime and an injected allocator — neither survives the zero-alloc
-gate or the own-the-ring model. The fit is a sans-io protocol core driven from
-completions like the `Channel` above: roll our own (§7 Phase 5), or FFI a
-sans-io C library (`nghttp2`; `ngtcp2`/`nghttp3` for H3) whose allocator routes
-through a reserved heap, as OpenSSL's does.
+gate or the own-the-ring model. **Decided (2026-07): roll our own sans-io H2
+core** (§7 Phase 5), the same shape as the `Channel` above — a bounded protocol
+state machine that never sees a socket, fed bytes from completions,
+deterministically testable down to 1-byte delivery. The FFI fallback
+(`nghttp2` has an allocator hook like OpenSSL's) was rejected: routing
+allocations is not the same as *bounding* them — nghttp2 sizes its internal
+queues and stream state dynamically, while our H2 limits must be
+`src/constants.zig` numbers we reserve, advertise via SETTINGS, and enforce.
+Unlike TLS there is no crypto to outsource; framing + HPACK + a state machine
+is tractable to own. (H3 unchanged: would need `ngtcp2`/`nghttp3` or std QUIC;
+revisit then.)
 
 ---
 
@@ -348,9 +355,47 @@ balancing is a prerequisite for H2's few-hot-connections traffic shape.
 - **Mechanical sympathy** (post-Phase 4): metrics sharding + cache-line
   padding, gated with hardware HITM counters (§4).
 
-### Phase 5 — HTTP/2 (planned)
-Per-stream state machines, dual-level flow control into the existing
-backpressure model, HPACK, multiplexed pooling with GOAWAY draining.
+### Phase 5 — HTTP/2 (planned; own sans-io core)
+Own implementation, sans-io, strictly bounded (§6, decided 2026-07): every H2
+knob — concurrent streams per connection, HPACK dynamic-table size, header-list
+size, max frame size, per-stream window — is a `src/constants.zig` number that
+is reserved at startup, advertised in our SETTINGS, and enforced on the wire.
+We never honor a peer setting that would exceed what we reserved.
+
+**Scope cut: H2 downstream / H1 upstream first.** Each H2 stream maps to one
+H1 transaction over the existing upstream pool, retries, and resilience
+machinery — the initial deliverable is the translation layer, not upstream
+multiplexing. H2 upstream (multiplexed pooling, GOAWAY-aware draining of
+shared connections) is a later slice, once the core is proven downstream.
+
+Slices, each behind the usual gates (zero-alloc, sim seeds, zrk bands):
+
+1. **Frame codec** — sans-io frame reader/writer over fixed buffers: preface,
+   9-byte header, bounded max frame size, SETTINGS exchange/ack, PING,
+   unknown-type skip. Pure functions over slices; unit-tested exhaustively.
+2. **HPACK** — static table, fixed-capacity dynamic table (we advertise
+   exactly the bytes we reserved), Huffman decoding, bounded header-list size
+   with the H2-native reject (COMPRESSION_ERROR / RST_STREAM, the 431
+   analogue). Encoder minimal: static-table + literal, no dynamic insertions.
+3. **Connection & stream state machines** — per-connection fixed stream
+   slots (`MAX_CONCURRENT_STREAMS` is pool math, exhaustion → REFUSED_STREAM),
+   RFC 9113 lifecycle, dual-level (connection + stream) flow-control
+   accounting. Priorities omitted — RFC 9113 deprecated them.
+4. **Translation + relay** — pseudo-headers ↔ request line/Host, per-stream
+   upstream checkout, response translation back into HEADERS/DATA. Flow
+   control *is* the backpressure model (§1.4): the stream window we advertise
+   is the relay-buffer size, and WINDOW_UPDATE is sent only after the upstream
+   write completes — recv → send → recv survives, per-stream memory stays one
+   fixed buffer, and a slow upstream stalls exactly its stream.
+5. **Integration & operability** — ALPN flips to prefer `h2` (config-gated),
+   GOAWAY rides the Phase 4 drain (kTLS is below the record layer, so H2 over
+   the switched path needs nothing new), zero-alloc gate extended over H2
+   traffic, sim invariants (every stream slot drains to zero under every
+   seed), zrk measurement gate including the few-hot-connections shape that
+   accept balancing (Phase 4) exists to serve.
+
+Later slices: H2 upstream + multiplexed upstream pooling; CONTINUATION-flood
+and rapid-reset hardening beyond what the fixed slots already give.
 
 ### Phase 6 — dynamic config (planned)
 xDS-style client or simpler custom protocol; apply via RCU pointer swap
