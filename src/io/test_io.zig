@@ -270,6 +270,20 @@ pub const IO = struct {
         assert(socket.state != .free); // double close
         assert(socket.state != .closed); // double close
         if (socket.state == .listener) {
+            // Queued-but-unaccepted connections die with the listener (the
+            // kernel resets them); their peers see the close. Inlined stream
+            // close per entry — no recursion (TigerStyle).
+            for (socket.accept_queue[0..socket.accept_queue_len]) |queued_fd| {
+                const queued = io.socket_at(queued_fd);
+                assert(queued.state == .stream); // queued fds were never accepted
+                if (queued.peer_fd >= 0) {
+                    const peer = io.socket_at(queued.peer_fd);
+                    peer.remote_closed = true;
+                    peer.peer_fd = -1;
+                }
+                queued.state = .closed;
+                queued.peer_fd = -1;
+            }
             socket.* = .{ .state = .free };
             return;
         }

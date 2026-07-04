@@ -25,8 +25,14 @@ pub const Metrics = struct {
     accepted: Counter = .{},
     /// Currently-open downstream connections (gauge).
     active: Counter = .{},
-    /// Connections rejected because the pool was full (backpressure).
+    /// Connections rejected because the pool was full (backpressure) or the
+    /// worker was draining when the accept completed.
     rejected: Counter = .{},
+    /// Workers currently draining (gauge; nonzero means shutdown began).
+    draining: Counter = .{},
+    /// Connections torn down by the deadline while draining — clients or
+    /// upstreams that outlived the drain limit.
+    drain_forced_closes: Counter = .{},
     /// Requests whose head parsed and routed.
     requests: Counter = .{},
     /// 4xx responses zoxy generated (bad/oversized requests).

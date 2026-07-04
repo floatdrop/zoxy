@@ -369,6 +369,13 @@ pub const ProxyConn = struct {
     /// A request is in flight (or aborted mid-flight) — controls whether the
     /// final teardown writes an access-log record.
     request_active: bool,
+    /// The worker is draining (docs/DESIGN.md §7 Phase 4): this connection
+    /// must not be reused after the in-flight response — the response head
+    /// gets `Connection: close` injected if it has not been relayed yet, and
+    /// `response_complete` closes instead of `finish_request`. Set by the
+    /// drain sweep only; connection-scoped (no reset between requests —
+    /// draining never un-happens).
+    drain_close: bool,
 
     // The upstream-bound head as slices of `head_buf` (plus the static
     // `Connection: close` injection), laid out by `build_prime_segments`.
@@ -451,6 +458,9 @@ pub const ProxyConn = struct {
     ktls_close_message: linux.msghdr_const,
 
     free_next: ?*ProxyConn,
+    /// Maintained by `Pool`: true between acquire and release. Makes every
+    /// slot in `pool.items` classifiable for the drain sweep and diagnostics.
+    in_use: bool,
 
     /// The downstream TLS layer (docs/DESIGN.md §6). The `Channel` transforms
     /// bytes; this struct owns the wire staging and the *logical* plaintext
@@ -583,6 +593,7 @@ pub const ProxyConn = struct {
         conn.downstream_fd = downstream_fd;
         conn.upstream_fd = -1;
         conn.closing = false;
+        conn.drain_close = false; // accepts stop before the drain sweep runs
         conn.refs = 0;
         conn.request_timeout_ns = request_timeout_ns;
         conn.idle_timeout_ns = idle_timeout_ns;
@@ -637,7 +648,12 @@ pub const ProxyConn = struct {
         conn.timeout_armed = false;
         if (conn.closing) return; // fired late / we cancelled it
         const now = conn.io.now_ns();
-        if (now >= conn.deadline_ns) return conn.teardown(); // the overall deadline is supreme
+        if (now >= conn.deadline_ns) { // the overall deadline is supreme
+            // The drain sweep clamps deadlines: at this point the connection
+            // outlived the drain limit and is being forced closed.
+            if (conn.drain_close) conn.metrics.drain_forced_closes.add(1);
+            return conn.teardown();
+        }
         if (conn.try_deadline_ns != 0 and now >= conn.try_deadline_ns) conn.abort_attempt();
         conn.arm_timeout(); // still time left (or a deadline moved); keep watching
     }
@@ -2015,9 +2031,12 @@ pub const ProxyConn = struct {
         const connection = ConnectionTokens.collect(response.headers);
         // Reuse intent: a framed response to a keep-alive client. The final
         // decision (`can_reuse_downstream`) also needs the request forwarded.
+        // A draining worker never reuses — falling into the injection branch
+        // below, so the client is told `Connection: close` (RFC 9112 §9.6).
         conn.response_reusable = conn.downstream_keep_alive and
             framing != .until_close and
-            !connection.overflow;
+            !connection.overflow and
+            !conn.drain_close;
         // The upstream connection can be pooled when the response is framed
         // HTTP/1.1 that does not announce a close. (Decided before the strip
         // below invalidates the header slices.)
@@ -2119,8 +2138,10 @@ pub const ProxyConn = struct {
         conn.settle_accounting(.success);
         conn.maybe_pool_upstream();
         // The response is fully delivered: a close here is server-initiated
-        // and polite (close_notify for a TLS client).
-        if (!conn.can_reuse_downstream()) return conn.close_downstream();
+        // and polite (close_notify for a TLS client). `drain_close` covers a
+        // drain that began after this response's head (with its reuse
+        // decision) was already relayed: complete response, then close.
+        if (!conn.can_reuse_downstream() or conn.drain_close) return conn.close_downstream();
         conn.finish_request();
     }
 
@@ -2308,8 +2329,30 @@ pub const ProxyServer = struct {
     upstream_tls_contexts: []const ?*const terminator.Context,
     request_timeout_ns: u63,
     idle_timeout_ns: u63,
+    /// Drain-to-forced-teardown bound; set by the worker after init like
+    /// `worker_index` (the simulator shrinks it to force the deadline path).
+    drain_timeout_ns: u63,
+    /// Graceful drain (docs/DESIGN.md §7 Phase 4). Once `draining` is set:
+    /// no new accepts, the listener closes, idle connections close politely,
+    /// in-flight responses are completed-then-closed, and the worker's loop
+    /// exits when `drain_complete()`.
+    draining: bool,
+    /// The listener fd has been closed (exactly once, by the drain path).
+    listener_closed: bool,
+    /// Server-scoped ring ops in flight: the accept, its retry timer, the
+    /// accept cancel, and the drain-trigger recv. `drain_complete` requires
+    /// zero so a worker never abandons a live op on ring teardown.
+    operations_pending: u32,
+    accept_pending: bool,
+    /// Wired by the worker before `start` (-1 = none): a byte, EOF, or error
+    /// on this fd — main's socketpair poke — begins the drain. The pending
+    /// recv is what lets a signal wake a worker blocked in the ring.
+    drain_trigger_fd: posix.socket_t,
+    drain_trigger_buf: [1]u8,
     accept_completion: Completion,
     accept_retry_completion: Completion,
+    accept_cancel_completion: Completion,
+    drain_trigger_completion: Completion,
 
     pub fn init(
         io: *IO,
@@ -2336,8 +2379,17 @@ pub const ProxyServer = struct {
             .upstream_tls_contexts = &.{},
             .request_timeout_ns = request_timeout_ns,
             .idle_timeout_ns = idle_timeout_ns,
+            .drain_timeout_ns = constants.drain_timeout_ns,
+            .draining = false,
+            .listener_closed = false,
+            .operations_pending = 0,
+            .accept_pending = false,
+            .drain_trigger_fd = -1,
+            .drain_trigger_buf = undefined,
             .accept_completion = undefined,
             .accept_retry_completion = undefined,
+            .accept_cancel_completion = undefined,
+            .drain_trigger_completion = undefined,
         };
     }
 
@@ -2347,10 +2399,17 @@ pub const ProxyServer = struct {
     }
 
     pub fn start(server: *ProxyServer) void {
+        assert(!server.draining); // a drained server never restarts
         server.arm_accept();
+        if (server.drain_trigger_fd >= 0) server.arm_drain_trigger();
+        assert(server.operations_pending >= 1); // at least the accept is in flight
     }
 
     fn arm_accept(server: *ProxyServer) void {
+        assert(!server.accept_pending); // one accept in flight, always
+        assert(!server.draining); // every re-arm site checks first
+        server.accept_pending = true;
+        server.operations_pending += 1;
         server.io.accept(
             *ProxyServer,
             server,
@@ -2365,6 +2424,20 @@ pub const ProxyServer = struct {
         _: *Completion,
         result: io_mod.AcceptError!posix.socket_t,
     ) void {
+        assert(server.accept_pending);
+        server.accept_pending = false;
+        server.operations_pending -= 1;
+        if (server.draining) {
+            // The accept loop ends here — cancelled, or one last connection
+            // raced the cancel and is shed unserved. Either way the listener
+            // closes now: refused-at-connect beats accepted-then-ignored.
+            if (result) |fd| {
+                server.metrics.rejected.add(1);
+                server.io.close_now(fd);
+            } else |_| {}
+            server.close_listener();
+            return;
+        }
         if (result) |fd| {
             assert(fd >= 0);
             assert(server.worker_index < constants.workers_max);
@@ -2397,13 +2470,16 @@ pub const ProxyServer = struct {
             error.ProcessFdQuotaExceeded,
             error.SystemFdQuotaExceeded,
             error.SystemResources,
-            => server.io.timeout(
-                *ProxyServer,
-                server,
-                on_accept_retry,
-                &server.accept_retry_completion,
-                constants.accept_retry_delay_ns,
-            ),
+            => {
+                server.operations_pending += 1;
+                server.io.timeout(
+                    *ProxyServer,
+                    server,
+                    on_accept_retry,
+                    &server.accept_retry_completion,
+                    constants.accept_retry_delay_ns,
+                );
+            },
             // Transient, per-connection failures (e.g. the peer aborted its
             // handshake); accept the next connection immediately.
             else => server.arm_accept(),
@@ -2416,7 +2492,115 @@ pub const ProxyServer = struct {
         result: io_mod.TimeoutError!void,
     ) void {
         result catch {}; // even a failed timer must not stop the accept loop
+        assert(server.operations_pending > 0);
+        server.operations_pending -= 1;
+        // A drain that began during the backoff wait finds no accept pending
+        // to cancel; the accept loop ends on this tick instead.
+        if (server.draining) return server.close_listener();
         server.arm_accept();
+    }
+
+    // ---- graceful drain (docs/DESIGN.md §7 Phase 4) -------------------------
+
+    fn arm_drain_trigger(server: *ProxyServer) void {
+        assert(server.drain_trigger_fd >= 0);
+        assert(!server.draining);
+        server.operations_pending += 1;
+        server.io.recv(
+            *ProxyServer,
+            server,
+            on_drain_trigger,
+            &server.drain_trigger_completion,
+            server.drain_trigger_fd,
+            server.drain_trigger_buf[0..],
+        );
+    }
+
+    fn on_drain_trigger(
+        server: *ProxyServer,
+        _: *Completion,
+        result: io_mod.RecvError!usize,
+    ) void {
+        assert(server.operations_pending > 0);
+        server.operations_pending -= 1;
+        // A byte is the poke; EOF or an error means the main thread is gone.
+        // All of them mean the same thing: stop taking work and finish up.
+        _ = result catch {};
+        server.begin_drain();
+    }
+
+    /// Begin the graceful drain: stop accepting (cancel the pending accept —
+    /// its completion closes the listener), clamp every live connection's
+    /// deadline to the drain limit, close the idle ones politely, and mark
+    /// the busy ones close-after-response. Idempotent.
+    pub fn begin_drain(server: *ProxyServer) void {
+        if (server.draining) return;
+        server.draining = true;
+        server.metrics.draining.add(1);
+        if (server.accept_pending) {
+            server.operations_pending += 1;
+            server.io.cancel(
+                *ProxyServer,
+                server,
+                on_accept_cancel,
+                &server.accept_cancel_completion,
+                &server.accept_completion,
+            );
+        } else if (!server.listener_closed) {
+            // No accept in flight (a backoff wait, or a server that never
+            // started): nothing will deliver a completion — close here.
+            server.close_listener();
+        }
+        const deadline_ns = server.io.now_ns() + server.drain_timeout_ns;
+        for (server.pool.items) |*conn| {
+            if (!conn.in_use) continue;
+            if (conn.closing) continue; // already on its way out
+            conn.drain_close = true;
+            // The supreme deadline now also bounds the drain: the ticking
+            // timer force-closes whatever outlives it (`drain_forced_closes`).
+            if (conn.deadline_ns > deadline_ns) conn.deadline_ns = deadline_ns;
+            // Idle between requests: close now, politely (close_notify /
+            // kTLS alert for TLS clients). A connection owing or serving a
+            // request (`request_active`) finishes it first; the response
+            // path closes via `drain_close`.
+            if (!conn.request_active) conn.close_downstream();
+        }
+        assert(server.draining);
+    }
+
+    fn on_accept_cancel(
+        server: *ProxyServer,
+        _: *Completion,
+        _: io_mod.CancelError!void,
+    ) void {
+        // ENOENT (the accept won the race) is fine: on_accept saw `draining`
+        // and closed the listener itself.
+        assert(server.operations_pending > 0);
+        server.operations_pending -= 1;
+    }
+
+    /// Close the listener fd exactly once. Nothing is ever pending on it at
+    /// this point (the accept completed or was never armed), so the close is
+    /// synchronous. Queued-but-unaccepted handshakes get RST — unavoidable
+    /// with a closing SO_REUSEPORT listener, and documented.
+    fn close_listener(server: *ProxyServer) void {
+        assert(server.draining); // only the drain path closes the listener
+        if (server.listener_closed) return;
+        server.listener_closed = true;
+        assert(!server.accept_pending); // never close under a live accept
+        server.io.close_now(server.listener.fd);
+    }
+
+    /// The worker's exit condition: draining, every connection slot back in
+    /// the pool, and no server-scoped op left on the ring. The parked
+    /// upstream connections are closed by `deinit` after this returns true.
+    pub fn drain_complete(server: *const ProxyServer) bool {
+        if (!server.draining) return false;
+        if (server.operations_pending > 0) return false;
+        if (server.pool.free_count != server.pool.capacity) return false;
+        assert(server.listener_closed); // no ops pending implies the accept ended
+        assert(!server.accept_pending);
+        return true;
     }
 };
 
@@ -5437,6 +5621,260 @@ test "proxy: an idle keep-alive connection is reclaimed by the idle timeout" {
     try std.testing.expect(monotonic_nanos() - started_ns < 2 * std.time.ns_per_s);
 }
 
+/// A keep-alive test client: sends one request, accumulates response bytes,
+/// records the EOF the drain's close delivers.
+const DrainTestClient = struct {
+    io: *IO,
+    fd: posix.socket_t,
+    request: []const u8,
+    buf: [512]u8 = undefined,
+    len: usize = 0,
+    eof: bool = false,
+    send_c: Completion = undefined,
+    recv_c: Completion = undefined,
+
+    fn go(c: *DrainTestClient) void {
+        c.arm_recv();
+        c.io.send(*DrainTestClient, c, on_send, &c.send_c, c.fd, c.request);
+    }
+    fn arm_recv(c: *DrainTestClient) void {
+        c.io.recv(*DrainTestClient, c, on_recv, &c.recv_c, c.fd, c.buf[c.len..]);
+    }
+    fn on_send(c: *DrainTestClient, _: *Completion, _: io_mod.SendError!usize) void {
+        _ = c;
+    }
+    fn on_recv(c: *DrainTestClient, _: *Completion, result: io_mod.RecvError!usize) void {
+        const n = result catch 0;
+        if (n == 0) {
+            c.eof = true;
+            return;
+        }
+        c.len += n;
+        c.arm_recv();
+    }
+};
+
+/// True while the pool holds no live connection that is idle between
+/// requests — pump until this flips to observe the sweep's idle-close path.
+fn no_idle_connection(pool: *Pool) bool {
+    for (pool.items) |*conn| {
+        if (conn.in_use and !conn.request_active and !conn.closing) return false;
+    }
+    return true;
+}
+
+fn expect_connect_refused(port: u16) !void {
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    try std.testing.expect(linux.errno(rc) == .SUCCESS);
+    const fd: posix.socket_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    const sa = sockaddr_in(Ip4Address.loopback(port));
+    const connect_rc = linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in));
+    try std.testing.expect(linux.errno(connect_rc) == .CONNREFUSED);
+}
+
+test "proxy: drain closes an idle keep-alive connection and refuses new connects" {
+    const gpa = std.testing.allocator;
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO";
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    var origin = TestOrigin{
+        .io = &io,
+        .listener = origin_listener,
+        .response = response,
+        .close_after_send = false, // keep-alive on both hops
+    };
+    origin.start();
+
+    var json_buf: [256]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
+    , .{origin_listener.bound_address().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+
+    // No defer close: the drain path closes the listener exactly once.
+    const proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    const proxy_port = proxy_listener.bound_address().port;
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
+    );
+    defer server.deinit();
+    server.start();
+
+    const client = try connect_loopback(proxy_port);
+    defer _ = linux.close(client);
+    var c = DrainTestClient{
+        .io = &io,
+        .fd = client,
+        .request = "GET / HTTP/1.1\r\nHost: o\r\n\r\n", // keep-alive
+    };
+    c.go();
+
+    // Let the exchange finish so the connection is idle between requests.
+    while (no_idle_connection(&pool)) try io.run_once();
+    try std.testing.expectEqualStrings(response, c.buf[0..c.len]);
+    try std.testing.expect(!c.eof); // keep-alive: the proxy is holding it open
+
+    server.begin_drain();
+    // The sweep closes the idle connection; the client sees a clean EOF.
+    while (!c.eof) try io.run_once();
+    while (!server.drain_complete()) try io.run_once();
+    try std.testing.expectEqualStrings(response, c.buf[0..c.len]); // nothing extra
+    try std.testing.expectEqual(@as(u64, 1), metrics.draining.load());
+    try std.testing.expectEqual(@as(u64, 0), metrics.drain_forced_closes.load());
+    try std.testing.expect(server.resilience.is_idle());
+
+    // The listener closed with the accept loop: connects are refused now.
+    try expect_connect_refused(proxy_port);
+}
+
+test "proxy: drain during a request completes it with Connection: close injected" {
+    const gpa = std.testing.allocator;
+    // The origin's response is keep-alive shaped: the close announcement the
+    // client sees can only come from the proxy's drain injection.
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO";
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    var origin = TestOrigin{
+        .io = &io,
+        .listener = origin_listener,
+        .response = response,
+        .close_after_send = false,
+    };
+    origin.start();
+
+    var json_buf: [256]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
+    , .{origin_listener.bound_address().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+
+    const proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
+    );
+    defer server.deinit();
+    server.start();
+
+    // Connect, wait for the accept, and only then drain: the connection owes
+    // a request (`request_active`), so the sweep leaves it running and the
+    // response path must do the closing.
+    const client = try connect_loopback(proxy_listener.bound_address().port);
+    defer _ = linux.close(client);
+    while (metrics.active.load() == 0) try io.run_once();
+    server.begin_drain();
+
+    var c = DrainTestClient{
+        .io = &io,
+        .fd = client,
+        .request = "GET / HTTP/1.1\r\nHost: o\r\n\r\n", // asked for keep-alive
+    };
+    c.go();
+    while (!c.eof) try io.run_once();
+    while (!server.drain_complete()) try io.run_once();
+
+    // Full response delivered, with the close announced (RFC 9112 §9.6).
+    const received = c.buf[0..c.len];
+    try std.testing.expect(std.mem.indexOf(u8, received, "Connection: close\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, received, "\r\n\r\nHELLO"));
+    try std.testing.expectEqual(@as(u64, 1), metrics.requests.load());
+    try std.testing.expect(server.resilience.is_idle());
+}
+
+test "proxy: a byte on the drain trigger fd begins the drain" {
+    const gpa = std.testing.allocator;
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    var cfg = try config.parse(gpa,
+        \\{ "listen": "0.0.0.0:0", "routes": [{ "cluster": "o" }],
+        \\  "clusters": [{ "name": "o", "endpoints": ["127.0.0.1:9"] }] }
+    );
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+
+    const proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    const proxy_port = proxy_listener.bound_address().port;
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
+    );
+    defer server.deinit();
+
+    // The worker wiring: a socketpair whose worker end has a recv pending on
+    // the ring — one byte from the main thread is the whole protocol.
+    var fds: [2]i32 = undefined;
+    const pair_rc = linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC,
+        0,
+        &fds,
+    );
+    try std.testing.expect(linux.errno(pair_rc) == .SUCCESS);
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    server.drain_trigger_fd = fds[0];
+    server.start();
+    try std.testing.expect(!server.draining);
+
+    const poke = [1]u8{'d'};
+    try std.testing.expectEqual(@as(usize, 1), linux.write(fds[1], &poke, poke.len));
+    while (!server.drain_complete()) try io.run_once();
+    try std.testing.expect(server.draining);
+    try std.testing.expectEqual(@as(u64, 1), metrics.draining.load());
+    try expect_connect_refused(proxy_port);
+}
+
 test "proxy: the serving path allocates nothing after startup (zero-alloc gate)" {
     var counting = guard.CountingAllocator{ .backing = std.testing.allocator };
     const gpa = counting.allocator();
@@ -5464,8 +5902,8 @@ test "proxy: the serving path allocates nothing after startup (zero-alloc gate)"
 
     var metrics = Metrics{};
     var access = AccessLog{ .fd = -1 };
-    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer proxy_listener.close();
+    // No defer close: the drain at the end of this test closes the listener.
+    const proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     var server = ProxyServer.init(
         &io,
         &pool,
@@ -5515,6 +5953,12 @@ test "proxy: the serving path allocates nothing after startup (zero-alloc gate)"
 
     // The full accept -> parse -> route -> connect -> relay -> log path must not
     // have touched the allocator.
+    try std.testing.expectEqual(baseline, counting.allocation_count());
+
+    // Drain is on the serving path too (it runs while requests fly): the
+    // sweep, the accept cancel, and the listener close allocate nothing.
+    server.begin_drain();
+    while (!server.drain_complete()) try io.run_once();
     try std.testing.expectEqual(baseline, counting.allocation_count());
 }
 

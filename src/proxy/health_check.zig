@@ -112,10 +112,24 @@ pub const HealthChecker = struct {
         checker.arm_tick();
     }
 
-    /// Stop scheduling (tests; workers run forever). In-flight ops drain on
-    /// their own — poll `quiesced` while driving the loop.
+    /// Stop scheduling (graceful drain, tests): nothing re-arms, and every
+    /// in-flight probe connect is cancelled so quiescence is bounded by the
+    /// cancellations, not by a black-holed endpoint's SYN retries. Poll
+    /// `quiesced` while driving the loop.
     pub fn stop(checker: *HealthChecker) void {
         checker.running = false;
+        for (&checker.probes) |*probe| {
+            if (!probe.connect_pending) continue;
+            if (probe.cancel_pending) continue; // already being reaped
+            probe.cancel_pending = true;
+            checker.io.cancel(
+                *Probe,
+                probe,
+                on_probe_cancel,
+                &probe.cancel_completion,
+                &probe.connect_completion,
+            );
+        }
     }
 
     pub fn quiesced(checker: *const HealthChecker) bool {
@@ -223,7 +237,10 @@ pub const HealthChecker = struct {
         probe.checker.io.close_now(probe.fd);
         probe.fd = -1;
         const success = if (result) |_| true else |_| false; // cancel arrives as an error
-        probe.checker.record(probe.cluster_index, probe.endpoint_index, success);
+        // A probe cancelled by stop() says nothing about the endpoint.
+        if (probe.checker.running) {
+            probe.checker.record(probe.cluster_index, probe.endpoint_index, success);
+        }
     }
 
     fn on_probe_cancel(probe: *Probe, _: *Completion, _: io_mod.CancelError!void) void {

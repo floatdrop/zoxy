@@ -25,7 +25,12 @@
 //!   truncation, reordering, and cross-connection contamination (stray
 //!   bytes on a pooled upstream would surface here);
 //! - all connection slots return to the pool, and `metrics.active` is zero,
-//!   once every client is gone: no leaks under any schedule.
+//!   once every client is gone: no leaks under any schedule;
+//! - graceful drain (a third of iterations, begun at a random step): accepts
+//!   freeze, the listener closes (later connects are refused), every slot
+//!   still drains to zero — with a drain deadline short enough that forced
+//!   teardown of wedged exchanges is exercised — and the worker's exit
+//!   condition (`drain_complete`) is reached with no server op abandoned.
 
 pub const zoxy_io = .simulation;
 
@@ -179,6 +184,14 @@ fn run_iteration(seed: u64) !u64 {
     // The balancer's PRNG derives from the iteration seed: same seed, same
     // P2C draws, same schedule — determinism end to end.
     server.prng = .init(seed +% 0x853C49E6748FEA9B);
+    // A third of iterations drain mid-traffic. The drain deadline sits below
+    // the per-try timeout (2s) so wedged exchanges (black-holed connects,
+    // never-responding origins) hit the forced-teardown path, not just the
+    // polite one.
+    const drain_requested = workload.one_in(3);
+    const drain_after_steps: u64 =
+        if (drain_requested) workload.prng.random().intRangeLessThan(u64, 0, 1500) else 0;
+    if (drain_requested) server.drain_timeout_ns = 1 * std.time.ns_per_s;
     server.start();
 
     // Active health probes run through the same virtual ring and fault
@@ -201,11 +214,22 @@ fn run_iteration(seed: u64) !u64 {
     // Drive until every client concluded, then until the proxy reclaimed
     // every slot (teardowns, idle timeouts, pool checkins all complete).
     var steps: u64 = 0;
+    var accepted_at_drain: ?u64 = null;
     while (!clients_done(clients)) : (steps += 1) {
+        if (drain_requested and accepted_at_drain == null and steps >= drain_after_steps) {
+            server.begin_drain();
+            accepted_at_drain = metrics.accepted.load();
+        }
         if (steps > step_cap) fail("hang: step cap with {d} clients unfinished", .{
             clients_unfinished(clients),
         });
         io.run_once() catch fail("deadlock while clients still running", .{});
+    }
+    // Clients can all conclude before the drain step arrives: drain an idle
+    // proxy then — begin_drain with nothing in flight must still complete.
+    if (drain_requested and accepted_at_drain == null) {
+        server.begin_drain();
+        accepted_at_drain = metrics.accepted.load();
     }
     while (pool.free_count != pool.capacity) : (steps += 1) {
         if (steps > step_cap) fail("leak: {d} slots never reclaimed", .{
@@ -216,6 +240,32 @@ fn run_iteration(seed: u64) !u64 {
             io.dump_pending();
             fail("leak: slot held with no pending operation", .{});
         };
+    }
+    if (drain_requested) {
+        // The worker's exit condition: server-scoped ops (the cancelled
+        // accept, its cancel, a backoff timer) must all deliver — a worker
+        // never abandons a live op on ring teardown.
+        while (!server.drain_complete()) : (steps += 1) {
+            if (steps > step_cap) fail("drain never completed ({d} ops pending)", .{
+                server.operations_pending,
+            });
+            io.run_once() catch {
+                io.dump_pending();
+                fail("drain stalled: {d} server ops pending, nothing ready", .{
+                    server.operations_pending,
+                });
+            };
+        }
+        // Accepts froze at begin_drain: the cancel (or the drain branch of
+        // on_accept) guarantees no connection was started after it.
+        if (metrics.accepted.load() != accepted_at_drain.?) {
+            fail("accepted {d} connections after drain began", .{
+                metrics.accepted.load() - accepted_at_drain.?,
+            });
+        }
+        if (metrics.draining.load() != 1) fail("draining gauge = {d}, want 1", .{
+            metrics.draining.load(),
+        });
     }
     server.deinit();
     if (metrics.active.load() != 0) fail("metrics.active = {d} after drain", .{
@@ -234,7 +284,7 @@ fn run_iteration(seed: u64) !u64 {
 /// Diagnostic for leak failures: the state of every in-use connection slot.
 fn dump_pool(pool: *ConnPool) void {
     for (pool.items) |*conn| {
-        if (conn.free_next != null) continue; // parked on the free list
+        if (!conn.in_use) continue; // parked on the free list
         std.debug.print(
             "sim: leaked conn: refs={d} closing={} timeout_armed={} downstream_fd={d} " ++
                 "upstream_fd={d} " ++

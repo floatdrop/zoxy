@@ -91,6 +91,13 @@ pub const idle_timeout_ns: u63 = 60 * std.time.ns_per_s;
 /// slop when a deadline moves closer.
 pub const timeout_tick_ns: u63 = 1 * std.time.ns_per_s;
 
+/// Bound between "drain begins" (SIGTERM, or the trigger fd) and the forced
+/// teardown of whatever is still open. Applied as a clamp on every live
+/// connection's supreme deadline, so the existing per-connection ticking
+/// timer enforces it — a worker is gone at most this long (plus one tick)
+/// after the signal, whatever clients and origins do.
+pub const drain_timeout_ns: u63 = 30 * std.time.ns_per_s;
+
 /// Idle upstream connections parked per worker (across all endpoints).
 /// Checkin beyond this closes the connection instead of keeping it.
 pub const upstream_idle_max: usize = 64;

@@ -145,6 +145,33 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
+    // Graceful drain (docs/DESIGN.md §7 Phase 4): SIGTERM/SIGINT are blocked
+    // in every thread (workers inherit this mask) and surface only through
+    // the signalfd read below. Each worker gets one end of a socketpair with
+    // a recv pending on its ring — writing the other end is how a signal
+    // wakes a worker that is blocked in io_uring_enter.
+    var signal_mask = linux.sigemptyset();
+    linux.sigaddset(&signal_mask, .TERM);
+    linux.sigaddset(&signal_mask, .INT);
+    _ = linux.sigprocmask(linux.SIG.BLOCK, &signal_mask, null);
+    const signal_fd_rc = linux.signalfd(-1, &signal_mask, linux.SFD.CLOEXEC);
+    if (linux.errno(signal_fd_rc) != .SUCCESS) {
+        std.log.err("zoxy: cannot create signalfd: {s}", .{@tagName(linux.errno(signal_fd_rc))});
+        return error.SignalFdFailed;
+    }
+    const signal_fd: linux.fd_t = @intCast(signal_fd_rc);
+
+    const drain_triggers = try gpa.alloc([2]linux.fd_t, worker_count);
+    for (drain_triggers) |*pair| {
+        var fds: [2]i32 = undefined;
+        const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds);
+        if (linux.errno(rc) != .SUCCESS) {
+            std.log.err("zoxy: cannot create drain socketpair: {s}", .{@tagName(linux.errno(rc))});
+            return error.SocketPairFailed;
+        }
+        pair.* = .{ fds[0], fds[1] };
+    }
+
     // Shared counters (atomic) and per-worker access logs, reserved up front.
     var metrics: Metrics = .{};
     const accesses = try gpa.alloc(AccessLog, worker_count);
@@ -162,14 +189,14 @@ pub fn main(init: std.process.Init) !void {
     const seed_base = std.mem.readInt(u64, &seed_bytes, .little);
 
     const threads = try gpa.alloc(std.Thread, worker_count);
-    for (threads, pools, accesses, 0..) |*thread, *pool, *access, cpu| {
+    for (threads, pools, accesses, drain_triggers, 0..) |*thread, *pool, *access, trigger, cpu| {
         thread.* = try std.Thread.spawn(
             .{},
             run_worker,
             .{
-                cfg.listen,   pool,      &router, &metrics,
-                access,       seed_base, cpu,     tls_context,
-                upstream_tls,
+                cfg.listen,   pool,       &router, &metrics,
+                access,       seed_base,  cpu,     tls_context,
+                upstream_tls, trigger[0],
             },
         );
     }
@@ -191,7 +218,42 @@ pub fn main(init: std.process.Init) !void {
     }
 
     std.log.info("zoxy listening on {f} across {d} worker(s)", .{ cfg.listen, worker_count });
+
+    // Block until the first SIGTERM/SIGINT, poke every worker's drain
+    // trigger, then join them: each exits once its connections finish (or
+    // the drain deadline force-closes the stragglers). A second signal —
+    // watched by a detached thread — exits immediately.
+    wait_for_signal(signal_fd);
+    std.log.info("zoxy: draining {d} worker(s) (limit {d}ms; second signal exits now)", .{
+        worker_count,
+        constants.drain_timeout_ns / std.time.ns_per_ms,
+    });
+    for (drain_triggers) |pair| {
+        const poke = [1]u8{'d'};
+        _ = linux.write(pair[1], &poke, poke.len); // EOF from a failed write drains too
+    }
+    const watcher = try std.Thread.spawn(.{}, hard_exit_watcher, .{signal_fd});
+    watcher.detach();
     for (threads) |thread| thread.join();
+    std.log.info("zoxy: drained, exiting", .{});
+}
+
+/// Block until one of the masked signals is delivered to the signalfd.
+fn wait_for_signal(signal_fd: linux.fd_t) void {
+    var info: linux.signalfd_siginfo = undefined;
+    while (true) { // bounded by delivery: reads only fail transiently (EINTR)
+        const rc = linux.read(signal_fd, std.mem.asBytes(&info), @sizeOf(linux.signalfd_siginfo));
+        if (linux.errno(rc) == .INTR) continue;
+        if (linux.errno(rc) != .SUCCESS) return; // treat a broken signalfd as a signal
+        if (rc == @sizeOf(linux.signalfd_siginfo)) return;
+    }
+}
+
+/// A second signal during the drain means "now": skip the joins and die.
+fn hard_exit_watcher(signal_fd: linux.fd_t) void {
+    wait_for_signal(signal_fd);
+    std.log.warn("zoxy: second signal — exiting without drain", .{});
+    linux.exit_group(1);
 }
 
 /// Build one cluster's upstream (client-role) context: read the CA bundle
@@ -236,7 +298,8 @@ fn load_tls_identity(
 }
 
 /// One share-nothing worker: its own IO ring, SO_REUSEPORT listener, and pool,
-/// pinned to a core. Runs the proxy accept/relay loop forever.
+/// pinned to a core. Runs the proxy accept/relay loop until a drain completes
+/// (or forever, if no drain is ever triggered).
 fn run_worker(
     listen: Ip4Address,
     pool: *Pool,
@@ -247,6 +310,7 @@ fn run_worker(
     cpu: usize,
     tls_context: ?*const zoxy.terminator.Context,
     upstream_tls: []const ?*const zoxy.terminator.Context,
+    drain_trigger_fd: std.posix.socket_t,
 ) void {
     assert(pool.capacity > 0);
     pin_to_cpu(cpu);
@@ -255,9 +319,11 @@ fn run_worker(
         return log_worker_error("io init", err);
     defer io.deinit();
 
-    var listener = Listener.open(listen, constants.accept_backlog) catch |err|
+    // No defer close: the drain path closes the listener (exactly once, via
+    // `close_listener`) the moment accepting stops, so clients get refused
+    // instead of queueing behind a worker that will never accept them.
+    const listener = Listener.open(listen, constants.accept_backlog) catch |err|
         return log_worker_error("listen", err);
-    defer listener.close();
 
     var server = ProxyServer.init(
         &io,
@@ -274,16 +340,27 @@ fn run_worker(
     server.prng = .init(seed_base +% cpu);
     server.tls_context = tls_context;
     server.upstream_tls_contexts = upstream_tls;
+    server.drain_trigger_fd = drain_trigger_fd;
     server.start();
 
     // Active health checks ride the same ring; arms only when configured.
     var health = zoxy.HealthChecker.init(&io, router.config.clusters, &server.resilience, metrics);
     health.start();
 
-    while (true) {
+    while (!server.drain_complete()) {
         io.run_once() catch |err| return log_worker_error("io run", err);
         access.flush(); // batched: one write per event-loop iteration, off the per-connection path
     }
+    // Drained: every connection slot is back and no server op is on the
+    // ring. Quiesce the health checker (bounded: its probes are cancelled,
+    // its tick is at most one `health_tick_ns` away), close the parked
+    // upstream connections, and let the ring go down clean.
+    health.stop();
+    while (!health.quiesced()) {
+        io.run_once() catch break; // nothing pending: already quiet
+    }
+    server.deinit();
+    access.flush();
 }
 
 /// Best-effort CPU pinning (Linux only). Failure is non-fatal.

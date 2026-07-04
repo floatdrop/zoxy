@@ -596,8 +596,51 @@ catches the dominant failures), ejection-time multipliers.
   SO_REUSEPORT hash pins load (measured below). Plan moved to Phase 5.
 
 ### Phase 4 — Operability
-- Graceful drain + hot restart (FD passing over a unix socket, à la HAProxy
-  `SCM_RIGHTS`; drain via `Connection: close` / GOAWAY; transfer stats).
+- Graceful drain + hot restart, sliced:
+  1. **Graceful drain** — done 2026-07-04. *Trigger:* SIGTERM/SIGINT are
+     blocked in every thread (workers inherit the mask) and surface only
+     through a signalfd read on the main thread; each worker owns one end
+     of a socketpair with a recv pending on its ring, so main's one-byte
+     poke arrives as an ordinary completion — that is how a signal wakes a
+     worker blocked in `io_uring_enter` (no new IO op in the seam, and the
+     simulator needs no fd: `begin_drain` is callable directly). A second
+     signal (a detached watcher thread on the same signalfd) exits
+     immediately. *Per-worker semantics:* the pending accept is cancelled
+     and the listener closes the moment its completion lands
+     (refused-at-connect beats accepted-then-ignored; connections still in
+     the accept queue get RST — unavoidable with a closing listener, and
+     the hot-restart slice is what removes that window); a sweep over the
+     connection pool (`Pool` grew an `in_use` marker so every slot is
+     classifiable) closes idle keep-alive connections politely
+     (`close_downstream` — close_notify / kTLS-alert aware) and marks
+     in-flight ones `drain_close`: the response-head reuse decision then
+     fails, so the existing RFC 9112 §9.6 `Connection: close` injection
+     fires; a response whose head already went out keep-alive completes
+     fully and then closes. *No new timer:* the sweep clamps each
+     connection's supreme deadline to now + `drain_timeout_ns` (30s), so
+     the per-connection ticking timer force-closes stragglers
+     (`zoxy_drain_forced_closes`). *Exit:* the worker loop runs until
+     `drain_complete()` — every pool slot back AND zero server-scoped ops
+     (`operations_pending` counts the accept, its retry timer, its cancel,
+     and the trigger recv; a worker never abandons a live op on ring
+     teardown) — then stops the health checker (`stop()` now also cancels
+     in-flight probe connects, so a black-holed endpoint cannot pin
+     shutdown), closes parked upstreams, and returns; main joins and exits
+     0. Gauge: `zoxy_draining` = draining workers. Verified: a third of
+     sim iterations drain at a random step under a 1s deadline (accepts
+     freeze, every slot drains, `drain_complete` reached, forced teardown
+     exercised — seeds 0..2000); integration tests for idle-close +
+     refusal, mid-request close injection, and the trigger fd; the
+     zero-alloc gate now drains inside it; process-level with an idle +
+     wedged + mid-drain client mix (close injected, idle EOF, listener
+     refused while admin stays up, gauge visible, second-signal hard
+     exit). Sanity bench at 60k req/s: in-band (avg 462µs, 0 errors,
+     >99.9% upstream reuse).
+  2. **Hot restart** — FD passing over a unix socket, à la HAProxy
+     `SCM_RIGHTS`: the new process starts and binds alongside the old
+     (SO_REUSEPORT admits it), takes over accepting, then the old drains
+     via slice 1; a listener handoff also closes the drain-only RST
+     window. Transfer stats across the pair.
 - **Accept balancing across workers.** Measured 2026-07 (per-worker accept
   counters, `zoxy_worker_accepted`): the SO_REUSEPORT hash is uniform at
   large N (1.14:1 over 150k accepts) but few long-lived connections pin

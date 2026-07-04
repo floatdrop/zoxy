@@ -10,11 +10,12 @@ zoxy is built on the [TigerBeetle](https://tigerbeetle.com) I/O model — comple
 `io_uring` with caller-owned completions — and follows [TigerStyle](docs/TIGER_STYLE.md):
 **all memory is reserved at startup, and the request-serving path allocates nothing.**
 
-> **Status: experimental, Phase 3 TLS complete.** A working HTTPS/HTTP/1.1 reverse
-> proxy: TLS termination with kernel-TLS offload, SNI multi-cert, verified upstream
-> re-encryption, keep-alive and pooling on both sides, and a resilience layer (P2C
-> load balancing, retries, circuit breaking, outlier detection, health checks) —
-> but not yet production-ready — see [Scope & roadmap](#scope--roadmap). Linux only.
+> **Status: experimental, Phase 4 operability in progress.** A working
+> HTTPS/HTTP/1.1 reverse proxy: TLS termination with kernel-TLS offload, SNI
+> multi-cert, verified upstream re-encryption, keep-alive and pooling on both
+> sides, a resilience layer (P2C load balancing, retries, circuit breaking,
+> outlier detection, health checks), and graceful drain on SIGTERM — but not
+> yet production-ready — see [Scope & roadmap](#scope--roadmap). Linux only.
 
 ## Highlights
 
@@ -285,12 +286,23 @@ TLS heap per userspace connection, ~0 after the kernel switchover. Closes
 are polite (close_notify in both modes). See
 [`docs/DESIGN.md`](docs/DESIGN.md) §6.
 
-**Next — Phase 4, operability:** graceful drain + hot restart (FD passing
-over a unix socket), accept balancing across workers (the SO_REUSEPORT hash
-pins few-hot-connection loads), consistent-hash LB, Prometheus metrics +
-distributed tracing. HTTP/2 is deliberately deferred behind it: it is a
-large protocol surface that lands better on an operable base, and accept
-balancing is a prerequisite for its few-hot-connections traffic shape.
+**Phase 4, operability (in progress) — graceful drain done:** on SIGTERM
+each worker cancels its accept and closes its listener (later connects are
+refused, not silently queued), closes idle keep-alive connections politely
+(close_notify/kTLS-alert aware), completes in-flight responses with
+`Connection: close` injected, and force-closes stragglers at a 30s drain
+deadline enforced by the existing per-connection timers — no new timer
+machinery. A worker exits only when every connection slot and ring op has
+drained; a second signal exits immediately. The signal reaches a worker
+blocked in `io_uring_enter` as a plain recv completion on a per-worker
+socketpair. Verified by the simulator (a third of iterations drain
+mid-traffic, replayable), integration tests, and the zero-alloc gate
+(which now drains inside it). Still to come: hot restart (`SCM_RIGHTS` fd
+passing), accept balancing across workers, consistent-hash LB, tracing +
+Prometheus polish. HTTP/2 is deliberately deferred behind operability: it
+is a large protocol surface that lands better on an operable base, and
+accept balancing is a prerequisite for its few-hot-connections traffic
+shape.
 
 **Later:** HTTP/2 and HTTP/3, TLS session resumption, and config
 hot-reload. The full plan is in [`docs/DESIGN.md`](docs/DESIGN.md) §7.
