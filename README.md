@@ -10,10 +10,11 @@ zoxy is built on the [TigerBeetle](https://tigerbeetle.com) I/O model — comple
 `io_uring` with caller-owned completions — and follows [TigerStyle](docs/TIGER_STYLE.md):
 **all memory is reserved at startup, and the request-serving path allocates nothing.**
 
-> **Status: experimental, Phase 2 complete.** A working HTTP/1.1 reverse proxy with
-> keep-alive on both sides, upstream pooling, and a resilience layer (P2C load
-> balancing, retries, circuit breaking, outlier detection, health checks) — but not
-> yet production-ready — see [Scope & roadmap](#scope--roadmap). Linux only.
+> **Status: experimental, Phase 3 TLS complete.** A working HTTPS/HTTP/1.1 reverse
+> proxy: TLS termination with kernel-TLS offload, SNI multi-cert, verified upstream
+> re-encryption, keep-alive and pooling on both sides, and a resilience layer (P2C
+> load balancing, retries, circuit breaking, outlier detection, health checks) —
+> but not yet production-ready — see [Scope & roadmap](#scope--roadmap). Linux only.
 
 ## Highlights
 
@@ -30,12 +31,22 @@ zoxy is built on the [TigerBeetle](https://tigerbeetle.com) I/O model — comple
   full-jitter backoff, per-try timeouts, circuit breakers, passive outlier ejection, and
   active TCP health probes — all state statically reserved per worker, all timers riding
   the same ring.
-- **Zero dependencies** beyond the Zig toolchain.
+- **TLS on both hops, kernel-offloaded.** OpenSSL terminates the handshake sans-io
+  (every byte stays a ring op); after a quiet handshake the record layer moves into
+  the kernel (kTLS) and steady-state TLS runs the *plaintext* relay code path. SNI
+  multi-cert, ALPN, polite close_notify, and verified re-encryption to origins with
+  pooled TLS sessions. OpenSSL's allocations live in a fixed heap reserved at startup —
+  exhaustion load-sheds a handshake, never OOMs.
+- **Zero dependencies** beyond the Zig toolchain, with one deliberate exception: a
+  vendored OpenSSL (built by the Zig build system, sources fetched by content hash)
+  for the TLS handshake.
 
 ## Requirements
 
 - **Zig 0.16** (the [Nix dev shell](flake.nix) pins `zig_0_16` + `zls`).
 - **Linux with `io_uring`** (kernel 5.11+).
+- Optional: the `tls` kernel module (`modprobe tls`) for kTLS offload — without it,
+  TLS connections transparently stay on the userspace relay.
 
 ## Build & run
 
@@ -144,6 +155,45 @@ examples). Semantics:
 All limits and budgets are **per worker** (share-nothing — no cross-worker
 coordination): a cluster-wide budget is the configured value × worker count.
 
+### TLS (optional)
+
+Terminate TLS on the listener, and/or re-encrypt to a cluster's origins:
+
+```json
+{
+  "listen": "0.0.0.0:443",
+  "tls": {
+    "certificate_file": "certs/default.pem",
+    "private_key_file": "certs/default.key",
+    "kernel_offload": true,
+    "additional_identities": [
+      { "server_names": ["other.example.com", "*.other.example.com"],
+        "certificate_file": "certs/other.pem",
+        "private_key_file": "certs/other.key" }
+    ]
+  },
+  "routes": [{ "cluster": "api" }],
+  "clusters": [
+    { "name": "api", "endpoints": ["10.0.0.5:8443"],
+      "tls": { "server_name": "api.internal", "ca_file": "certs/internal-ca.pem" } }
+  ]
+}
+```
+
+- **Listener `tls`** terminates TLS 1.3/1.2 (full handshakes; no resumption yet).
+  ALPN negotiates `http/1.1`. `additional_identities` selects certificates by SNI
+  (exact names and single-label `*.` wildcards, declared explicitly — never
+  introspected from certificates); absent or unmatched SNI gets the default pair.
+- **`kernel_offload`** (default `true`) hands each connection's record layer to
+  the kernel after the handshake, when provably safe (record sequence zero, AES-GCM,
+  `tls` module present) — otherwise that connection transparently stays on the
+  userspace relay, which serves identical bytes. Closes send `close_notify` either way.
+- **Cluster `tls`** re-encrypts to the origins. Verification is an explicit choice:
+  `ca_file` (a PEM bundle) **and** `server_name` (required of the certificate,
+  offered as SNI) — or `"insecure": true`, spelled out. A failed origin handshake
+  is an attempt failure: retried per the cluster's retry policy, else an honest 502.
+  Upstream TLS sessions park in the per-worker pool alongside their connections.
+
 ## Benchmarking
 
 ```sh
@@ -178,6 +228,8 @@ Source layout:
 | `src/net/proxy.zig` | the proxy data path (parse → route → connect → relay → retry) |
 | `src/http/h1.zig` | zero-copy HTTP/1.1 request/response parsers + body framing |
 | `src/config.zig`, `src/proxy/` | config, routing, P2C balancing, upstream pool, resilience state (breakers, outlier detection, retry budget), health checks |
+| `src/tls/` | TLS: sans-io BIO-pair terminator + SNI, the kTLS key derivation and kernel ABI, and the fixed heap behind OpenSSL's memory hook |
+| `third_party/openssl/` | vendored OpenSSL build recipe (sources fetched by content hash) |
 | `src/obs/` | metrics counters + per-worker access log |
 | `src/mem/guard.zig` | zero-allocation acceptance gate |
 
@@ -211,23 +263,30 @@ run-to-run variance dominates any difference against the pre-Phase-2 build at
 60k req/s. Deferred with rationale (EWMA weighting, retry-on-5xx, HTTP
 probes): see [`docs/DESIGN.md`](docs/DESIGN.md) §7.
 
-**Phase 3, TLS half (done): termination + kTLS** — TLS 1.3/1.2 termination
-with a vendored OpenSSL used *only* for the handshake, sans-io over memory
-BIO pairs so every byte stays a ring op; SNI-ready ALPN (`http/1.1`);
-allocations routed into a fixed heap reserved at startup (exhaustion
-load-sheds the handshake, never OOM). After a quiet handshake the record
-layer moves into the kernel (kTLS): traffic secrets from the keylog
-callback, keys via HKDF-Expand-Label (RFC 8448-verified), installed only
-when the record sequence is provably zero — otherwise the connection stays
-on the userspace relay, which serves identical bytes. Steady state, a
-kernel-TLS connection runs the *plaintext* relay code path. Measured:
-TLS ≈ plaintext at 20k req/s (p50 ~135µs vs ~155µs plaintext); kTLS saves
-~10% proxy CPU vs the userspace relay at equal latency; ~161 KiB TLS heap
-per userspace connection, ~0 after the kernel switchover. Closes are
-polite (close_notify both modes). See [`docs/DESIGN.md`](docs/DESIGN.md) §6.
+**Phase 3, TLS (done): termination, kTLS, re-encryption, SNI** — TLS 1.3/1.2
+termination with a vendored OpenSSL used *only* for the handshake, sans-io
+over memory BIO pairs so every byte stays a ring op; ALPN (`http/1.1`); SNI
+multi-certificate selection; allocations routed into a fixed heap reserved
+at startup (exhaustion load-sheds the handshake, never OOM). After a quiet
+handshake the record layer moves into the kernel (kTLS): traffic secrets
+from the keylog callback, keys via HKDF-Expand-Label (RFC 8448-verified),
+installed only when the record sequence is provably zero — otherwise the
+connection stays on the userspace relay, which serves identical bytes.
+Steady state, a kernel-TLS connection runs the *plaintext* relay code path.
+Upstream re-encryption per cluster with explicit verification (CA bundle +
+required hostname, or spelled-out insecure); a refused origin certificate
+feeds the retry machinery like any attempt failure; upstream TLS sessions
+park in the connection pool (the origin's session tickets rule out client-
+side kTLS, so that hop stays on the BIO pair). Measured: single-hop TLS ≈
+plaintext at 20k req/s (p50 ~135µs); kTLS saves ~10% proxy CPU at equal
+latency; the fully encrypted chain (TLS client → zoxy → TLS origin) also
+holds 20k req/s at p50 ~138µs with >99.9% upstream session reuse; ~161 KiB
+TLS heap per userspace connection, ~0 after the kernel switchover. Closes
+are polite (close_notify in both modes). See
+[`docs/DESIGN.md`](docs/DESIGN.md) §6.
 
-**Later:** HTTP/2 and HTTP/3, upstream re-encryption, SNI multi-cert,
-graceful drain + hot restart, and config hot-reload. The full plan is in
+**Later:** HTTP/2 and HTTP/3, TLS session resumption, graceful drain + hot
+restart, and config hot-reload. The full plan is in
 [`docs/DESIGN.md`](docs/DESIGN.md) §7.
 
 ## License
