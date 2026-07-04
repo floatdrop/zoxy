@@ -706,8 +706,14 @@ catches the dominant failures), ejection-time multipliers.
   unprivileged BPF is disabled on modern kernels
   (`kernel.unprivileged_bpf_disabled=2` on the dev box), so it needs
   CAP_BPF even to load — revisit only if `shared` proves insufficient.
-- Consistent-hash LB (ring-hash / Maglev). Distributed tracing (B3/W3C
-  propagation) + Prometheus metrics.
+- Consistent-hash LB (ring-hash / Maglev).
+- Distributed tracing (B3/W3C propagation) and Prometheus polish
+  (histograms, labels): **deferred out of Phase 4** (2026-07-04). The
+  operability core — drain, hot restart, stats continuity, accept
+  balancing — is what changes how zoxy runs in production; the /metrics
+  counter exposition already covers day-one observability, and tracing
+  earns its complexity once there is dynamic config (Phase 6) or multi-hop
+  deployments to debug.
 
 ### Phase 5 — HTTP/2
 - HTTP/2 downstream+upstream: per-stream state machines, **dual-level flow

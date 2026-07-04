@@ -309,7 +309,10 @@ Accept balancing landed as `accept_mode: "shared"` — one listener, every
 worker with a pending accept, so idle workers pull more: the hottest
 worker's share at 64 connections drops from 22–23% to ~16% (10-run A/B),
 with no churn regression; `reuseport` stays the default. Still to come:
-consistent-hash LB, tracing + Prometheus polish. HTTP/2 is deliberately
+consistent-hash LB (distributed tracing and Prometheus polish are
+deferred — the counter exposition covers day-one observability, and
+tracing earns its complexity alongside dynamic config). HTTP/2 is
+deliberately
 deferred behind operability: it
 is a large protocol surface that lands better on an operable base, and
 accept balancing is a prerequisite for its few-hot-connections traffic
