@@ -961,35 +961,47 @@ pub const H2Conn = struct {
                 leg.response_consumed = leg.response_filled;
                 continue;
             }
-            switch (leg.response_framer.framing) {
-                .chunked => {
-                    const extracted = leg.response_decoder.extract(raw) catch
-                        return conn.leg_answer(leg, .reset); // mid-relay corruption
-                    if (leg.response_decoder.done()) {
-                        // Mirror the shared framer state (BodyFramer owns a
-                        // decoder we bypassed for payload extraction).
-                        leg.response_framer.decoder = leg.response_decoder;
-                    }
-                    leg.span_start = leg.response_consumed +
-                        @as(u32, @intCast(@intFromPtr(extracted.payload.ptr) -
-                            @intFromPtr(raw.ptr)));
-                    leg.span_end = leg.span_start + @as(u32, @intCast(extracted.payload.len));
-                    leg.response_consumed += @intCast(extracted.consumed);
-                },
-                .content_length, .until_close, .none => {
-                    const n = leg.response_framer.consume(raw) catch
-                        return conn.leg_answer(leg, .reset);
-                    leg.span_start = leg.response_consumed;
-                    leg.span_end = leg.response_consumed + @as(u32, @intCast(n));
-                    leg.response_consumed += @intCast(n);
-                    if (n == 0) {
-                        leg.response_overflow = true;
-                        leg.response_consumed = leg.response_filled;
-                    }
-                },
-            }
+            if (!conn.leg_next_span(leg, raw)) return;
         }
         unreachable; // the budget covers every byte of the buffer plus slack
+    }
+
+    /// Locate the next payload span in `raw` (framing-specific), advancing
+    /// span_start/span_end/response_consumed. Returns false when mid-relay
+    /// corruption has already reset the stream and the caller must stop.
+    fn leg_next_span(conn: *H2Conn, leg: *StreamLeg, raw: []const u8) bool {
+        switch (leg.response_framer.framing) {
+            .chunked => {
+                const extracted = leg.response_decoder.extract(raw) catch {
+                    conn.leg_answer(leg, .reset); // mid-relay corruption
+                    return false;
+                };
+                if (leg.response_decoder.done()) {
+                    // Mirror the shared framer state (BodyFramer owns a
+                    // decoder we bypassed for payload extraction).
+                    leg.response_framer.decoder = leg.response_decoder;
+                }
+                leg.span_start = leg.response_consumed +
+                    @as(u32, @intCast(@intFromPtr(extracted.payload.ptr) -
+                        @intFromPtr(raw.ptr)));
+                leg.span_end = leg.span_start + @as(u32, @intCast(extracted.payload.len));
+                leg.response_consumed += @intCast(extracted.consumed);
+            },
+            .content_length, .until_close, .none => {
+                const n = leg.response_framer.consume(raw) catch {
+                    conn.leg_answer(leg, .reset);
+                    return false;
+                };
+                leg.span_start = leg.response_consumed;
+                leg.span_end = leg.response_consumed + @as(u32, @intCast(n));
+                leg.response_consumed += @intCast(n);
+                if (n == 0) {
+                    leg.response_overflow = true;
+                    leg.response_consumed = leg.response_filled;
+                }
+            },
+        }
+        return true;
     }
 
     fn leg_response_end(conn: *H2Conn, leg: *StreamLeg) void {

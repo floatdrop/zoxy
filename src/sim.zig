@@ -161,11 +161,72 @@ fn run_iteration(seed: u64) !u64 {
     var workload = Workload{ .prng = std.Random.DefaultPrng.init(seed +% 0x9E3779B97F4A7C15) };
     io.faults = workload.fault_profile();
 
-    // per_try_timeout (2s virtual, under the 5s request timeout) puts the
-    // attempt-abort/drain machinery under every seed's schedule: black-holed
-    // connects get cancelled, stalled attempts answer 504 instead of hanging
-    // to the overall deadline.
-    var cfg = try config_mod.parse(arena,
+    var cfg = try parse_sim_config(arena);
+    const router = Router.init(&cfg);
+    try spawn_origins(&io, arena, &workload);
+
+    // Drawn here (server construction never touches the workload PRNG) to
+    // fix the seed's draw order. A third of iterations drain mid-traffic.
+    const drain_requested = workload.one_in(3);
+    const drain_after_steps: u64 =
+        if (drain_requested) workload.prng.random().intRangeLessThan(u64, 0, 1500) else 0;
+    var pool = try ConnPool.init(arena, connection_pool_capacity);
+    var metrics = Counters{};
+    var access = AccessLog{ .fd = -1 }; // records accumulate, flushes are no-ops
+    var server: ProxyServer = undefined;
+    setup_h1_server(&server, &io, &pool, &router, &metrics, &access, seed, drain_requested);
+
+    // Active health probes share the ring/faults; refused probes flip
+    // endpoints unhealthy and the balancer must still route (fail-open).
+    var health = HealthChecker.init(&io, cfg.clusters, &server.resilience, &metrics);
+    health.start();
+
+    // The h2c proxy: an independent worker sharing the origins, own pools.
+    var h2_conn_pool = try H2ConnPool.init(arena, constants.h2_connections_max);
+    var h2_leg_pool = try H2LegPool.init(arena, constants.h2_legs_max);
+    var h2_metrics = Counters{};
+    var h2_access = AccessLog{ .fd = -1 };
+    var h2_server: H2Server = undefined;
+    setup_h2_server(
+        &h2_server,
+        &io,
+        &h2_conn_pool,
+        &h2_leg_pool,
+        &router,
+        &h2_metrics,
+        &h2_access,
+        seed,
+        drain_requested,
+    );
+    const clients = try spawn_clients(&io, &workload, arena);
+    const h2_clients = try spawn_h2_clients(&io, &workload, arena);
+    const drive = drive_until_done(
+        &io,
+        &server,
+        &h2_server,
+        clients,
+        h2_clients,
+        drain_requested,
+        drain_after_steps,
+    );
+    const steps = check_h1_drain(
+        &io,
+        &server,
+        drain_requested,
+        drive.accepted_at_drain,
+        drive.steps,
+    );
+    check_h2_drain(&io, &h2_server, drain_requested, drive.h2_accepted_at_drain, steps);
+
+    return tally_responses(clients, h2_clients);
+}
+
+/// The sim's fixed config. `per_try_timeout` (2s virtual, under the 5s
+/// request timeout) keeps the attempt-abort/drain machinery under every
+/// seed's schedule: black-holed connects get cancelled, stalled attempts
+/// answer 504 instead of hanging to the overall deadline.
+fn parse_sim_config(arena: std.mem.Allocator) !config_mod.Config {
+    return config_mod.parse(arena,
         \\{ "listen": "127.0.0.1:8080",
         \\  "routes": [ { "path_prefix": "/a", "cluster": "one" }, { "cluster": "two" } ],
         \\  "clusters": [
@@ -182,96 +243,134 @@ fn run_iteration(seed: u64) !u64 {
         \\      "health_check": { "interval_ms": 1000, "timeout_ms": 500 } }
         \\  ] }
     );
-    const router = Router.init(&cfg);
+}
 
+/// Start the shared virtual origins — one accept loop each. They store
+/// `io`/`workload` pointers (caller-frame stable) and live on the arena.
+fn spawn_origins(io: *IO, arena: std.mem.Allocator, workload: *Workload) !void {
     const origins = try arena.alloc(Origin, origin_ports.len);
+    assert(origins.len == origin_ports.len);
     for (origins, origin_ports) |*origin, port| {
         origin.* = .{
-            .io = &io,
+            .io = io,
             .arena = arena,
-            .workload = &workload,
+            .workload = workload,
             .listener_fd = io.open_listener(port),
         };
         origin.start();
     }
+}
 
-    var pool = try ConnPool.init(arena, connection_pool_capacity);
-    var metrics = Counters{};
-    var access = AccessLog{ .fd = -1 }; // records accumulate, flushes are no-ops
-    var server = ProxyServer.init(
-        &io,
-        &pool,
+/// Build, tune (deterministic PRNG, shortened drain deadline), and start the
+/// HTTP/1.1 proxy at its final address: `start` registers self-referential
+/// completions, so the server must already live in `run_iteration`'s frame.
+fn setup_h1_server(
+    server: *ProxyServer,
+    io: *IO,
+    pool: *ConnPool,
+    router: *const Router,
+    metrics: *Counters,
+    access: *AccessLog,
+    seed: u64,
+    drain_requested: bool,
+) void {
+    server.* = ProxyServer.init(
+        io,
+        pool,
         Listener{ .fd = io.open_listener(proxy_port) },
-        &router,
-        &metrics,
-        &access,
+        router,
+        metrics,
+        access,
         5 * std.time.ns_per_s, // request timeout (virtual time)
         10 * std.time.ns_per_s, // idle timeout (virtual time)
     );
     // The balancer's PRNG derives from the iteration seed: same seed, same
     // P2C draws, same schedule — determinism end to end.
     server.prng = .init(seed +% 0x853C49E6748FEA9B);
-    // A third of iterations drain mid-traffic. The drain deadline sits below
-    // the per-try timeout (2s) so wedged exchanges (black-holed connects,
-    // never-responding origins) hit the forced-teardown path, not just the
-    // polite one.
-    const drain_requested = workload.one_in(3);
-    const drain_after_steps: u64 =
-        if (drain_requested) workload.prng.random().intRangeLessThan(u64, 0, 1500) else 0;
     if (drain_requested) server.drain_timeout_ns = 1 * std.time.ns_per_s;
     server.start();
+    assert(server.operations_pending >= 1); // at least the accept is in flight
+}
 
-    // Active health probes run through the same virtual ring and fault
-    // profile: refused/black-holed probes flip endpoints unhealthy and the
-    // balancer must still route (fail-open) — under every seed's schedule.
-    var health = HealthChecker.init(&io, cfg.clusters, &server.resilience, &metrics);
-    health.start();
-
-    // The h2c proxy: its own pools, metrics, and resilience (an independent
-    // worker sharing the origins), so the H1 invariant checks stay clean and
-    // the H2 path gets its own accounting to assert idle. MV scope: the h2c
-    // server is not drained (drain is the H1 path's job this slice); its
-    // clients conclude naturally and its pools must still reclaim every slot.
-    var h2_conn_pool = try H2ConnPool.init(arena, constants.h2_connections_max);
-    var h2_leg_pool = try H2LegPool.init(arena, constants.h2_legs_max);
-    var h2_metrics = Counters{};
-    var h2_access = AccessLog{ .fd = -1 };
-    var h2_server = H2Server.init(
-        &io,
-        &h2_conn_pool,
-        &h2_leg_pool,
+/// Build, tune, and start the plaintext HTTP/2 (h2c) proxy at its final
+/// address (same self-pointer constraint as `setup_h1_server`). Its drain
+/// deadline sits below the per-try timeout so wedged streams force-tear down.
+fn setup_h2_server(
+    h2_server: *H2Server,
+    io: *IO,
+    h2_conn_pool: *H2ConnPool,
+    h2_leg_pool: *H2LegPool,
+    router: *const Router,
+    h2_metrics: *Counters,
+    h2_access: *AccessLog,
+    seed: u64,
+    drain_requested: bool,
+) void {
+    h2_server.* = H2Server.init(
+        io,
+        h2_conn_pool,
+        h2_leg_pool,
         Listener{ .fd = io.open_listener(h2c_proxy_port) },
-        &router,
-        &h2_metrics,
-        &h2_access,
+        router,
+        h2_metrics,
+        h2_access,
         5 * std.time.ns_per_s,
         10 * std.time.ns_per_s,
     );
     h2_server.prng = .init(seed +% 0x2545F4914F6CDD1D);
-    // The h2c drain deadline sits below the per-try timeout (as on H1) so
-    // wedged streams hit the forced-teardown path within the run's step cap.
     if (drain_requested) h2_server.drain_timeout_ns = 1 * std.time.ns_per_s;
     h2_server.start();
+    assert(!h2_server.listener_closed); // accepting until begin_drain
+}
 
+/// Allocate and begin the H1 virtual clients; returned for the drive loop
+/// and the final tally. Strict framing only when the schedule never RSTs.
+fn spawn_clients(io: *IO, workload: *Workload, arena: std.mem.Allocator) ![]Client {
     const clients = try arena.alloc(Client, clients_max);
+    assert(clients.len == clients_max);
     for (clients, 0..) |*client, index| {
         client.* = .{
-            .io = &io,
-            .workload = &workload,
+            .io = io,
+            .workload = workload,
             .id = @intCast(index),
             .strict_until_close = io.faults.reset_ppm == 0,
         };
         client.begin();
     }
+    return clients;
+}
 
-    const h2_clients = try arena.alloc(H2Client, h2_clients_max);
-    for (h2_clients, 0..) |*client, index| {
-        client.* = .{ .io = &io, .workload = &workload, .id = @intCast(index) };
+/// Allocate and begin the h2c virtual clients (each multiplexes streams).
+fn spawn_h2_clients(io: *IO, workload: *Workload, arena: std.mem.Allocator) ![]H2Client {
+    const clients = try arena.alloc(H2Client, h2_clients_max);
+    assert(clients.len == h2_clients_max);
+    for (clients, 0..) |*client, index| {
+        client.* = .{ .io = io, .workload = workload, .id = @intCast(index) };
         client.begin();
     }
+    return clients;
+}
 
-    // Drive until every client concluded, then until the proxy reclaimed
-    // every slot (teardowns, idle timeouts, pool checkins all complete).
+/// What `drive_until_done` hands back to the invariant checks: the running
+/// step counter and the accepted-connection snapshots taken at drain start.
+const DriveOutcome = struct {
+    steps: u64,
+    accepted_at_drain: ?u64,
+    h2_accepted_at_drain: u64,
+};
+
+/// Drive until every client concluded (triggering drain at its step if
+/// requested), then until the H1 proxy reclaimed every slot. Reads pool and
+/// metrics through the servers' own pointers (same underlying objects).
+fn drive_until_done(
+    io: *IO,
+    server: *ProxyServer,
+    h2_server: *H2Server,
+    clients: []Client,
+    h2_clients: []H2Client,
+    drain_requested: bool,
+    drain_after_steps: u64,
+) DriveOutcome {
     var steps: u64 = 0;
     var accepted_at_drain: ?u64 = null;
     var h2_accepted_at_drain: u64 = 0;
@@ -279,11 +378,11 @@ fn run_iteration(seed: u64) !u64 {
         if (drain_requested and accepted_at_drain == null and steps >= drain_after_steps) {
             server.begin_drain();
             h2_server.begin_drain(); // the h2c server drains in parallel (GOAWAY sweep)
-            accepted_at_drain = metrics.accepted.load();
-            h2_accepted_at_drain = h2_metrics.accepted.load();
+            accepted_at_drain = server.metrics.accepted.load();
+            h2_accepted_at_drain = h2_server.metrics.accepted.load();
         }
         if (steps > step_cap) {
-            dump_h2(h2_clients, &h2_conn_pool, io.now_ns());
+            dump_h2(h2_clients, h2_server.pool, io.now_ns());
             fail("hang: step cap with {d} H1 + {d} h2c clients unfinished", .{
                 clients_unfinished(clients),
                 h2_clients_unfinished(h2_clients),
@@ -296,19 +395,39 @@ fn run_iteration(seed: u64) !u64 {
     if (drain_requested and accepted_at_drain == null) {
         server.begin_drain();
         h2_server.begin_drain();
-        accepted_at_drain = metrics.accepted.load();
-        h2_accepted_at_drain = h2_metrics.accepted.load();
+        accepted_at_drain = server.metrics.accepted.load();
+        h2_accepted_at_drain = h2_server.metrics.accepted.load();
     }
-    while (pool.free_count != pool.capacity) : (steps += 1) {
+    while (server.pool.free_count != server.pool.capacity) : (steps += 1) {
         if (steps > step_cap) fail("leak: {d} slots never reclaimed", .{
-            pool.capacity - pool.free_count,
+            server.pool.capacity - server.pool.free_count,
         });
         io.run_once() catch {
-            dump_pool(&pool);
+            dump_pool(server.pool);
             io.dump_pending();
             fail("leak: slot held with no pending operation", .{});
         };
     }
+    assert(server.pool.free_count == server.pool.capacity); // every H1 slot home
+    return .{
+        .steps = steps,
+        .accepted_at_drain = accepted_at_drain,
+        .h2_accepted_at_drain = h2_accepted_at_drain,
+    };
+}
+
+/// H1 graceful-drain invariants and teardown: the worker reaches its exit
+/// condition with no op abandoned, no connection accepted after drain, and
+/// every counter — including resilience — settled to zero. Returns the
+/// running step count for the h2c checks to continue from.
+fn check_h1_drain(
+    io: *IO,
+    server: *ProxyServer,
+    drain_requested: bool,
+    accepted_at_drain: ?u64,
+    steps_in: u64,
+) u64 {
+    var steps = steps_in;
     if (drain_requested) {
         // The worker's exit condition: server-scoped ops (the cancelled
         // accept, its cancel, a backoff timer) must all deliver — a worker
@@ -326,51 +445,67 @@ fn run_iteration(seed: u64) !u64 {
         }
         // Accepts froze at begin_drain: the cancel (or the drain branch of
         // on_accept) guarantees no connection was started after it.
-        if (metrics.accepted.load() != accepted_at_drain.?) {
+        if (server.metrics.accepted.load() != accepted_at_drain.?) {
             fail("accepted {d} connections after drain began", .{
-                metrics.accepted.load() - accepted_at_drain.?,
+                server.metrics.accepted.load() - accepted_at_drain.?,
             });
         }
-        if (metrics.draining.load() != 1) fail("draining gauge = {d}, want 1", .{
-            metrics.draining.load(),
+        if (server.metrics.draining.load() != 1) fail("draining gauge = {d}, want 1", .{
+            server.metrics.draining.load(),
         });
     }
     server.deinit();
-    if (metrics.active.load() != 0) fail("metrics.active = {d} after drain", .{
-        metrics.active.load(),
+    if (server.metrics.active.load() != 0) fail("metrics.active = {d} after drain", .{
+        server.metrics.active.load(),
     });
     // Resilience accounting must drain with the connections: a nonzero
     // counter here is a leaked increment/decrement pair somewhere on the
     // data path (the standing invariant for every Phase-2 slice).
     if (!server.resilience.is_idle()) fail("resilience counters nonzero after drain", .{});
+    assert(steps >= steps_in); // steps only advances
+    return steps;
+}
 
-    // The h2c server's every slot — connection and stream leg — must come
-    // home, and its resilience must settle, under the same fault schedule.
-    while (h2_conn_pool.free_count != h2_conn_pool.capacity or
-        h2_leg_pool.free_count != h2_leg_pool.capacity) : (steps += 1)
+/// h2c invariants and teardown: every slot — connection and stream leg —
+/// comes home, its drain (if requested) completes with no late accept, and
+/// its resilience settles, under the same fault schedule.
+fn check_h2_drain(
+    io: *IO,
+    h2_server: *H2Server,
+    drain_requested: bool,
+    h2_accepted_at_drain: u64,
+    steps_in: u64,
+) void {
+    var steps = steps_in;
+    while (h2_server.pool.free_count != h2_server.pool.capacity or
+        h2_server.legs.free_count != h2_server.legs.capacity) : (steps += 1)
     {
         if (steps > step_cap) fail("h2c leak: {d} conn + {d} leg slots never reclaimed", .{
-            h2_conn_pool.capacity - h2_conn_pool.free_count,
-            h2_leg_pool.capacity - h2_leg_pool.free_count,
+            h2_server.pool.capacity - h2_server.pool.free_count,
+            h2_server.legs.capacity - h2_server.legs.free_count,
         });
         io.run_once() catch {
             io.dump_pending();
             fail("h2c leak: slot held with no pending operation", .{});
         };
     }
+    assert(h2_server.pool.free_count == h2_server.pool.capacity); // every conn home
     if (drain_requested) {
         if (!h2_server.drain_complete()) fail("h2c drain never completed", .{});
-        if (h2_metrics.accepted.load() != h2_accepted_at_drain) {
+        if (h2_server.metrics.accepted.load() != h2_accepted_at_drain) {
             fail("h2c accepted {d} connections after drain began", .{
-                h2_metrics.accepted.load() - h2_accepted_at_drain,
+                h2_server.metrics.accepted.load() - h2_accepted_at_drain,
             });
         }
     }
     h2_server.deinit();
-    if (h2_metrics.active.load() != 0)
-        fail("h2c metrics.active = {d}", .{h2_metrics.active.load()});
+    if (h2_server.metrics.active.load() != 0)
+        fail("h2c metrics.active = {d}", .{h2_server.metrics.active.load()});
     if (!h2_server.resilience.is_idle()) fail("h2c resilience counters nonzero", .{});
+}
 
+/// Sum every client's completed-200 count — the sim's traffic-flow proof.
+fn tally_responses(clients: []Client, h2_clients: []H2Client) u64 {
     var responses: u64 = 0;
     for (clients) |*client| responses += client.responses_ok;
     for (h2_clients) |*client| responses += client.responses_ok;

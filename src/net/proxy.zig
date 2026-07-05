@@ -617,29 +617,7 @@ pub const ProxyConn = struct {
         conn.ktls_active = false;
         conn.ktls_notify_pending = false;
         if (tls_context) |context| {
-            assert(tls_legs != null); // wired together with the context
-            // Sized one leg per connection, so a fresh conn always finds one;
-            // shed like heap exhaustion if the invariant ever breaks.
-            const leg = tls_legs.?.acquire() orelse {
-                metrics.tls_handshake_failures.add(1);
-                metrics.rejected.add(1);
-                io.close_now(downstream_fd);
-                pool.release(conn);
-                return;
-            };
-            const channel = terminator.Channel.init(context) catch {
-                tls_legs.?.release(leg);
-                metrics.tls_handshake_failures.add(1);
-                metrics.rejected.add(1);
-                io.close_now(downstream_fd);
-                pool.release(conn);
-                return;
-            };
-            leg.reset(channel, .downstream, context.kernel_offload);
-            // The keylog callback fills these secrets during the handshake;
-            // armed here, at the leg's checked-out (pool-stable) address.
-            leg.channel.capture_secrets(&leg.secrets);
-            conn.tls = leg;
+            if (!conn.setup_downstream_tls(io, pool, metrics, context, downstream_fd)) return;
         }
         conn.io = io;
         conn.pool = pool;
@@ -666,16 +644,57 @@ pub const ProxyConn = struct {
         metrics.accepted.add(1);
         metrics.active.add(1);
         conn.arm_timeout();
-        // A TLS connection handshakes before HTTP: the client speaks first
-        // (ClientHello), so this arms the first wire recv. Handshake and
-        // request share the request deadline already running.
+        conn.arm_first_read();
+        assert(conn.timeout_armed); // both the deadline and the first recv are in flight
+        assert(conn.refs >= 1);
+    }
+
+    /// Acquire and arm the downstream TLS leg for `context`, or shed the
+    /// connection (leg-pool / TLS-heap exhaustion) and return false so `start`
+    /// bails without a partial init.
+    fn setup_downstream_tls(
+        conn: *ProxyConn,
+        io: *IO,
+        pool: *Pool,
+        metrics: *Counters,
+        context: *const terminator.Context,
+        downstream_fd: posix.socket_t,
+    ) bool {
+        assert(conn.tls_legs != null); // wired together with the context
+        // Sized one leg per connection, so a fresh conn always finds one;
+        // shed like heap exhaustion if the invariant ever breaks.
+        const leg = conn.tls_legs.?.acquire() orelse {
+            metrics.tls_handshake_failures.add(1);
+            metrics.rejected.add(1);
+            io.close_now(downstream_fd);
+            pool.release(conn);
+            return false;
+        };
+        const channel = terminator.Channel.init(context) catch {
+            conn.tls_legs.?.release(leg);
+            metrics.tls_handshake_failures.add(1);
+            metrics.rejected.add(1);
+            io.close_now(downstream_fd);
+            pool.release(conn);
+            return false;
+        };
+        leg.reset(channel, .downstream, context.kernel_offload);
+        // The keylog callback fills these secrets during the handshake;
+        // armed here, at the leg's checked-out (pool-stable) address.
+        leg.channel.capture_secrets(&leg.secrets);
+        conn.tls = leg;
+        return true;
+    }
+
+    /// Arm the first wire read: a TLS connection drives the handshake (the
+    /// client speaks first, ClientHello), a plaintext one reads the request
+    /// head. Both run under the request deadline already ticking.
+    fn arm_first_read(conn: *ProxyConn) void {
         if (conn.tls != null) {
             conn.tls_handshake_progress(conn.tls.?);
         } else {
             conn.arm_recv_head();
         }
-        assert(conn.timeout_armed); // both the deadline and the first recv are in flight
-        assert(conn.refs >= 1);
     }
 
     /// Move the current phase's deadline; the ticking timer picks it up.

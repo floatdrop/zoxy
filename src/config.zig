@@ -283,52 +283,8 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
         try lower_lb(a, &dc, cluster);
     }
 
-    const routes = try a.alloc(Route, dto.routes.len);
-    assert(routes.len == dto.routes.len);
-    for (dto.routes, routes) |dr, *route| {
-        route.* = .{
-            .host = try a.dupe(u8, dr.host),
-            .path_prefix = try a.dupe(u8, dr.path_prefix),
-            .cluster = try a.dupe(u8, dr.cluster),
-        };
-    }
-
-    // Validate every route references a real cluster before we commit.
-    for (routes) |route| {
-        if (find_cluster_in(clusters, route.cluster) == null) return error.UnknownCluster;
-    }
-
-    const tls: ?TlsConfig = if (dto.tls) |dt| lower: {
-        if (dt.certificate_file.len == 0) return error.InvalidTls;
-        if (dt.private_key_file.len == 0) return error.InvalidTls;
-        // The default identity counts toward the identity limit.
-        if (dt.additional_identities.len + 1 > constants.tls_identities_max) {
-            return error.InvalidTls;
-        }
-        const identities = try a.alloc(TlsIdentity, dt.additional_identities.len);
-        for (dt.additional_identities, identities) |di, *identity| {
-            if (di.server_names.len == 0) return error.InvalidTls;
-            if (di.certificate_file.len == 0) return error.InvalidTls;
-            if (di.private_key_file.len == 0) return error.InvalidTls;
-            const names = try a.alloc([]const u8, di.server_names.len);
-            for (di.server_names, names) |name, *duped| {
-                if (name.len == 0) return error.InvalidTls;
-                duped.* = try a.dupe(u8, name);
-            }
-            identity.* = .{
-                .server_names = names,
-                .certificate_file = try a.dupe(u8, di.certificate_file),
-                .private_key_file = try a.dupe(u8, di.private_key_file),
-            };
-        }
-        break :lower .{
-            .certificate_file = try a.dupe(u8, dt.certificate_file),
-            .private_key_file = try a.dupe(u8, dt.private_key_file),
-            .kernel_offload = dt.kernel_offload,
-            .http2 = dt.http2,
-            .additional_identities = identities,
-        };
-    } else null;
+    const routes = try lower_routes(a, dto.routes, clusters);
+    const tls = try lower_tls(a, dto.tls);
 
     return .{
         .gpa = gpa,
@@ -348,6 +304,60 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
         .tls = tls,
         .routes = routes,
         .clusters = clusters,
+    };
+}
+
+fn lower_routes(
+    a: std.mem.Allocator,
+    dto_routes: []const Dto.RouteDto,
+    clusters: []const Cluster,
+) ParseError![]Route {
+    const routes = try a.alloc(Route, dto_routes.len);
+    assert(routes.len == dto_routes.len);
+    for (dto_routes, routes) |dr, *route| {
+        route.* = .{
+            .host = try a.dupe(u8, dr.host),
+            .path_prefix = try a.dupe(u8, dr.path_prefix),
+            .cluster = try a.dupe(u8, dr.cluster),
+        };
+    }
+    // Validate every route references a real cluster before we commit.
+    for (routes) |route| {
+        if (find_cluster_in(clusters, route.cluster) == null) return error.UnknownCluster;
+    }
+    return routes;
+}
+
+fn lower_tls(a: std.mem.Allocator, dto_tls: ?Dto.TlsDto) ParseError!?TlsConfig {
+    const dt = dto_tls orelse return null;
+    if (dt.certificate_file.len == 0) return error.InvalidTls;
+    if (dt.private_key_file.len == 0) return error.InvalidTls;
+    // The default identity counts toward the identity limit.
+    if (dt.additional_identities.len + 1 > constants.tls_identities_max) {
+        return error.InvalidTls;
+    }
+    const identities = try a.alloc(TlsIdentity, dt.additional_identities.len);
+    for (dt.additional_identities, identities) |di, *identity| {
+        if (di.server_names.len == 0) return error.InvalidTls;
+        if (di.certificate_file.len == 0) return error.InvalidTls;
+        if (di.private_key_file.len == 0) return error.InvalidTls;
+        const names = try a.alloc([]const u8, di.server_names.len);
+        for (di.server_names, names) |name, *duped| {
+            if (name.len == 0) return error.InvalidTls;
+            duped.* = try a.dupe(u8, name);
+        }
+        identity.* = .{
+            .server_names = names,
+            .certificate_file = try a.dupe(u8, di.certificate_file),
+            .private_key_file = try a.dupe(u8, di.private_key_file),
+        };
+    }
+    return .{
+        .certificate_file = try a.dupe(u8, dt.certificate_file),
+        .private_key_file = try a.dupe(u8, dt.private_key_file),
+        .kernel_offload = dt.kernel_offload,
+        .http2 = dt.http2,
+        .additional_identities = identities,
     };
 }
 
