@@ -453,7 +453,7 @@ Deferred to later slices:
 - **Client-side flow-control stall coverage in the sim** — bodies beyond the
   initial window, needing a window-accounting test client.
 
-### Phase 6 — config: JSON schema (slice 1 done) + file-watch reload (planned)
+### Phase 6 — config: JSON schema + reload (slices 1–2 done; DSL planned)
 Decided 2026-07-04. Keep JSON as the canonical, machine-facing format (Caddy's
 model): the format was never the problem — `config.zig` already lowers a wire
 DTO into an immutable, arena-owned `Config`, and the allocation island absorbs
@@ -489,21 +489,45 @@ Slices, each behind the usual gates:
    with strictness. Lesson: reflecting the schema from the parser makes the
    schema *and its documentation* a byproduct of the DTO, so "can't drift"
    covers every description and enum value, not just the field shape.
-2. **File-watch reload → RCU swap.** A dedicated thread (off every data path)
-   watches the config file, parses + validates a *complete* new `Config` in a
-   fresh arena, and publishes only on success — a bad edit is logged and the
-   running config keeps serving, never a self-inflicted outage. Watch the
-   directory for the atomic-rename-replace editors perform (inotify
-   `IN_MOVED_TO` / `IN_CLOSE_WRITE` on the name, not an fd on the inode, which a
-   rename orphans); SIGHUP is an explicit second trigger. Publish per worker:
-   the watcher posts the new pointer to a per-worker mailbox, and each worker
-   swaps its own active `*const Config` at a loop-top quiescent point after one
-   atomic mailbox check — the per-request path stays a plain pointer deref, no
-   locks. **Reclamation is the hard part:** a routed request borrows
-   `*const Cluster` deep into `ProxyConn`, so the old arena cannot free until
-   every worker has both swapped *and* drained the requests that captured it —
-   an RCU grace period, reusing the Phase-4 drain accounting to detect
-   quiescence.
+2. **Config reload via supervised self-relaunch (done).** The plan was an
+   in-process **RCU swap** — a watcher publishes a new `*const Config` to
+   per-worker mailboxes, workers swap at a loop-top quiescent point, the old
+   arena is reclaimed after a grace period. **Rejected after tracing the
+   borrows.** Per-worker *mutable* state (`resilience.clusters[cluster_index]`,
+   `health_check.next_probe_ns[cluster.index][endpoint_index]`, balancer
+   counters) is reserved at startup and keyed by **cluster index / endpoint
+   position**, and the `upstream_tls` context slice + TLS heap + leg pools are
+   sized from the config at boot — so changing the cluster set/order, removing an
+   endpoint, or toggling TLS would mismap or panic in-flight accounting. And a
+   routed request borrows `*const Cluster`/`*const ResiliencePolicy` for its
+   whole life (up to the request timeout), so reclamation needs per-request epoch
+   tracking, not a fixed delay — a fixed delay is a use-after-free. The swap is
+   safe only for routes + policy tuning, at high complexity and risk.
+
+   **Chosen instead: a reload is a hot restart of ourselves.** zoxy already hands
+   its listener fds to a successor over a unix socket and drains (Phase 4). On
+   **SIGHUP** the running instance re-reads and strict-parses the file (slice 1's
+   parser) and, if the change is reloadable, `fork`+`exec`s a fresh `zoxy` on the
+   same config path; the successor adopts the live listeners through the handoff
+   socket and serves while the predecessor's handoff server delivers its own
+   SIGTERM and drains. No data-path change, no lifetime hazard, and **any** config
+   change works — cluster sets, endpoints, TLS — because the successor reserves
+   everything fresh, identical to a binary hot restart but self-triggered. Two
+   constraints, enforced by rejecting the reload and logging (never a broken
+   cutover): the **handoff socket must be configured** (the adoption channel) and
+   the **listen address must be unchanged** (the successor validates it before
+   adopting). Because main orders every fallible startup step — including TLS
+   cert loading — *before* the adopt, a successor that rejects the new config
+   dies before adopting and the running instance keeps serving; a `waitpid` on
+   the next SIGHUP reaps it so the operator can fix and retry. `config_reloads` /
+   `config_reload_errors` counters cross the very restart they trigger. Deferred:
+   inotify file-watch (auto-detect the edit) — a small additive follow-up over
+   the relaunch core.
+
+   Lesson: **the config format was never the hard part — the borrow graph was.**
+   Reusing the process boundary as the reclamation boundary turned a
+   many-edge-case in-process surgery into a few dozen lines leaning on
+   already-tested machinery.
 3. **Human-readable surface (later).** If hand-authoring JSON hurts, add a
    Caddyfile-style DSL that *lowers to* JSON — JSON stays canonical, the sugar
    never becomes a second source of truth.

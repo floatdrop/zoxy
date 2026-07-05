@@ -40,6 +40,9 @@ pub const h2_proxy = @import("net/h2_proxy.zig");
 /// Static proxy configuration (docs/DESIGN.md §7).
 pub const config = @import("config.zig");
 
+/// Config reload via supervised self-relaunch (docs/DESIGN.md §7 Phase 6 slice 2).
+pub const reload = @import("reload.zig");
+
 /// Request routing (host/path -> cluster).
 pub const Router = @import("proxy/router.zig").Router;
 
@@ -100,6 +103,7 @@ test {
     _ = h2_proxy;
     _ = config;
     _ = @import("config_schema.zig");
+    _ = reload;
     _ = @import("proxy/router.zig");
     _ = balancer;
     _ = maglev;

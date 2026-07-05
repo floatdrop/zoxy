@@ -334,7 +334,15 @@ pub const IO = struct {
     fn prep(io: *IO, completion: *Completion) error{SubmissionQueueFull}!void {
         const user_data: u64 = @intFromPtr(completion);
         switch (completion.operation) {
-            .accept => |op| _ = try io.ring.accept(user_data, op.socket, null, null, 0),
+            // CLOEXEC: a config-reload fork+exec (reload.zig) must not leak
+            // in-flight client fds into the successor — every other fd is CLOEXEC.
+            .accept => |op| _ = try io.ring.accept(
+                user_data,
+                op.socket,
+                null,
+                null,
+                linux.SOCK.CLOEXEC,
+            ),
             .recv => |op| _ = try io.ring.recv(user_data, op.socket, .{ .buffer = op.buffer }, 0),
             // MSG_NOSIGNAL: a send to a peer-closed socket must surface EPIPE,
             // not raise SIGPIPE. Zig's start code ignores SIGPIPE by default,
