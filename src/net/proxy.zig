@@ -3059,74 +3059,131 @@ const OneShotClient = struct {
     }
 };
 
+/// The shared test environment most plaintext proxy tests repeat verbatim: an
+/// `IO` loop, one `TestOrigin`, a parsed `Config` + `Router`, a connection
+/// pool, and a started `ProxyServer` on a loopback listener. Pointer-stable —
+/// every pointer the server borrows refers into this struct, so it must not be
+/// moved after `init` (declare `var h: TestHarness = undefined; try h.init(...)`).
+/// Tests needing a custom config, multiple origins, or TLS keep manual setup.
+const TestHarness = struct {
+    io: IO,
+    origin_listener: Listener,
+    origin: TestOrigin,
+    cfg: config.Config,
+    router: Router,
+    pool: Pool,
+    proxy_listener: Listener,
+    metrics: Counters,
+    access: AccessLog,
+    server: ProxyServer,
+
+    const Options = struct {
+        response: []const u8,
+        respond_after: []const u8 = "\r\n\r\n",
+        close_origin_after_send: bool = true,
+        pool_slots: u32 = 4,
+        request_timeout_ns: u63 = constants.request_timeout_ns,
+        idle_timeout_ns: u63 = constants.idle_timeout_ns,
+    };
+
+    fn init(h: *TestHarness, gpa: std.mem.Allocator, options: Options) !void {
+        assert(options.response.len > 0);
+        assert(options.pool_slots > 0);
+        h.io = try IO.init(64, 0);
+        errdefer h.io.deinit();
+
+        h.origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+        errdefer h.origin_listener.close();
+        h.origin = .{
+            .io = &h.io,
+            .listener = h.origin_listener,
+            .response = options.response,
+            .respond_after = options.respond_after,
+            .close_after_send = options.close_origin_after_send,
+        };
+        h.origin.start();
+
+        var json_buf: [256]u8 = undefined;
+        const cfg_text = try std.fmt.bufPrint(&json_buf,
+            \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+            \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
+        , .{h.origin_listener.bound_address().port});
+        h.cfg = try config.parse(gpa, cfg_text);
+        errdefer h.cfg.deinit();
+        h.router = Router.init(&h.cfg);
+
+        h.pool = try Pool.init(gpa, options.pool_slots);
+        errdefer h.pool.deinit(gpa);
+
+        h.proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+        errdefer h.proxy_listener.close();
+        h.metrics = .{};
+        h.access = .{ .fd = -1 };
+        h.server = ProxyServer.init(
+            &h.io,
+            &h.pool,
+            h.proxy_listener,
+            &h.router,
+            &h.metrics,
+            &h.access,
+            options.request_timeout_ns,
+            options.idle_timeout_ns,
+        );
+        h.server.start();
+    }
+
+    /// Tears down in reverse init order, mirroring the tests' original defers.
+    fn deinit(h: *TestHarness, gpa: std.mem.Allocator) void {
+        h.server.deinit();
+        h.proxy_listener.close();
+        h.pool.deinit(gpa);
+        h.cfg.deinit();
+        // A lingering origin (close_after_send = false) leaves its accepted
+        // connection open; close it so no fd leaks past the test.
+        if (h.origin.fd >= 0) _ = linux.close(h.origin.fd);
+        h.origin_listener.close();
+        h.io.deinit();
+    }
+
+    /// A loopback client socket connected to the proxy listener.
+    fn connect(h: *TestHarness) !posix.socket_t {
+        return connect_loopback(h.proxy_listener.bound_address().port);
+    }
+};
+
 test "proxy: forwards a request to an upstream and relays the response" {
     const gpa = std.testing.allocator;
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHELLO";
 
-    var io = try IO.init(64, 0);
-    defer io.deinit();
-
-    // Origin on an ephemeral port, on this same loop.
-    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer origin_listener.close();
-    var origin = TestOrigin{ .io = &io, .listener = origin_listener, .response = response };
-    origin.start();
-
-    // Config routes everything to a cluster pointing at the origin.
-    var json_buf: [256]u8 = undefined;
-    const cfg_text = try std.fmt.bufPrint(&json_buf,
-        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
-        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
-    , .{origin_listener.bound_address().port});
-    var cfg = try config.parse(gpa, cfg_text);
-    defer cfg.deinit();
-    const router = Router.init(&cfg);
-
-    var pool = try Pool.init(gpa, 4);
-    defer pool.deinit(gpa);
-
-    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer proxy_listener.close();
-    var metrics = Counters{};
-    var access = AccessLog{ .fd = -1 };
-    var server = ProxyServer.init(
-        &io,
-        &pool,
-        proxy_listener,
-        &router,
-        &metrics,
-        &access,
-        constants.request_timeout_ns,
-        constants.idle_timeout_ns,
-    );
-    defer server.deinit();
-    server.start();
+    var h: TestHarness = undefined;
+    try h.init(gpa, .{ .response = response });
+    defer h.deinit(gpa);
 
     // Client connects to the proxy and drives its request on the same loop.
-    const client = try connect_loopback(proxy_listener.bound_address().port);
+    const client = try h.connect();
     defer _ = linux.close(client);
 
     var c = OneShotClient{
-        .io = &io,
+        .io = &h.io,
         .fd = client,
         .request = "GET / HTTP/1.1\r\nHost: origin\r\nConnection: close\r\n\r\n",
     };
     c.go();
 
-    try io.run_until_done(&c.done);
+    try h.io.run_until_done(&c.done);
     try std.testing.expectEqualStrings(response, c.buf[0..c.len]);
 
     // Let the proxy finish tearing the connection down and reclaim its slot.
-    while (pool.free_count != pool.capacity) try io.run_once();
+    while (h.pool.free_count != h.pool.capacity) try h.io.run_once();
 
     // Every byte the proxy sent upstream (the spliced head — the client sent
     // no body) must be counted; the origin received exactly what was sent.
     try std.testing.expectEqual(
-        @as(u64, origin.request_len),
-        metrics.bytes_to_upstream.load(),
+        @as(u64, h.origin.request_len),
+        h.metrics.bytes_to_upstream.load(),
     );
     // Resilience accounting drains with the connection.
-    try std.testing.expect(server.resilience.is_idle());
+    try std.testing.expect(h.server.resilience.is_idle());
 }
 
 /// A TLS client on the test IO loop: a client-role `Channel` glued to a real
@@ -4027,112 +4084,42 @@ test "proxy: a response the proxy will close after announces Connection: close" 
     // proxy is about to perform.
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO";
 
-    var io = try IO.init(64, 0);
-    defer io.deinit();
+    var h: TestHarness = undefined;
+    try h.init(gpa, .{ .response = response, .close_origin_after_send = false });
+    defer h.deinit(gpa);
 
-    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer origin_listener.close();
-    var origin = TestOrigin{
-        .io = &io,
-        .listener = origin_listener,
-        .response = response,
-        .close_after_send = false, // origin keeps alive; the close is ours
-    };
-    origin.start();
-
-    var json_buf: [256]u8 = undefined;
-    const cfg_text = try std.fmt.bufPrint(&json_buf,
-        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
-        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
-    , .{origin_listener.bound_address().port});
-    var cfg = try config.parse(gpa, cfg_text);
-    defer cfg.deinit();
-    const router = Router.init(&cfg);
-
-    var pool = try Pool.init(gpa, 4);
-    defer pool.deinit(gpa);
-    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer proxy_listener.close();
-    var metrics = Counters{};
-    var access = AccessLog{ .fd = -1 };
-    var server = ProxyServer.init(
-        &io,
-        &pool,
-        proxy_listener,
-        &router,
-        &metrics,
-        &access,
-        constants.request_timeout_ns,
-        constants.idle_timeout_ns,
-    );
-    defer server.deinit();
-    server.start();
-
-    const client = try connect_loopback(proxy_listener.bound_address().port);
+    const client = try h.connect();
     defer _ = linux.close(client);
     var c = OneShotClient{
-        .io = &io,
+        .io = &h.io,
         .fd = client,
         .request = "GET / HTTP/1.1\r\nHost: origin\r\nConnection: close\r\n\r\n",
     };
     c.go();
 
-    try io.run_until_done(&c.done);
+    try h.io.run_until_done(&c.done);
     const received = c.buf[0..c.len];
     try std.testing.expect(std.mem.indexOf(u8, received, "Connection: close\r\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, received, "\r\n\r\nHELLO"));
-    while (pool.free_count != pool.capacity) try io.run_once();
+    while (h.pool.free_count != h.pool.capacity) try h.io.run_once();
 }
 
 test "proxy: strips hop-by-hop headers from the forwarded request" {
     const gpa = std.testing.allocator;
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
 
-    var io = try IO.init(64, 0);
-    defer io.deinit();
+    var h: TestHarness = undefined;
+    try h.init(gpa, .{ .response = response });
+    defer h.deinit(gpa);
 
-    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer origin_listener.close();
-    var origin = TestOrigin{ .io = &io, .listener = origin_listener, .response = response };
-    origin.start();
-
-    var json_buf: [256]u8 = undefined;
-    const cfg_text = try std.fmt.bufPrint(&json_buf,
-        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
-        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
-    , .{origin_listener.bound_address().port});
-    var cfg = try config.parse(gpa, cfg_text);
-    defer cfg.deinit();
-    const router = Router.init(&cfg);
-
-    var pool = try Pool.init(gpa, 4);
-    defer pool.deinit(gpa);
-
-    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer proxy_listener.close();
-    var metrics = Counters{};
-    var access = AccessLog{ .fd = -1 };
-    var server = ProxyServer.init(
-        &io,
-        &pool,
-        proxy_listener,
-        &router,
-        &metrics,
-        &access,
-        constants.request_timeout_ns,
-        constants.idle_timeout_ns,
-    );
-    defer server.deinit();
-    server.start();
-
-    const client = try connect_loopback(proxy_listener.bound_address().port);
+    const client = try h.connect();
     defer _ = linux.close(client);
 
     // `Connection` names "x-hop", making X-Hop hop-by-hop as well; the whole
     // connection-management block must vanish (nothing is injected: an
     // HTTP/1.1 upstream defaults to keep-alive, which the pool wants).
     var c = OneShotClient{
-        .io = &io,
+        .io = &h.io,
         .fd = client,
         .request = "GET / HTTP/1.1\r\n" ++
             "Host: o\r\n" ++
@@ -4143,11 +4130,11 @@ test "proxy: strips hop-by-hop headers from the forwarded request" {
     };
     c.go();
 
-    try io.run_until_done(&c.done);
+    try h.io.run_until_done(&c.done);
     try std.testing.expectEqualStrings(response, c.buf[0..c.len]);
-    while (pool.free_count != pool.capacity) try io.run_once();
+    while (h.pool.free_count != h.pool.capacity) try h.io.run_once();
 
-    const forwarded = origin.request_buf[0..origin.request_len];
+    const forwarded = h.origin.request_buf[0..h.origin.request_len];
     try std.testing.expect(std.mem.startsWith(u8, forwarded, "GET / HTTP/1.1\r\n"));
     try std.testing.expect(std.mem.indexOf(u8, forwarded, "Host: o\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, forwarded, "Accept: */*\r\n") != null);
@@ -4228,68 +4215,27 @@ test "proxy: completes promptly when a lingering upstream sends a framed respons
     // relay, this connection was pinned until the 30s deadline.
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO";
 
-    var io = try IO.init(64, 0);
-    defer io.deinit();
+    var h: TestHarness = undefined;
+    try h.init(gpa, .{ .response = response, .close_origin_after_send = false });
+    defer h.deinit(gpa);
 
-    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer origin_listener.close();
-    var origin = TestOrigin{
-        .io = &io,
-        .listener = origin_listener,
-        .response = response,
-        .close_after_send = false,
-    };
-    origin.start();
-    defer if (origin.fd >= 0) {
-        _ = linux.close(origin.fd);
-    };
-
-    var json_buf: [256]u8 = undefined;
-    const cfg_text = try std.fmt.bufPrint(&json_buf,
-        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
-        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
-    , .{origin_listener.bound_address().port});
-    var cfg = try config.parse(gpa, cfg_text);
-    defer cfg.deinit();
-    const router = Router.init(&cfg);
-
-    var pool = try Pool.init(gpa, 4);
-    defer pool.deinit(gpa);
-
-    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer proxy_listener.close();
-    var metrics = Counters{};
-    var access = AccessLog{ .fd = -1 };
-    var server = ProxyServer.init(
-        &io,
-        &pool,
-        proxy_listener,
-        &router,
-        &metrics,
-        &access,
-        constants.request_timeout_ns,
-        constants.idle_timeout_ns,
-    );
-    defer server.deinit();
-    server.start();
-
-    const client = try connect_loopback(proxy_listener.bound_address().port);
+    const client = try h.connect();
     defer _ = linux.close(client);
 
     var c = OneShotClient{
-        .io = &io,
+        .io = &h.io,
         .fd = client,
         .request = "GET / HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n",
     };
     c.go();
 
     const started_ns = monotonic_nanos();
-    try io.run_until_done(&c.done);
+    try h.io.run_until_done(&c.done);
     // The origin's head implied keep-alive; the proxy closes after this
     // response, so the relayed head announces it (RFC 9112 §9.6).
     const expected = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHELLO";
     try std.testing.expectEqualStrings(expected, c.buf[0..c.len]);
-    while (pool.free_count != pool.capacity) try io.run_once();
+    while (h.pool.free_count != h.pool.capacity) try h.io.run_once();
     // Well under the 30s deadline: the framer ended the response, not a timer.
     try std.testing.expect(monotonic_nanos() - started_ns < 5 * std.time.ns_per_s);
 }
@@ -4299,53 +4245,11 @@ test "proxy: relays a chunked response and ends it at the terminal chunk" {
     const response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
         "5\r\nHELLO\r\n6\r\nWORLD!\r\n0\r\n\r\n";
 
-    var io = try IO.init(64, 0);
-    defer io.deinit();
+    var h: TestHarness = undefined;
+    try h.init(gpa, .{ .response = response, .close_origin_after_send = false });
+    defer h.deinit(gpa);
 
-    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer origin_listener.close();
-    // The origin lingers: only chunked end-detection can finish this request.
-    var origin = TestOrigin{
-        .io = &io,
-        .listener = origin_listener,
-        .response = response,
-        .close_after_send = false,
-    };
-    origin.start();
-    defer if (origin.fd >= 0) {
-        _ = linux.close(origin.fd);
-    };
-
-    var json_buf: [256]u8 = undefined;
-    const cfg_text = try std.fmt.bufPrint(&json_buf,
-        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
-        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
-    , .{origin_listener.bound_address().port});
-    var cfg = try config.parse(gpa, cfg_text);
-    defer cfg.deinit();
-    const router = Router.init(&cfg);
-
-    var pool = try Pool.init(gpa, 4);
-    defer pool.deinit(gpa);
-
-    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer proxy_listener.close();
-    var metrics = Counters{};
-    var access = AccessLog{ .fd = -1 };
-    var server = ProxyServer.init(
-        &io,
-        &pool,
-        proxy_listener,
-        &router,
-        &metrics,
-        &access,
-        constants.request_timeout_ns,
-        constants.idle_timeout_ns,
-    );
-    defer server.deinit();
-    server.start();
-
-    const client = try connect_loopback(proxy_listener.bound_address().port);
+    const client = try h.connect();
     defer _ = linux.close(client);
 
     const Client = struct {
@@ -4377,15 +4281,15 @@ test "proxy: relays a chunked response and ends it at the terminal chunk" {
             c.arm_recv();
         }
     };
-    var c = Client{ .io = &io, .fd = client };
+    var c = Client{ .io = &h.io, .fd = client };
     c.go();
 
-    try io.run_until_done(&c.done);
+    try h.io.run_until_done(&c.done);
     // Keep-alive origin + closing client: the relayed head announces our close.
     const expected = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" ++
         "5\r\nHELLO\r\n6\r\nWORLD!\r\n0\r\n\r\n";
     try std.testing.expectEqualStrings(expected, c.buf[0..c.total]);
-    while (pool.free_count != pool.capacity) try io.run_once();
+    while (h.pool.free_count != h.pool.capacity) try h.io.run_once();
 }
 
 test "proxy: serves pipelined requests sequentially, each routed on its own" {
@@ -4395,44 +4299,11 @@ test "proxy: serves pipelined requests sequentially, each routed on its own" {
     // (the forced upstream close must not leak to a keep-alive client).
     const client_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
 
-    var io = try IO.init(64, 0);
-    defer io.deinit();
+    var h: TestHarness = undefined;
+    try h.init(gpa, .{ .response = response });
+    defer h.deinit(gpa);
 
-    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer origin_listener.close();
-    var origin = TestOrigin{ .io = &io, .listener = origin_listener, .response = response };
-    origin.start();
-
-    var json_buf: [256]u8 = undefined;
-    const cfg_text = try std.fmt.bufPrint(&json_buf,
-        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
-        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
-    , .{origin_listener.bound_address().port});
-    var cfg = try config.parse(gpa, cfg_text);
-    defer cfg.deinit();
-    const router = Router.init(&cfg);
-
-    var pool = try Pool.init(gpa, 4);
-    defer pool.deinit(gpa);
-
-    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer proxy_listener.close();
-    var metrics = Counters{};
-    var access = AccessLog{ .fd = -1 };
-    var server = ProxyServer.init(
-        &io,
-        &pool,
-        proxy_listener,
-        &router,
-        &metrics,
-        &access,
-        constants.request_timeout_ns,
-        constants.idle_timeout_ns,
-    );
-    defer server.deinit();
-    server.start();
-
-    const client = try connect_loopback(proxy_listener.bound_address().port);
+    const client = try h.connect();
     defer _ = linux.close(client);
 
     const Client = struct {
@@ -4472,20 +4343,20 @@ test "proxy: serves pipelined requests sequentially, each routed on its own" {
             c.arm_recv();
         }
     };
-    var c = Client{ .io = &io, .fd = client, .expected_total = client_response.len * 2 };
+    var c = Client{ .io = &h.io, .fd = client, .expected_total = client_response.len * 2 };
     c.go();
 
-    try io.run_until_done(&c.done);
+    try h.io.run_until_done(&c.done);
     try std.testing.expectEqualStrings(client_response ++ client_response, c.buf[0..c.total]);
 
-    const forwarded = origin.request_buf[0..origin.request_len];
+    const forwarded = h.origin.request_buf[0..h.origin.request_len];
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, forwarded, "GET "));
     try std.testing.expect(std.mem.indexOf(u8, forwarded, "GET /second ") != null);
 
     // The downstream connection is still open (keep-alive); closing it
     // releases the slot.
     _ = linux.close(client);
-    while (pool.free_count != pool.capacity) try io.run_once();
+    while (h.pool.free_count != h.pool.capacity) try h.io.run_once();
 }
 
 test "proxy: reuses the downstream connection for sequential keep-alive requests" {
@@ -4493,44 +4364,11 @@ test "proxy: reuses the downstream connection for sequential keep-alive requests
     const response = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nHELLO";
     const client_response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO";
 
-    var io = try IO.init(64, 0);
-    defer io.deinit();
+    var h: TestHarness = undefined;
+    try h.init(gpa, .{ .response = response });
+    defer h.deinit(gpa);
 
-    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer origin_listener.close();
-    var origin = TestOrigin{ .io = &io, .listener = origin_listener, .response = response };
-    origin.start();
-
-    var json_buf: [256]u8 = undefined;
-    const cfg_text = try std.fmt.bufPrint(&json_buf,
-        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
-        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
-    , .{origin_listener.bound_address().port});
-    var cfg = try config.parse(gpa, cfg_text);
-    defer cfg.deinit();
-    const router = Router.init(&cfg);
-
-    var pool = try Pool.init(gpa, 4);
-    defer pool.deinit(gpa);
-
-    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer proxy_listener.close();
-    var metrics = Counters{};
-    var access = AccessLog{ .fd = -1 };
-    var server = ProxyServer.init(
-        &io,
-        &pool,
-        proxy_listener,
-        &router,
-        &metrics,
-        &access,
-        constants.request_timeout_ns,
-        constants.idle_timeout_ns,
-    );
-    defer server.deinit();
-    server.start();
-
-    const client = try connect_loopback(proxy_listener.bound_address().port);
+    const client = try h.connect();
 
     // Two requests, the second sent only after the first response arrives —
     // on the same downstream socket, without reconnecting.
@@ -4576,22 +4414,22 @@ test "proxy: reuses the downstream connection for sequential keep-alive requests
                 "Host: o\r\n\r\n");
         }
     };
-    var c = Client{ .io = &io, .fd = client, .expected = client_response };
+    var c = Client{ .io = &h.io, .fd = client, .expected = client_response };
     c.go();
 
-    try io.run_until_done(&c.done);
+    try h.io.run_until_done(&c.done);
     try std.testing.expect(c.matched);
     try std.testing.expectEqual(@as(u32, 2), c.responses);
-    try std.testing.expectEqual(@as(u64, 2), metrics.requests.load());
+    try std.testing.expectEqual(@as(u64, 2), h.metrics.requests.load());
     // One downstream connection carried both requests...
-    try std.testing.expectEqual(@as(u64, 1), metrics.accepted.load());
+    try std.testing.expectEqual(@as(u64, 1), h.metrics.accepted.load());
     // ...and each went to the origin on its own upstream connection.
-    const forwarded = origin.request_buf[0..origin.request_len];
+    const forwarded = h.origin.request_buf[0..h.origin.request_len];
     try std.testing.expect(std.mem.indexOf(u8, forwarded, "GET /one ") != null);
     try std.testing.expect(std.mem.indexOf(u8, forwarded, "GET /two ") != null);
 
     _ = linux.close(client);
-    while (pool.free_count != pool.capacity) try io.run_once();
+    while (h.pool.free_count != h.pool.capacity) try h.io.run_once();
 }
 
 test "proxy: reuses a pooled upstream connection for the next request" {
@@ -4601,52 +4439,11 @@ test "proxy: reuses a pooled upstream connection for the next request" {
     // very same connection, without a second accept.
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO";
 
-    var io = try IO.init(64, 0);
-    defer io.deinit();
+    var h: TestHarness = undefined;
+    try h.init(gpa, .{ .response = response, .close_origin_after_send = false });
+    defer h.deinit(gpa);
 
-    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer origin_listener.close();
-    var origin = TestOrigin{
-        .io = &io,
-        .listener = origin_listener,
-        .response = response,
-        .close_after_send = false,
-    };
-    origin.start();
-    defer if (origin.fd >= 0) {
-        _ = linux.close(origin.fd);
-    };
-
-    var json_buf: [256]u8 = undefined;
-    const cfg_text = try std.fmt.bufPrint(&json_buf,
-        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
-        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
-    , .{origin_listener.bound_address().port});
-    var cfg = try config.parse(gpa, cfg_text);
-    defer cfg.deinit();
-    const router = Router.init(&cfg);
-
-    var pool = try Pool.init(gpa, 4);
-    defer pool.deinit(gpa);
-
-    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer proxy_listener.close();
-    var metrics = Counters{};
-    var access = AccessLog{ .fd = -1 };
-    var server = ProxyServer.init(
-        &io,
-        &pool,
-        proxy_listener,
-        &router,
-        &metrics,
-        &access,
-        constants.request_timeout_ns,
-        constants.idle_timeout_ns,
-    );
-    defer server.deinit();
-    server.start();
-
-    const client = try connect_loopback(proxy_listener.bound_address().port);
+    const client = try h.connect();
 
     const Client = struct {
         io: *IO,
@@ -4690,73 +4487,32 @@ test "proxy: reuses a pooled upstream connection for the next request" {
                 "Host: o\r\n\r\n");
         }
     };
-    var c = Client{ .io = &io, .fd = client, .expected = response };
+    var c = Client{ .io = &h.io, .fd = client, .expected = response };
     c.go();
 
-    try io.run_until_done(&c.done);
+    try h.io.run_until_done(&c.done);
     try std.testing.expect(c.matched);
     try std.testing.expectEqual(@as(u32, 2), c.responses);
     // The second request rode the pooled connection...
-    try std.testing.expectEqual(@as(u64, 1), metrics.upstream_reused.load());
+    try std.testing.expectEqual(@as(u64, 1), h.metrics.upstream_reused.load());
     // ...which the origin observes as both requests on one accept.
-    const forwarded = origin.request_buf[0..origin.request_len];
+    const forwarded = h.origin.request_buf[0..h.origin.request_len];
     try std.testing.expect(std.mem.indexOf(u8, forwarded, "GET /one ") != null);
     try std.testing.expect(std.mem.indexOf(u8, forwarded, "GET /two ") != null);
 
     _ = linux.close(client);
-    while (pool.free_count != pool.capacity) try io.run_once();
+    while (h.pool.free_count != h.pool.capacity) try h.io.run_once();
 }
 
 test "proxy: retries a stale pooled upstream on a fresh connection" {
     const gpa = std.testing.allocator;
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO";
 
-    var io = try IO.init(64, 0);
-    defer io.deinit();
+    var h: TestHarness = undefined;
+    try h.init(gpa, .{ .response = response, .close_origin_after_send = false });
+    defer h.deinit(gpa);
 
-    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer origin_listener.close();
-    var origin = TestOrigin{
-        .io = &io,
-        .listener = origin_listener,
-        .response = response,
-        .close_after_send = false,
-    };
-    origin.start();
-    defer if (origin.fd >= 0) {
-        _ = linux.close(origin.fd);
-    };
-
-    var json_buf: [256]u8 = undefined;
-    const cfg_text = try std.fmt.bufPrint(&json_buf,
-        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
-        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
-    , .{origin_listener.bound_address().port});
-    var cfg = try config.parse(gpa, cfg_text);
-    defer cfg.deinit();
-    const router = Router.init(&cfg);
-
-    var pool = try Pool.init(gpa, 4);
-    defer pool.deinit(gpa);
-
-    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer proxy_listener.close();
-    var metrics = Counters{};
-    var access = AccessLog{ .fd = -1 };
-    var server = ProxyServer.init(
-        &io,
-        &pool,
-        proxy_listener,
-        &router,
-        &metrics,
-        &access,
-        constants.request_timeout_ns,
-        constants.idle_timeout_ns,
-    );
-    defer server.deinit();
-    server.start();
-
-    const client = try connect_loopback(proxy_listener.bound_address().port);
+    const client = try h.connect();
 
     const Client = struct {
         io: *IO,
@@ -4803,75 +4559,42 @@ test "proxy: retries a stale pooled upstream on a fresh connection" {
             c.done = true;
         }
     };
-    var c = Client{ .io = &io, .fd = client, .expected = response };
+    var c = Client{ .io = &h.io, .fd = client, .expected = response };
     c.go();
 
-    try io.run_until_done(&c.got_first);
+    try h.io.run_until_done(&c.got_first);
     // The upstream closes the connection while it idles in the pool —
     // exactly what a server-side keep-alive timeout does.
-    _ = linux.shutdown(origin.fd, linux.SHUT.RDWR);
-    _ = linux.close(origin.fd);
-    origin.fd = -1;
-    origin.start(); // ready to accept the retry's fresh dial
+    _ = linux.shutdown(h.origin.fd, linux.SHUT.RDWR);
+    _ = linux.close(h.origin.fd);
+    h.origin.fd = -1;
+    h.origin.start(); // ready to accept the retry's fresh dial
 
     c.send_second();
-    try io.run_until_done(&c.done);
+    try h.io.run_until_done(&c.done);
     try std.testing.expect(c.matched);
     try std.testing.expectEqual(@as(u32, 2), c.responses);
     // The stale connection was checked out, failed, and was replaced.
-    try std.testing.expectEqual(@as(u64, 1), metrics.upstream_reused.load());
-    try std.testing.expectEqual(@as(u64, 1), metrics.upstream_retried.load());
-    try std.testing.expectEqual(@as(u64, 0), metrics.upstream_errors.load());
+    try std.testing.expectEqual(@as(u64, 1), h.metrics.upstream_reused.load());
+    try std.testing.expectEqual(@as(u64, 1), h.metrics.upstream_retried.load());
+    try std.testing.expectEqual(@as(u64, 0), h.metrics.upstream_errors.load());
 
     _ = linux.close(client);
-    while (pool.free_count != pool.capacity) try io.run_once();
+    while (h.pool.free_count != h.pool.capacity) try h.io.run_once();
     // The replay opened a second attempt on the same endpoint; both attempts
     // and the request itself must be settled.
-    try std.testing.expect(server.resilience.is_idle());
+    try std.testing.expect(h.server.resilience.is_idle());
 }
 
 test "proxy: does not reuse the connection for an HTTP/1.0 client" {
     const gpa = std.testing.allocator;
     const response = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nHELLO";
 
-    var io = try IO.init(64, 0);
-    defer io.deinit();
+    var h: TestHarness = undefined;
+    try h.init(gpa, .{ .response = response });
+    defer h.deinit(gpa);
 
-    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer origin_listener.close();
-    var origin = TestOrigin{ .io = &io, .listener = origin_listener, .response = response };
-    origin.start();
-
-    var json_buf: [256]u8 = undefined;
-    const cfg_text = try std.fmt.bufPrint(&json_buf,
-        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
-        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
-    , .{origin_listener.bound_address().port});
-    var cfg = try config.parse(gpa, cfg_text);
-    defer cfg.deinit();
-    const router = Router.init(&cfg);
-
-    var pool = try Pool.init(gpa, 4);
-    defer pool.deinit(gpa);
-
-    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer proxy_listener.close();
-    var metrics = Counters{};
-    var access = AccessLog{ .fd = -1 };
-    var server = ProxyServer.init(
-        &io,
-        &pool,
-        proxy_listener,
-        &router,
-        &metrics,
-        &access,
-        constants.request_timeout_ns,
-        constants.idle_timeout_ns,
-    );
-    defer server.deinit();
-    server.start();
-
-    const client = try connect_loopback(proxy_listener.bound_address().port);
+    const client = try h.connect();
     defer _ = linux.close(client);
 
     const Client = struct {
@@ -4903,13 +4626,13 @@ test "proxy: does not reuse the connection for an HTTP/1.0 client" {
             c.arm_recv();
         }
     };
-    var c = Client{ .io = &io, .fd = client };
+    var c = Client{ .io = &h.io, .fd = client };
     c.go();
 
-    try io.run_until_done(&c.eof);
+    try h.io.run_until_done(&c.eof);
     // No reuse means no stripping either: the head passes through verbatim.
     try std.testing.expectEqualStrings(response, c.buf[0..c.total]);
-    while (pool.free_count != pool.capacity) try io.run_once();
+    while (h.pool.free_count != h.pool.capacity) try h.io.run_once();
 }
 
 test "proxy: streams a framed request body to the upstream" {
@@ -4917,50 +4640,11 @@ test "proxy: streams a framed request body to the upstream" {
     const body = "0123456789";
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
 
-    var io = try IO.init(64, 0);
-    defer io.deinit();
+    var h: TestHarness = undefined;
+    try h.init(gpa, .{ .response = response, .respond_after = body });
+    defer h.deinit(gpa);
 
-    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer origin_listener.close();
-    // The origin only answers once the whole body has arrived.
-    var origin = TestOrigin{
-        .io = &io,
-        .listener = origin_listener,
-        .response = response,
-        .respond_after = body,
-    };
-    origin.start();
-
-    var json_buf: [256]u8 = undefined;
-    const cfg_text = try std.fmt.bufPrint(&json_buf,
-        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
-        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
-    , .{origin_listener.bound_address().port});
-    var cfg = try config.parse(gpa, cfg_text);
-    defer cfg.deinit();
-    const router = Router.init(&cfg);
-
-    var pool = try Pool.init(gpa, 4);
-    defer pool.deinit(gpa);
-
-    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer proxy_listener.close();
-    var metrics = Counters{};
-    var access = AccessLog{ .fd = -1 };
-    var server = ProxyServer.init(
-        &io,
-        &pool,
-        proxy_listener,
-        &router,
-        &metrics,
-        &access,
-        constants.request_timeout_ns,
-        constants.idle_timeout_ns,
-    );
-    defer server.deinit();
-    server.start();
-
-    const client = try connect_loopback(proxy_listener.bound_address().port);
+    const client = try h.connect();
     defer _ = linux.close(client);
 
     const Client = struct {
@@ -4990,64 +4674,27 @@ test "proxy: streams a framed request body to the upstream" {
             c.done = true;
         }
     };
-    var c = Client{ .io = &io, .fd = client, .body = body };
+    var c = Client{ .io = &h.io, .fd = client, .body = body };
     c.go();
 
-    try io.run_until_done(&c.done);
+    try h.io.run_until_done(&c.done);
     // Keep-alive origin + closing client: the relayed head announces our close.
     const expected = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
     try std.testing.expectEqualStrings(expected, c.buf[0..c.len]);
-    while (pool.free_count != pool.capacity) try io.run_once();
+    while (h.pool.free_count != h.pool.capacity) try h.io.run_once();
 
-    const forwarded = origin.request_buf[0..origin.request_len];
+    const forwarded = h.origin.request_buf[0..h.origin.request_len];
     try std.testing.expect(std.mem.endsWith(u8, forwarded, body));
 }
 
 test "proxy: answers 502 when the upstream response is unparseable" {
     const gpa = std.testing.allocator;
 
-    var io = try IO.init(64, 0);
-    defer io.deinit();
+    var h: TestHarness = undefined;
+    try h.init(gpa, .{ .response = "NOT-HTTP-AT-ALL\r\n\r\n" });
+    defer h.deinit(gpa);
 
-    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer origin_listener.close();
-    var origin = TestOrigin{
-        .io = &io,
-        .listener = origin_listener,
-        .response = "NOT-HTTP-AT-ALL\r\n\r\n",
-    };
-    origin.start();
-
-    var json_buf: [256]u8 = undefined;
-    const cfg_text = try std.fmt.bufPrint(&json_buf,
-        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
-        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
-    , .{origin_listener.bound_address().port});
-    var cfg = try config.parse(gpa, cfg_text);
-    defer cfg.deinit();
-    const router = Router.init(&cfg);
-
-    var pool = try Pool.init(gpa, 4);
-    defer pool.deinit(gpa);
-
-    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer proxy_listener.close();
-    var metrics = Counters{};
-    var access = AccessLog{ .fd = -1 };
-    var server = ProxyServer.init(
-        &io,
-        &pool,
-        proxy_listener,
-        &router,
-        &metrics,
-        &access,
-        constants.request_timeout_ns,
-        constants.idle_timeout_ns,
-    );
-    defer server.deinit();
-    server.start();
-
-    const client = try connect_loopback(proxy_listener.bound_address().port);
+    const client = try h.connect();
     defer _ = linux.close(client);
 
     const Client = struct {
@@ -5070,14 +4717,14 @@ test "proxy: answers 502 when the upstream response is unparseable" {
             c.done = true;
         }
     };
-    var c = Client{ .io = &io, .fd = client };
+    var c = Client{ .io = &h.io, .fd = client };
     c.go();
 
-    try io.run_until_done(&c.done);
+    try h.io.run_until_done(&c.done);
     try std.testing.expect(std.mem.startsWith(u8, c.buf[0..c.len], "HTTP/1.1 502 "));
-    while (pool.free_count != pool.capacity) try io.run_once();
+    while (h.pool.free_count != h.pool.capacity) try h.io.run_once();
     // The failed attempt (an upstream fault, mid-flight) must be settled.
-    try std.testing.expect(server.resilience.is_idle());
+    try std.testing.expect(h.server.resilience.is_idle());
 }
 
 test "proxy: circuit breaker rejects a request beyond max_requests with 503" {
@@ -5604,44 +5251,11 @@ test "proxy: relays a response larger than the relay buffer with bounded memory"
     @memcpy(response[0..header.len], header);
     for (response[header.len..], 0..) |*b, i| b.* = @truncate(i);
 
-    var io = try IO.init(64, 0);
-    defer io.deinit();
+    var h: TestHarness = undefined;
+    try h.init(gpa, .{ .response = response });
+    defer h.deinit(gpa);
 
-    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer origin_listener.close();
-    var origin = TestOrigin{ .io = &io, .listener = origin_listener, .response = response };
-    origin.start();
-
-    var json_buf: [256]u8 = undefined;
-    const cfg_text = try std.fmt.bufPrint(&json_buf,
-        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
-        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
-    , .{origin_listener.bound_address().port});
-    var cfg = try config.parse(gpa, cfg_text);
-    defer cfg.deinit();
-    const router = Router.init(&cfg);
-
-    var pool = try Pool.init(gpa, 4);
-    defer pool.deinit(gpa);
-
-    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer proxy_listener.close();
-    var metrics = Counters{};
-    var access = AccessLog{ .fd = -1 };
-    var server = ProxyServer.init(
-        &io,
-        &pool,
-        proxy_listener,
-        &router,
-        &metrics,
-        &access,
-        constants.request_timeout_ns,
-        constants.idle_timeout_ns,
-    );
-    defer server.deinit();
-    server.start();
-
-    const client = try connect_loopback(proxy_listener.bound_address().port);
+    const client = try h.connect();
     defer _ = linux.close(client);
 
     const Client = struct {
@@ -5672,12 +5286,12 @@ test "proxy: relays a response larger than the relay buffer with bounded memory"
             c.arm_recv();
         }
     };
-    var c = Client{ .io = &io, .fd = client };
+    var c = Client{ .io = &h.io, .fd = client };
     c.go();
 
-    try io.run_until_done(&c.done);
+    try h.io.run_until_done(&c.done);
     try std.testing.expectEqual(response.len, c.total);
-    while (pool.free_count != pool.capacity) try io.run_once();
+    while (h.pool.free_count != h.pool.capacity) try h.io.run_once();
 }
 
 test "proxy: a stalled connection is reclaimed by the deadline" {
@@ -5732,56 +5346,18 @@ test "proxy: an idle keep-alive connection is reclaimed by the idle timeout" {
     const gpa = std.testing.allocator;
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO";
 
-    var io = try IO.init(64, 0);
-    defer io.deinit();
-
-    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer origin_listener.close();
-    var origin = TestOrigin{
-        .io = &io,
-        .listener = origin_listener,
-        .response = response,
-        .close_after_send = false,
-    };
-    origin.start();
-    defer if (origin.fd >= 0) {
-        _ = linux.close(origin.fd);
-    };
-
-    var json_buf: [256]u8 = undefined;
-    const cfg_text = try std.fmt.bufPrint(&json_buf,
-        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
-        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
-    , .{origin_listener.bound_address().port});
-    var cfg = try config.parse(gpa, cfg_text);
-    defer cfg.deinit();
-    const router = Router.init(&cfg);
-
-    var pool = try Pool.init(gpa, 4);
-    defer pool.deinit(gpa);
-
-    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    defer proxy_listener.close();
     // Idle enforcement lags by at most the in-flight timer, which is bounded
     // by the request timeout here — keep both short so the test is fast.
-    const request_timeout: u63 = 300 * std.time.ns_per_ms;
-    const idle_timeout: u63 = 100 * std.time.ns_per_ms;
-    var metrics = Counters{};
-    var access = AccessLog{ .fd = -1 };
-    var server = ProxyServer.init(
-        &io,
-        &pool,
-        proxy_listener,
-        &router,
-        &metrics,
-        &access,
-        request_timeout,
-        idle_timeout,
-    );
-    defer server.deinit();
-    server.start();
+    var h: TestHarness = undefined;
+    try h.init(gpa, .{
+        .response = response,
+        .close_origin_after_send = false,
+        .request_timeout_ns = 300 * std.time.ns_per_ms,
+        .idle_timeout_ns = 100 * std.time.ns_per_ms,
+    });
+    defer h.deinit(gpa);
 
-    const client = try connect_loopback(proxy_listener.bound_address().port);
+    const client = try h.connect();
     defer _ = linux.close(client);
 
     // One complete keep-alive exchange; then the client goes silent.
@@ -5817,14 +5393,14 @@ test "proxy: an idle keep-alive connection is reclaimed by the idle timeout" {
             c.arm_recv();
         }
     };
-    var c = Client{ .io = &io, .fd = client, .expected = response };
+    var c = Client{ .io = &h.io, .fd = client, .expected = response };
     c.go();
 
     const started_ns = monotonic_nanos();
-    try io.run_until_done(&c.eof);
+    try h.io.run_until_done(&c.eof);
     try std.testing.expect(c.got_response);
     try std.testing.expectEqualStrings(response, c.buf[0..c.len]);
-    while (pool.free_count != pool.capacity) try io.run_once();
+    while (h.pool.free_count != h.pool.capacity) try h.io.run_once();
     // Reclaimed by the idle deadline (~100-400ms), not the old 30s whole-life
     // deadline and not the request timeout alone.
     try std.testing.expect(monotonic_nanos() - started_ns < 2 * std.time.ns_per_s);
