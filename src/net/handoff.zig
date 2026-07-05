@@ -301,40 +301,48 @@ pub fn recv_fds(
     }
 
     // Every adopted fd must be a listening socket bound to the configured
-    // address — `getsockname` + SO_ACCEPTCONN, or the whole batch is refused.
-    var valid = true;
-    for (control.fds[0..fd_count]) |received_fd| {
-        if (!is_listener_for(received_fd, listen_address)) valid = false;
-    }
-    if (!valid) {
-        for (control.fds[0..fd_count]) |received_fd| _ = linux.close(received_fd);
-        return 0;
-    }
-    for (control.fds[0..fd_count], fds_out[0..fd_count]) |received_fd, *slot| {
-        slot.* = received_fd;
-    }
+    // address (getsockname + SO_ACCEPTCONN), or the whole batch is refused.
+    if (!adopt_listeners(control.fds[0..fd_count], fds_out, listen_address)) return 0;
 
     // The counter records ride behind the header. Best-effort: an absent,
     // oversized, or short block never un-adopts the listeners above.
-    if (header.stats_bytes > 0 and header.stats_bytes <= stats_bytes_max) {
-        var stats_buffer: [stats_bytes_max]u8 = undefined;
-        var filled: usize = 0;
-        while (filled < header.stats_bytes) { // bounded: every pass reads >= 1 byte or stops
-            const stats_rc = linux.read(
-                connection,
-                stats_buffer[filled..].ptr,
-                header.stats_bytes - filled,
-            );
-            if (linux.errno(stats_rc) != .SUCCESS) break;
-            if (stats_rc == 0) break; // peer closed early: partial block
-            filled += stats_rc;
-            assert(filled <= header.stats_bytes);
-        }
-        if (metrics) |target| {
-            if (filled == header.stats_bytes) apply_stats(target, stats_buffer[0..filled]);
-        }
-    }
+    read_stats_tail(connection, header.stats_bytes, metrics);
     return fd_count;
+}
+
+fn adopt_listeners(
+    fds: []const posix.socket_t,
+    fds_out: []posix.socket_t,
+    listen_address: Ip4Address,
+) bool {
+    var valid = true;
+    for (fds) |received_fd| {
+        if (!is_listener_for(received_fd, listen_address)) valid = false;
+    }
+    if (!valid) {
+        for (fds) |received_fd| _ = linux.close(received_fd);
+        return false;
+    }
+    for (fds, fds_out[0..fds.len]) |received_fd, *slot| slot.* = received_fd;
+    return true;
+}
+
+/// Read the best-effort counter-records tail that rides behind the header; an
+/// absent, oversized, or short block never un-adopts the listeners.
+fn read_stats_tail(connection: posix.socket_t, stats_bytes: u32, metrics: ?*Metrics) void {
+    if (stats_bytes == 0 or stats_bytes > stats_bytes_max) return;
+    var stats_buffer: [stats_bytes_max]u8 = undefined;
+    var filled: usize = 0;
+    while (filled < stats_bytes) { // bounded: every pass reads >= 1 byte or stops
+        const stats_rc = linux.read(connection, stats_buffer[filled..].ptr, stats_bytes - filled);
+        if (linux.errno(stats_rc) != .SUCCESS) break;
+        if (stats_rc == 0) break; // peer closed early: partial block
+        filled += stats_rc;
+        assert(filled <= stats_bytes);
+    }
+    if (metrics) |target| {
+        if (filled == stats_bytes) apply_stats(target, stats_buffer[0..filled]);
+    }
 }
 
 fn is_listener_for(fd: posix.socket_t, listen_address: Ip4Address) bool {

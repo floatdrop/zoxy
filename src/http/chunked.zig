@@ -118,6 +118,20 @@ pub const ChunkedDecoder = struct {
                 decoder.state = .chunk_size;
                 return 1;
             },
+            .trailer_start, .trailer_line, .trailer_line_lf => return decoder.step_trailer(c),
+            .final_lf => {
+                if (c != '\n') return error.Malformed;
+                decoder.state = .done;
+                return 1;
+            },
+            .done => unreachable, // the feed loop stops on .done (asserted above)
+        }
+    }
+
+    /// The trailer-section states (RFC 9112 §7.1.2): header lines we count but
+    /// discard, ending on the blank line that terminates the message.
+    fn step_trailer(decoder: *ChunkedDecoder, c: u8) error{Malformed}!usize {
+        switch (decoder.state) {
             .trailer_start => {
                 if (c == '\r') {
                     decoder.state = .final_lf;
@@ -140,12 +154,7 @@ pub const ChunkedDecoder = struct {
                 decoder.state = .trailer_start;
                 return 1;
             },
-            .final_lf => {
-                if (c != '\n') return error.Malformed;
-                decoder.state = .done;
-                return 1;
-            },
-            .done => unreachable, // the feed loop stops on .done (asserted above)
+            else => unreachable, // step() dispatches only the trailer states here
         }
     }
 
