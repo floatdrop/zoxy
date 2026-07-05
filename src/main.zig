@@ -29,7 +29,8 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.arena.allocator();
 
     const args = try init.minimal.args.toSlice(gpa);
-    const config_path = if (args.len > 1) args[1] else "zoxy.json";
+    // NUL-terminated so a SIGHUP reload can pass it straight to execve.
+    const config_path: [:0]const u8 = if (args.len > 1) args[1] else "zoxy.json";
 
     const text = std.Io.Dir.cwd().readFileAlloc(init.io, config_path, gpa, .unlimited) catch |err| {
         std.log.err("zoxy: cannot read config {s}: {s}", .{ config_path, @errorName(err) });
@@ -93,8 +94,16 @@ pub fn main(init: std.process.Init) !void {
 
     std.log.info("zoxy listening on {f} across {d} worker(s)", .{ cfg.listen, worker_count });
 
-    // Block until the first signal, poke every worker's drain trigger, join.
-    try drain_and_join(threads, drain_triggers, signal_fd);
+    // Supervise: SIGHUP reloads by relaunch, SIGTERM/SIGINT drain and join.
+    try drain_and_join(
+        init.io,
+        &cfg,
+        config_path,
+        &metrics,
+        threads,
+        drain_triggers,
+        signal_fd,
+    );
 }
 
 /// Reserve the TLS FFI heap and install the process-global memory hook when any
@@ -233,12 +242,16 @@ fn build_upstream_contexts(
     return upstream_tls;
 }
 
-/// Block SIGTERM/SIGINT in this thread (workers inherit the mask) and create
-/// the signalfd that surfaces them — must run before any worker spawns.
+/// Block SIGTERM/SIGINT/SIGHUP in this thread (workers inherit the mask) and
+/// create the signalfd that surfaces them — must run before any worker spawns.
+/// TERM/INT drain; HUP reloads by relaunch (docs/DESIGN.md §7 Phase 6 slice 2).
+/// A successor that dies before adopting is reaped via `waitpid` on the next
+/// SIGHUP (see `drain_and_join`), so SIGCHLD stays default.
 fn install_signal_fd() !linux.fd_t {
     var signal_mask = linux.sigemptyset();
     linux.sigaddset(&signal_mask, .TERM);
     linux.sigaddset(&signal_mask, .INT);
+    linux.sigaddset(&signal_mask, .HUP);
     _ = linux.sigprocmask(linux.SIG.BLOCK, &signal_mask, null);
     const signal_fd_rc = linux.signalfd(-1, &signal_mask, linux.SFD.CLOEXEC);
     if (linux.errno(signal_fd_rc) != .SUCCESS) {
@@ -490,16 +503,41 @@ fn start_admin(
     std.log.info("zoxy admin/metrics on {f}", .{admin_address});
 }
 
-/// Block until the first signal, poke every worker's drain trigger, then join:
-/// each worker exits once its connections finish (or the drain deadline
-/// force-closes the stragglers). A second signal — watched by a detached
-/// thread — exits immediately.
+/// Supervise: SIGHUP reloads the config by relaunching (docs/DESIGN.md §7
+/// Phase 6 slice 2), SIGTERM/SIGINT begin the drain. On drain, poke every
+/// worker's trigger and join: each worker exits once its connections finish (or
+/// the drain deadline force-closes the stragglers). A second signal — watched
+/// by a detached thread — exits immediately.
 fn drain_and_join(
+    io: std.Io,
+    cfg: *const zoxy.config.Config,
+    config_path: [:0]const u8,
+    metrics: *Metrics,
     threads: []const std.Thread,
     drain_triggers: []const [2]linux.fd_t,
     signal_fd: linux.fd_t,
 ) !void {
-    wait_for_signal(signal_fd);
+    // A successful reload launches a successor that adopts our listeners; the
+    // handoff then delivers our own SIGTERM (run_handoff_server), so the loop
+    // exits into the drain below. While a launched successor is still starting,
+    // further HUPs are ignored (a second successor would end up serving beside
+    // the first); but one that died before adopting — a config the successor
+    // rejected at boot — is reaped so the operator can fix it and retry.
+    var successor: ?linux.pid_t = null;
+    while (true) {
+        const signo = wait_for_signal(signal_fd);
+        if (signo != @intFromEnum(linux.SIG.HUP)) break; // TERM/INT → drain
+        if (successor) |pid| {
+            if (successor_alive(pid)) {
+                std.log.warn("zoxy: reload: successor pid={d} still starting; ignoring SIGHUP", .{
+                    pid,
+                });
+                continue;
+            }
+            successor = null; // it exited without adopting; a fresh attempt is fine
+        }
+        successor = reload_config(io, cfg, config_path, metrics);
+    }
     std.log.info("zoxy: draining {d} worker(s) (limit {d}ms; second signal exits now)", .{
         threads.len,
         constants.drain_timeout_ns / std.time.ns_per_ms,
@@ -514,20 +552,98 @@ fn drain_and_join(
     std.log.info("zoxy: drained, exiting", .{});
 }
 
-/// Block until one of the masked signals is delivered to the signalfd.
-fn wait_for_signal(signal_fd: linux.fd_t) void {
+/// Handle one SIGHUP: re-read and strict-parse the config, then, if it is
+/// reloadable (same handoff socket, same listen address), fork+exec a successor
+/// that adopts our listeners while we drain. A bad edit or an unreloadable
+/// change is logged and counted; the running config keeps serving. Returns the
+/// successor pid only when one was launched. All transient parsing allocates in
+/// a scratch arena freed on return — reload must not grow the process arena.
+fn reload_config(
+    io: std.Io,
+    cfg: *const zoxy.config.Config,
+    config_path: [:0]const u8,
+    metrics: *Metrics,
+) ?linux.pid_t {
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const alloc = scratch.allocator();
+
+    const text = std.Io.Dir.cwd().readFileAlloc(io, config_path, alloc, .unlimited) catch |err| {
+        std.log.err("zoxy: reload: cannot read {s}: {s}", .{ config_path, @errorName(err) });
+        return reload_rejected(metrics);
+    };
+    var diagnostic: zoxy.config.Diagnostic = .{};
+    const new_cfg = zoxy.config.parse_diagnostic(alloc, text, &diagnostic) catch |err| {
+        if (diagnostic.unknown_field) |field| {
+            std.log.err("zoxy: reload: invalid config: unknown field {s}", .{field});
+        } else {
+            std.log.err("zoxy: reload: invalid config: {s}", .{@errorName(err)});
+        }
+        return reload_rejected(metrics);
+    };
+    // `evaluate` borrows both configs' handoff strings; the scratch arena keeps
+    // `new_cfg`'s alive through the switch below (no `deinit` — scratch owns it).
+    switch (zoxy.reload.evaluate(cfg.handoff, new_cfg.handoff, cfg.listen, new_cfg.listen)) {
+        .no_handoff => {
+            std.log.err("zoxy: reload: ignored — no handoff socket configured", .{});
+            return reload_rejected(metrics);
+        },
+        .handoff_changed => {
+            std.log.err("zoxy: reload: ignored — handoff socket change needs a full restart", .{});
+            return reload_rejected(metrics);
+        },
+        .listen_changed => {
+            std.log.err("zoxy: reload: ignored — listen address change needs a full restart", .{});
+            return reload_rejected(metrics);
+        },
+        .launch => {
+            const pid = zoxy.reload.spawn_successor(io, alloc, config_path) catch |err| {
+                std.log.err("zoxy: reload: cannot launch successor: {s}", .{@errorName(err)});
+                return reload_rejected(metrics);
+            };
+            std.log.info("zoxy: reload: launched successor pid={d}; will drain", .{pid});
+            metrics.shard(Metrics.shard_adopted).config_reloads.add(1);
+            return pid;
+        },
+    }
+}
+
+/// Reload counters ride the non-worker adopted shard (no data-path writer, so
+/// the single-writer invariant holds) and cross the restart via the handoff fold.
+fn reload_rejected(metrics: *Metrics) ?linux.pid_t {
+    metrics.shard(Metrics.shard_adopted).config_reload_errors.add(1);
+    return null;
+}
+
+/// Non-blocking check (also reaping if it exited) of a launched successor: true
+/// while it is still starting, false once it has adopted-and-we're-draining or
+/// died before adopting. `waitpid` returns 0 when the child is still running.
+/// A successor that wedges in startup without adopting or exiting would keep
+/// this true and block further reloads — pathological (a broken binary), not
+/// guarded by a deadline in this first cut.
+fn successor_alive(pid: linux.pid_t) bool {
+    assert(pid > 0); // only ever a spawn_successor pid; 0/-1 would waitpid a group
+    var status: u32 = undefined;
+    const rc = linux.waitpid(pid, &status, linux.W.NOHANG);
+    return linux.errno(rc) == .SUCCESS and rc == 0;
+}
+
+/// Block until one of the masked signals is delivered; returns its number.
+fn wait_for_signal(signal_fd: linux.fd_t) u32 {
     var info: linux.signalfd_siginfo = undefined;
     while (true) { // bounded by delivery: reads only fail transiently (EINTR)
         const rc = linux.read(signal_fd, std.mem.asBytes(&info), @sizeOf(linux.signalfd_siginfo));
         if (linux.errno(rc) == .INTR) continue;
-        if (linux.errno(rc) != .SUCCESS) return; // treat a broken signalfd as a signal
-        if (rc == @sizeOf(linux.signalfd_siginfo)) return;
+        // A broken signalfd is treated as a terminating signal (drain).
+        if (linux.errno(rc) != .SUCCESS) return @intFromEnum(linux.SIG.TERM);
+        if (rc == @sizeOf(linux.signalfd_siginfo)) return info.signo;
     }
 }
 
-/// A second signal during the drain means "now": skip the joins and die.
+/// A second terminating signal during the drain means "now": skip the joins and
+/// die. A SIGHUP arriving mid-drain is ignored — we are already shutting down.
 fn hard_exit_watcher(signal_fd: linux.fd_t) void {
-    wait_for_signal(signal_fd);
+    while (wait_for_signal(signal_fd) == @intFromEnum(linux.SIG.HUP)) {}
     std.log.warn("zoxy: second signal — exiting without drain", .{});
     linux.exit_group(1);
 }

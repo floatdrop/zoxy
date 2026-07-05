@@ -94,6 +94,13 @@ pub const Counters = struct {
     breaker_dials_rejected: Counter = .{},
     bytes_to_upstream: Counter = .{},
     bytes_to_client: Counter = .{},
+    /// SIGHUP config reloads that launched a successor (docs/DESIGN.md §7
+    /// Phase 6 slice 2). Not a gauge — it crosses the very restart it triggers,
+    /// so the running total survives into the successor.
+    config_reloads: Counter = .{},
+    /// SIGHUP reloads rejected before any launch: a failed parse, no handoff
+    /// socket, or a changed listen address — the running config keeps serving.
+    config_reload_errors: Counter = .{},
 
     /// Fields that are point-in-time gauges, not cumulative counters. A hot
     /// restart transfers counters to the successor so scrapes stay monotonic
