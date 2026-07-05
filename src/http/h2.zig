@@ -1513,29 +1513,7 @@ test "h2: seeded frame fuzz — no panic, output parses, stream slots drain to z
 /// (valid request HEADERS, DATA, control) with a tail of pure garbage.
 fn fuzz_frame(rand: std.Random, next_id: *u31, out: []u8) usize {
     const roll = rand.intRangeAtMost(u32, 0, 99);
-    if (roll < 50) { // a valid request HEADERS on a fresh (mostly) id
-        const id = if (rand.boolean())
-            next_id.*
-        else
-            @as(u31, @intCast(rand.intRangeAtMost(u32, 1, 99) | 1));
-        if (id >= next_id.*) next_id.* = id + 2;
-        var block: [64]u8 = undefined;
-        var block_len: usize = 0;
-        block_len += encode_fuzz_header(":method", "GET", block[block_len..]);
-        block_len += encode_fuzz_header(":scheme", "https", block[block_len..]);
-        block_len += encode_fuzz_header(":path", "/", block[block_len..]);
-        block_len += encode_fuzz_header(":authority", "z", block[block_len..]);
-        var flags: u8 = h2_frame.Flags.end_headers;
-        if (rand.boolean()) flags |= h2_frame.Flags.end_stream;
-        h2_frame.write_frame_header(.{
-            .length = @intCast(block_len),
-            .type = .headers,
-            .flags = flags,
-            .stream_id = id,
-        }, out[0..9]);
-        @memcpy(out[9..][0..block_len], block[0..block_len]);
-        return 9 + block_len;
-    }
+    if (roll < 50) return fuzz_headers_frame(rand, next_id, out);
     if (roll < 70) { // DATA on some id
         const id: u31 = @intCast(rand.intRangeAtMost(u32, 1, 99) | 1);
         const payload_len = rand.intRangeAtMost(usize, 0, 32);
@@ -1582,6 +1560,31 @@ fn fuzz_frame(rand: std.Random, next_id: *u31, out: []u8) usize {
     }, out[0..9]);
     for (out[9..][0..payload_len]) |*b| b.* = rand.int(u8);
     return 9 + payload_len;
+}
+
+/// A valid request HEADERS frame on a fresh (mostly) stream id.
+fn fuzz_headers_frame(rand: std.Random, next_id: *u31, out: []u8) usize {
+    const id = if (rand.boolean())
+        next_id.*
+    else
+        @as(u31, @intCast(rand.intRangeAtMost(u32, 1, 99) | 1));
+    if (id >= next_id.*) next_id.* = id + 2;
+    var block: [64]u8 = undefined;
+    var block_len: usize = 0;
+    block_len += encode_fuzz_header(":method", "GET", block[block_len..]);
+    block_len += encode_fuzz_header(":scheme", "https", block[block_len..]);
+    block_len += encode_fuzz_header(":path", "/", block[block_len..]);
+    block_len += encode_fuzz_header(":authority", "z", block[block_len..]);
+    var flags: u8 = h2_frame.Flags.end_headers;
+    if (rand.boolean()) flags |= h2_frame.Flags.end_stream;
+    h2_frame.write_frame_header(.{
+        .length = @intCast(block_len),
+        .type = .headers,
+        .flags = flags,
+        .stream_id = id,
+    }, out[0..9]);
+    @memcpy(out[9..][0..block_len], block[0..block_len]);
+    return 9 + block_len;
 }
 
 fn encode_fuzz_header(name: []const u8, value: []const u8, out: []u8) usize {
