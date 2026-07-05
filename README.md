@@ -215,28 +215,6 @@ several runs, not single numbers.
 
 ## Architecture
 
-```
-per core (thread-per-core, share-nothing):
-  SO_REUSEPORT listener ──io.accept──► single-threaded io_uring loop
-    io.recv ─► parse head ─► route ─► upstream pool / io.connect
-             ─► framed relay both ways ─► reuse both connections
-```
-
-Source layout:
-
-| Path | What |
-|------|------|
-| `src/io/` | `IO` + `Completion` over `std.os.linux.IoUring` (comptime backend seam) |
-| `src/net/listener.zig` | `SO_REUSEPORT` TCP listener |
-| `src/net/pool.zig` | fixed object pool over an intrusive free list |
-| `src/net/proxy.zig` | the proxy data path (parse → route → connect → relay → retry) |
-| `src/http/h1.zig` | zero-copy HTTP/1.1 request/response parsers + body framing |
-| `src/config.zig`, `src/proxy/` | config, routing, P2C balancing, upstream pool, resilience state (breakers, outlier detection, retry budget), health checks |
-| `src/tls/` | TLS: sans-io BIO-pair terminator + SNI, the kTLS key derivation and kernel ABI, and the fixed heap behind OpenSSL's memory hook |
-| `third_party/openssl/` | vendored OpenSSL build recipe (sources fetched by content hash) |
-| `src/obs/` | metrics counters + per-worker access log |
-| `src/mem/guard.zig` | zero-allocation acceptance gate |
-
 Design rationale and the Zig-0.16 findings behind these choices are in
 [`docs/DESIGN.md`](docs/DESIGN.md); the coding conventions are in
 [`docs/TIGER_STYLE.md`](docs/TIGER_STYLE.md).
