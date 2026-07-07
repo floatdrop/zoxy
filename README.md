@@ -54,17 +54,19 @@ zoxy is built on the [TigerBeetle](https://tigerbeetle.com) I/O model — comple
 
 ## Requirements
 
-- **Zig 0.16** (the [Nix dev shell](flake.nix) pins `zig_0_16` + `zls`).
+- **Zig 0.16** (pinned by [devenv](devenv.nix) and the [Nix dev shell](flake.nix):
+  `zig_0_16` + `zls`).
 - **Linux with `io_uring`** (kernel 5.11+).
 - Optional: the `tls` kernel module (`modprobe tls`) for kTLS offload — without it,
   TLS connections transparently stay on the userspace relay.
 
 ## Build & run
 
-With Nix (recommended):
+With [devenv](https://devenv.sh) or Nix (recommended — with direnv, `.envrc`
+activates the same shell automatically on `cd`):
 
 ```sh
-nix develop            # zig 0.16, zls, kcov
+devenv shell           # zig 0.16, zls, kcov (or: nix develop)
 zig build              # build zig-out/bin/zoxy
 zig build test         # run the test suite
 zig build sim -- 0 500 # deterministic simulator: [seed] [iterations]

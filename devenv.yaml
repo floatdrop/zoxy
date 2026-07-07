@@ -1,0 +1,6 @@
+# devenv inputs (https://devenv.sh/inputs/). Pinned to the same nixpkgs
+# branch as flake.nix so both surfaces resolve the same zig_0_16 toolchain;
+# the exact revision lands in devenv.lock.
+inputs:
+  nixpkgs:
+    url: github:NixOS/nixpkgs/nixos-unstable
