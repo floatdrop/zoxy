@@ -45,6 +45,13 @@
       "type": "boolean",
       "default": false
     },
+    "connections_max": {
+      "description": "Concurrent downstream connections reserved per worker.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4096,
+      "default": 256
+    },
     "tls": {
       "description": "TLS termination on the listener; null = plaintext.",
       "anyOf": [

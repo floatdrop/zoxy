@@ -26,6 +26,7 @@
 //!   accept_mode shared            # reuseport | shared
 //!   workers 4                     # fixed worker count; omit = one per CPU
 //!   logging                       # flag: presence enables diagnostics + access logs
+//!   connections_max 512           # downstream connections reserved per worker
 //!
 //!   tls {
 //!       certificate cert.pem
@@ -265,6 +266,8 @@ const Parser = struct {
                 try p.scalar_integer(line, &p.scalars, dto_field(Dto, "workers"));
             } else if (eq(d, "logging")) {
                 try p.scalar_flag(line, &p.scalars, dto_field(Dto, "logging"));
+            } else if (eq(d, "connections_max")) {
+                try p.scalar_integer(line, &p.scalars, dto_field(Dto, "connections_max"));
             } else if (eq(d, "tls")) {
                 try p.top_tls(line);
             } else if (eq(d, "route")) {
@@ -847,6 +850,7 @@ test "adapter: scalars, comments, and blank lines" {
         \\accept_mode shared
         \\workers 4
         \\logging
+        \\connections_max 512
         \\
         \\route -> c
         \\cluster c {
@@ -861,6 +865,7 @@ test "adapter: scalars, comments, and blank lines" {
     try testing.expectEqualStrings("shared", root.get("accept_mode").?.string);
     try testing.expectEqual(@as(i64, 4), root.get("workers").?.integer);
     try testing.expectEqual(true, root.get("logging").?.bool);
+    try testing.expectEqual(@as(i64, 512), root.get("connections_max").?.integer);
 }
 
 test "adapter: route arrow match forms" {
