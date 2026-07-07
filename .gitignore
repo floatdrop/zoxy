@@ -6,3 +6,5 @@ zig-out
 zig-pkg
 result
 result-*
+.devenv*
+devenv.local.nix

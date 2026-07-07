@@ -12,9 +12,11 @@ allocate is a bug — and is enforced by a test-time acceptance gate.
 
 ## Commands
 
-The toolchain is pinned by the Nix flake (`zig_0_16` + `zls` + `kcov`). The repo ships
-a `.envrc`, so with **direnv + nix-direnv** the dev shell auto-loads on `cd` (one-time
-`direnv allow`) and bare commands just work:
+The toolchain is pinned (`zig_0_16` + `zls` + `kcov`) twice over: by
+[devenv](https://devenv.sh) (`devenv.nix`/`devenv.yaml`) and by the Nix flake dev
+shell, both on the same nixpkgs branch. The repo ships a `.envrc`, so with
+**direnv** the shell auto-loads on `cd` (one-time `direnv allow`) — devenv when
+installed, the flake otherwise — and bare commands just work:
 
 ```sh
 zig build              # build zig-out/bin/zoxy
@@ -33,8 +35,8 @@ scripts/coverage.sh    # kcov line coverage (tests + sim), HTML + cobertura
 A simulator failure prints its seed; `zig build sim -- <seed> 1` replays that
 exact schedule, faults included. CI runs seeds 0..300 on every push.
 
-Without direnv, prefix each with `nix develop --command` (this is what CI does), or
-enter the shell once with `nix develop` and drop the prefix.
+Without direnv, enter the shell once with `devenv shell` (or `nix develop` — CI
+prefixes commands with `nix develop --command`) and run them from there.
 
 **Running a single test:**
 
