@@ -415,6 +415,11 @@ pub const Config = struct {
     /// benchmark stays silent unless it opts in. Fatal config-load errors log
     /// regardless (main only lowers to this once the config parses).
     logging: bool,
+    /// Concurrent downstream connections reserved per worker. Sizes the
+    /// per-worker connection pool (and TLS-leg pool / TLS heap when terminating)
+    /// up front — raise it to push benchmark concurrency past the default,
+    /// bounded by `constants.connections_max_ceiling`.
+    connections_max: u32,
     /// TLS termination on the listener; null = plaintext.
     tls: ?TlsConfig,
     routes: []const Route,
@@ -467,6 +472,7 @@ pub const Dto = struct {
     accept_mode: []const u8 = "reuseport",
     workers: ?u16 = null,
     logging: bool = false,
+    connections_max: u32 = constants.connections_max,
     tls: ?TlsDto = null,
     routes: []const RouteDto,
     clusters: []const ClusterDto,
@@ -505,6 +511,11 @@ pub const Dto = struct {
         },
         .logging = .{
             .desc = "Emit diagnostics and per-request access logs; off keeps workers silent.",
+        },
+        .connections_max = .{
+            .desc = "Concurrent downstream connections reserved per worker.",
+            .minimum = 1,
+            .maximum = constants.connections_max_ceiling,
         },
         .tls = .{ .desc = "TLS termination on the listener; null = plaintext." },
         .routes = .{ .desc = "Host/path routing rules, evaluated first-match-wins." },
@@ -1054,6 +1065,12 @@ pub fn parse_resolved(
             break :blk w;
         } else null,
         .logging = dto.logging,
+        .connections_max = blk: {
+            if (dto.connections_max == 0 or
+                dto.connections_max > constants.connections_max_ceiling)
+                return error.InvalidLimit;
+            break :blk dto.connections_max;
+        },
         .tls = tls,
         .routes = routes,
         .clusters = clusters,
@@ -1747,6 +1764,34 @@ test "config: logging defaults off and parses on" {
     );
     defer on.deinit();
     try std.testing.expectEqual(true, on.logging);
+}
+
+test "config: connections_max defaults, parses a raise, rejects zero and over-ceiling" {
+    var dflt = try parse(std.testing.allocator, test_config);
+    defer dflt.deinit();
+    try std.testing.expectEqual(constants.connections_max, dflt.connections_max);
+
+    var raised = try parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "connections_max": 1024,
+        \\  "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    );
+    defer raised.deinit();
+    try std.testing.expectEqual(@as(u32, 1024), raised.connections_max);
+
+    const zero = parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "connections_max": 0,
+        \\  "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    );
+    try std.testing.expectError(error.InvalidLimit, zero);
+
+    const over = parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "connections_max": 4097,
+        \\  "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    );
+    try std.testing.expectError(error.InvalidLimit, over);
 }
 
 test "config: lb block — maglev builds a table, knobs validated strictly" {

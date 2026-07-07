@@ -177,7 +177,7 @@ fn reserve_tls_heap(
     const parked: usize = if (clusters_with_tls > 0) constants.upstream_idle_max else 0;
     const tls_heap_bytes = constants.tls_heap_base_bytes +
         constants.tls_heap_per_connection_bytes * worker_count *
-            (constants.connections_max * hops + parked);
+            (@as(usize, cfg.connections_max) * hops + parked);
     const alignment = comptime std.mem.Alignment.fromByteUnits(zoxy.tls.Heap.block_align);
     const region = try gpa.alignedAlloc(u8, alignment, tls_heap_bytes);
     try zoxy.tls.install_memory_hook(region);
@@ -408,7 +408,7 @@ fn reserve_worker_pools(
     for (accesses) |*slot| slot.value = .{ .fd = stderr_fd, .enabled = cfg.logging };
 
     const pools = try gpa.alloc(cache_line.Padded(Pool), worker_count);
-    for (pools) |*slot| slot.value = try Pool.init(gpa, constants.connections_max);
+    for (pools) |*slot| slot.value = try Pool.init(gpa, cfg.connections_max);
 
     // TLS legs live in their own per-worker pool, sized one leg per connection
     // per TLS-speaking side — a plaintext config reserves none.
@@ -423,7 +423,7 @@ fn reserve_worker_pools(
     const leg_pools: []cache_line.Padded(TlsLegPool) = if (tls_sides > 0) pools: {
         const leg_pools = try gpa.alloc(cache_line.Padded(TlsLegPool), worker_count);
         for (leg_pools) |*slot| {
-            slot.value = try TlsLegPool.init(gpa, constants.connections_max * tls_sides);
+            slot.value = try TlsLegPool.init(gpa, cfg.connections_max * tls_sides);
         }
         break :pools leg_pools;
     } else &.{};
@@ -855,6 +855,9 @@ fn run_worker(
     server.h2_leg_pool = h2_leg_pool;
     server.drain_trigger_fd = drain_trigger_fd;
     server.listener_refs = listener_refs;
+    // Resilience's active-count invariants are bounded by the real pool size
+    // (one request/attempt per connection slot), which the config sized.
+    server.resilience.connections_max = pool.capacity;
     server.start();
 
     // Active health checks ride the same ring; arms only when configured.

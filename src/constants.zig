@@ -4,9 +4,18 @@
 
 const std = @import("std");
 
-/// Maximum concurrent downstream connections per worker. Beyond this, new
-/// connections are rejected (backpressure), never queued via allocation.
+/// Default concurrent downstream connections per worker when the config omits
+/// `connections_max`. The config knob overrides it (benchmarks tune here);
+/// beyond the effective limit, new connections are rejected (backpressure),
+/// never queued via allocation.
 pub const connections_max: u32 = 256;
+
+/// Hard ceiling the config's `connections_max` may request — the largest
+/// per-worker pool (and thus reserved memory) a benchmark can ask for. Sized
+/// at the submission-queue depth: one pending recv per connection fits the ring
+/// here, and past it the SQ-full path (io/linux.zig) just flushes more eagerly,
+/// so this bounds reservation rather than marking a correctness edge.
+pub const connections_max_ceiling: u32 = io_ring_entries;
 
 /// Per-connection read buffer. Must hold a full HTTP request head (see later
 /// `head_bytes_max`) plus a useful chunk of body.

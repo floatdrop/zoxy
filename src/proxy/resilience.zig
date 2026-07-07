@@ -61,6 +61,11 @@ pub const ClusterState = struct {
 
 pub const Resilience = struct {
     clusters: [constants.clusters_max]ClusterState = @splat(.{}),
+    /// Upper bound on per-worker active counts (one request/attempt/dial per
+    /// connection slot): the pool size main reserved from `config.connections_max`.
+    /// Defaults to the compile-time default — a safe over-estimate for the
+    /// sim/tests, whose pools never exceed it.
+    connections_max: u32 = constants.connections_max,
 
     pub fn cluster_state(resilience: *Resilience, cluster_index: u32) *ClusterState {
         assert(cluster_index < constants.clusters_max); // enforced by config.parse
@@ -131,7 +136,7 @@ pub const Resilience = struct {
         const cluster = resilience.cluster_state(cluster_index);
         cluster.retries_active += 1;
         // At most one scheduled retry per request, one request per slot.
-        assert(cluster.retries_active <= constants.connections_max);
+        assert(cluster.retries_active <= resilience.connections_max);
     }
 
     pub fn retry_finish(resilience: *Resilience, cluster_index: u32) void {
@@ -144,7 +149,7 @@ pub const Resilience = struct {
         const cluster = resilience.cluster_state(cluster_index);
         cluster.requests_active += 1;
         // Bounded by the downstream connection pool: one request per slot.
-        assert(cluster.requests_active <= constants.connections_max);
+        assert(cluster.requests_active <= resilience.connections_max);
     }
 
     pub fn request_finish(resilience: *Resilience, cluster_index: u32) void {
@@ -157,7 +162,7 @@ pub const Resilience = struct {
         const endpoint = resilience.endpoint_state(cluster_index, endpoint_index);
         endpoint.in_flight += 1;
         // One attempt at a time per request, one request per connection slot.
-        assert(endpoint.in_flight <= constants.connections_max);
+        assert(endpoint.in_flight <= resilience.connections_max);
     }
 
     /// Settle an attempt and run passive outlier detection on its outcome:
@@ -232,7 +237,7 @@ pub const Resilience = struct {
     pub fn dial_start(resilience: *Resilience, cluster_index: u32) void {
         const cluster = resilience.cluster_state(cluster_index);
         cluster.pending_dials += 1;
-        assert(cluster.pending_dials <= constants.connections_max);
+        assert(cluster.pending_dials <= resilience.connections_max);
     }
 
     pub fn dial_finish(resilience: *Resilience, cluster_index: u32) void {
@@ -244,7 +249,7 @@ pub const Resilience = struct {
     pub fn connection_open(resilience: *Resilience, cluster_index: u32) void {
         const cluster = resilience.cluster_state(cluster_index);
         cluster.connections_active += 1;
-        assert(cluster.connections_active <= constants.connections_max);
+        assert(cluster.connections_active <= resilience.connections_max);
     }
 
     pub fn connection_close(resilience: *Resilience, cluster_index: u32) void {
