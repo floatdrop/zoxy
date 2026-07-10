@@ -45,14 +45,28 @@ pub fn build(b: *std.Build) void {
     // The four test gates of DESIGN.md §9 exist as steps from the first
     // commit; a step whose harness has not landed yet is inert and says so
     // in its description. A feature without its gate is not done.
+    const lint_exe = b.addExecutable(.{
+        .name = "zoxy-lint",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/lint.zig"),
+            .target = b.graph.host,
+        }),
+    });
+
     const module_tests = b.addRunArtifact(b.addTest(.{ .root_module = zoxy_module }));
     const exe_tests = b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module }));
+    const lint_tests = b.addRunArtifact(b.addTest(.{ .root_module = lint_exe.root_module }));
     const test_step = b.step("test", "Run unit tests (--fuzz adds the fuzz gate)");
     test_step.dependOn(&module_tests.step);
     test_step.dependOn(&exe_tests.step);
+    test_step.dependOn(&lint_tests.step);
 
     const sim_step = b.step("sim", "Deterministic simulation (inert until slice 10)");
-    const lint_step = b.step("lint", "Style and fd-boundary lint (inert until slice 2)");
+
+    const lint_run = b.addRunArtifact(lint_exe);
+    lint_run.addDirectoryArg(b.path("src"));
+    const lint_step = b.step("lint", "fd-boundary lint: raw syscalls only under src/io/");
+    lint_step.dependOn(&lint_run.step);
     _ = b.step("bench", "Tier-1 loopback benchmark (inert until slice 11)");
 
     const ci_step = b.step("ci", "Everything CI gates on: test + lint + sim");
