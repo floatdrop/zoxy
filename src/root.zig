@@ -4,6 +4,9 @@
 
 const std = @import("std");
 
+pub const constants = @import("constants.zig");
+
 test {
+    _ = constants;
     _ = @import("io/xev_smoke_test.zig");
 }
