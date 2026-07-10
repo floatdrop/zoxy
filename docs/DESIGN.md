@@ -265,6 +265,19 @@ separate deliberate decision, not a default.
   never `loop.stop()`, which does not wake a blocked loop from another
   thread (libxev #173). `SimIo` delivers drain as just another scheduled
   event.
+- **The data path never sees a file descriptor.** The seam hands out an
+  opaque `Io.Socket` handle; the fd itself never leaves `src/io/`, so a
+  direct data syscall from the data path is unrepresentable. This
+  matters because libxev's io_uring backend deliberately keeps sockets
+  *blocking* (non-blocking fds risk EAGAIN surfacing in completions) —
+  a "quick" direct `write` could stall the whole loop. That choice is
+  kept: O_NONBLOCK is never set. The control ops the design needs are
+  seam methods instead — `setNodelay` (§2), `setLingerRst` (§8's
+  accept-and-RST), `shutdown(.both)` (which must bypass
+  `xev.TCP.shutdown`, hardcoded to SHUT_WR, for the low-level op) —
+  direct non-blocking syscalls in `XevIo`, virtual-socket state changes
+  in `SimIo`, so the simulator can witness RST-on-shed and half-close
+  (§9). A build-time lint enforces the boundary (§9).
 - **Run to completion.** Callbacks never suspend (TigerStyle: assertions
   hold across the whole body). Completions are drained in bounded batches
   per loop tick; a callback may enqueue more work but never runs another
@@ -567,6 +580,12 @@ a feature without its gate is not done.
    in tests under a failing/counting allocator; baseline allocation count
    must equal the final count. Steady state also asserts zero allocating
    syscalls (no mmap/brk after init) via counters.
+
+Alongside the gates, a build-time lint asserts the fd boundary of §4:
+`std.posix`/`os.linux` may be named only under `src/io/`, with an
+explicit allowlist for `main.zig` startup work (the `RLIMIT_NOFILE`
+assert, `sigaction`). Cheap, and it turns "no direct syscalls on the
+data path" from prose into CI.
 
 ## 10. Phasing
 
