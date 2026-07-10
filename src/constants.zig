@@ -56,9 +56,10 @@ pub const timeout_ms_max: u32 = 3_600_000;
 
 /// Worst-case in-flight ring ops (§8: the ring is pre-budgeted, not shed):
 /// every admitted connection at its op peak, one armed accept per
-/// listener, plus the single async wakeup op for signals.
+/// listener, the single async wakeup op for signals, and the server's
+/// one drain-deadline timer.
 pub const in_flight_ops_max: u32 =
-    relay_buffers_max * conn_ops_max + listeners_max + 1;
+    relay_buffers_max * conn_ops_max + listeners_max + 1 + 1;
 
 /// Kernel completion queue capacity (io_uring fixes CQ at 2 × SQ).
 pub const completion_queue_entries: u32 = 2 * @as(u32, ring_entries);

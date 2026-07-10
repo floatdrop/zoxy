@@ -528,7 +528,8 @@ fn onCancelReaped(
 }
 
 fn signalBit(signal: Io.Signal) u8 {
-    return @as(u8, 1) << @intFromEnum(signal);
+    const shift: u3 = @intCast(@intFromEnum(signal));
+    return @as(u8, 1) << shift;
 }
 
 fn clearArmedAccept(io: *XevIo, completion: *xev.Completion) void {
