@@ -234,8 +234,9 @@ iteration's hand-rolled TigerBeetle pattern, and the same shape as
 **Dependency policy: Zig-first only.** The TIGER_STYLE zero-dependency rule
 takes its recorded exceptions here, and both are pure Zig, vendored by
 content hash in `build.zig.zon`: **libxev** (this section) and **hparse**
-(the HTTP/1.1 head parser, §7). No C-FFI dependency exists in the codebase;
-any future one (a TLS stack is the known candidate, §10 Phase 3) is a
+(the HTTP/1.1 head parser — as a hardened fork, §7). No C-FFI dependency
+exists in the codebase; any future one (a TLS stack is the known
+candidate, §10 Phase 3) is a
 separate deliberate decision, not a default. The pinned hash is an
 *audited commit*, never a branch tip — libxev's Zig 0.16 support is a
 self-described compatibility shim (PR #220) with real fixes still
@@ -413,13 +414,24 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
        → framed relay back → park upstream, idle downstream (keep-alive)
 ```
 
-- **Zero-copy head parser: [hparse](https://github.com/nikneym/hparse)**
-  (pure Zig, SIMD-vectorized, streaming, never allocates or copies —
-  picohttpparser-shaped API). It parses into a caller-owned bounded header
-  array over the linear head buffer. Oversize request-line → 414;
-  oversize header field or total head → 431; never grow. hparse parses
-  *syntax* only — framing semantics stay
-  ours: the incremental chunked decoder and every strictness/smuggling
+- **Zero-copy head parser: a hardened fork of
+  [hparse](https://github.com/nikneym/hparse)** (pure Zig,
+  SIMD-vectorized, never allocates or copies — picohttpparser-shaped
+  API; "streaming" means detect-and-retry — partial input re-parses
+  from byte 0, bounded by `head_bytes_max`). Upstream is not adoptable
+  as-is; the fork must clear a recorded hardening gate before Phase 1
+  lands: bounds-check the cursor (upstream dereferences one byte past
+  the buffer on partial input — silent UB), accept HTAB in field values
+  (RFC 9110), reject bare-LF line terminators (a smuggling ingredient),
+  make header-array overflow distinguishable from malformed input (431
+  vs 400), and open the closed method enum to extension tokens. The
+  fork is vendored by audited commit like every dependency (§4); if
+  hardening proves costlier than rewriting, the fallback is our own
+  parser behind the same wrapper. It parses into a caller-owned bounded
+  header array over the linear head buffer. Oversize request-line →
+  414; oversize header field or total head → 431; never grow. hparse
+  parses *syntax* only — framing semantics stay ours: the incremental
+  chunked decoder and every strictness/smuggling
   check in the next bullet are zoxy code (`src/http/parser.zig` wraps
   hparse and owns them), and hparse's output is fuzzed *through* that
   wrapper (§9), so the trust boundary sits at our validation, not the
@@ -668,8 +680,8 @@ bench/                // micro benches (poop) + loopback harness (zrk), §9
   and [A Database Without Dynamic Memory](https://tigerbeetle.com/blog/a-database-without-dynamic-memory)
   — static allocation and deterministic simulation discipline.
 - [hparse](https://github.com/nikneym/hparse) — pure-Zig SIMD HTTP/1.1
-  head parser (streaming, zero-alloc, zero-copy); the adopted parser
-  dependency.
+  head parser (zero-alloc, zero-copy); adopted as a hardened fork
+  behind the recorded gate in §7.
 - [zrk](https://github.com/floatdrop/zrk) — pure-Zig constant-throughput
   load generator (wrk2 model, coordinated-omission-corrected); the bench
   driver. [zoxy-io/benchmark](https://github.com/zoxy-io/benchmark) — the
