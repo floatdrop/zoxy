@@ -221,9 +221,7 @@ pub fn Server(comptime IoType: type) type {
             };
             conn.state = .relaying;
             server.storeDeadline(conn, server.cfg.idle_timeout_ms);
-            // Slice 8 starts the bidirectional relay here; until then the
-            // lifecycle is proven by tearing down immediately.
-            server.beginTeardown(conn);
+            relay.Relay(IoType).start(server, conn);
         }
 
         /// Teardown is a state, not an event (§5): shutdown both fds,
@@ -261,7 +259,9 @@ pub fn Server(comptime IoType: type) type {
             server.continueTeardown(conn);
         }
 
-        fn continueTeardown(server: *Self, conn: *ConnType) void {
+        /// Public for the relay: a data completion delivered during
+        /// teardown re-enters here (§5 — ops drain, then closes).
+        pub fn continueTeardown(server: *Self, conn: *ConnType) void {
             assert(conn.state == .tearing_down);
             if (!conn.closes_submitted) {
                 const blocking_ops = conn.armed.connect or
@@ -303,7 +303,9 @@ pub fn Server(comptime IoType: type) type {
             server.counters.increment("completed");
         }
 
-        fn storeDeadline(server: *Self, conn: *ConnType, timeout_ms: u32) void {
+        /// Public for the relay: activity pushes the idle deadline out;
+        /// only the stored value moves, never the armed timer op (§4).
+        pub fn storeDeadline(server: *Self, conn: *ConnType, timeout_ms: u32) void {
             assert(timeout_ms >= 1);
             conn.deadline_ns = server.io.nowNs() + @as(u64, timeout_ms) * std.time.ns_per_ms;
         }

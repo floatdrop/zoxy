@@ -29,6 +29,7 @@ pub fn Conn(comptime IoType: type) type {
         /// the armed timer op is never touched (§4).
         deadline_ns: u64,
         armed: Armed,
+        directions: [2]DirectionState,
 
         op_data_client_to_upstream: Op,
         op_data_upstream_to_client: Op,
@@ -45,6 +46,24 @@ pub fn Conn(comptime IoType: type) type {
             connecting,
             relaying,
             tearing_down,
+        };
+
+        pub const Direction = enum(u1) {
+            client_to_upstream,
+            upstream_to_client,
+        };
+
+        /// Strict recv → send → recv per direction (§6): exactly one data
+        /// op in flight per direction, phase says which; per-connection
+        /// memory stays constant regardless of stream size.
+        pub const DirectionState = struct {
+            phase: Phase = .idle,
+            /// Bytes filled by the last recv.
+            transfer_len: u32 = 0,
+            /// Bytes of the transfer already sent (short sends resume).
+            sent_len: u32 = 0,
+
+            pub const Phase = enum(u8) { idle, receiving, sending, finished };
         };
 
         /// One bit per embedded op; release requires all clear (§5).
@@ -81,6 +100,7 @@ pub fn Conn(comptime IoType: type) type {
             conn.relay_buffer = buffer;
             conn.deadline_ns = 0;
             conn.armed = .{};
+            conn.directions = .{ .{}, .{} };
             conn.op_data_client_to_upstream = .{};
             conn.op_data_upstream_to_client = .{};
             conn.op_connect = .{};

@@ -1,9 +1,11 @@
-//! Directed Server lifecycle scenarios over SimIo (§9): happy-path
-//! accept → dial → teardown with pools draining to zero, every §8
-//! exhaustion rung witnessed by its counter and by what the shed client
-//! actually observes on the wire (RST vs FIN), connect-refused, and the
-//! counter-reconciliation invariant after every scenario. The harness
-//! plays origin and clients through the seam on the same loop.
+//! Directed Server scenarios over SimIo (§9). With the relay in place
+//! (slice 8) these prove the actual L4 promise: a client's bytes reach
+//! the origin and the echo comes back byte-exact through the proxy,
+//! under 1-byte partial deliveries and adversarial ordering; FINs relay
+//! in both directions; idle connections meet the deadline; every §8
+//! exhaustion rung is witnessed by its counter and by what the shed
+//! client observes on the wire (RST vs FIN); and counters reconcile
+//! with pools drained after every scenario.
 
 const std = @import("std");
 
@@ -15,6 +17,8 @@ const SimIo = @import("io/SimIo.zig");
 const assert = std.debug.assert;
 
 const ServerSim = Server(SimIo);
+
+const echo_token = "proxied-echo-token-0123456789abc";
 
 const Scenario = struct {
     io: *SimIo,
@@ -42,6 +46,9 @@ const Scenario = struct {
     }
 };
 
+/// A scripted origin: echoes every chunk back (strict recv → send →
+/// recv, like the proxy), closes on the client's FIN — or, in `reset`
+/// mode, answers the first chunk with an RST (misbehaving origin, §9).
 const Origin = struct {
     io: *SimIo = undefined,
     listener: SimIo.Listener = undefined,
@@ -49,13 +56,75 @@ const Origin = struct {
     conns: [4]OriginConn = @splat(.{}),
     conns_count: u8 = 0,
     listening: bool = false,
+    mode: Mode = .echo,
+
+    const Mode = enum(u8) { echo, reset_on_first_chunk };
 
     const OriginConn = struct {
         origin: *Origin = undefined,
         socket: SimIo.Socket = undefined,
         recv_completion: SimIo.Completion = .{},
+        send_completion: SimIo.Completion = .{},
         buffer: [64]u8 = undefined,
+        transfer_len: u32 = 0,
+        sent_len: u32 = 0,
         done: bool = false,
+
+        fn armRecv(conn: *OriginConn) void {
+            conn.origin.io.recv(
+                conn.socket,
+                &conn.buffer,
+                &conn.recv_completion,
+                OriginConn,
+                conn,
+                onRecv,
+            );
+        }
+
+        fn onRecv(conn: *OriginConn, result: Io.RecvError!u32) void {
+            const received = result catch {
+                conn.origin.io.closeNow(conn.socket);
+                conn.done = true;
+                return;
+            };
+            assert(received >= 1);
+            if (conn.origin.mode == .reset_on_first_chunk) {
+                conn.origin.io.setLingerRst(conn.socket) catch unreachable;
+                conn.origin.io.closeNow(conn.socket);
+                conn.done = true;
+                return;
+            }
+            conn.transfer_len = received;
+            conn.sent_len = 0;
+            conn.armSend();
+        }
+
+        fn armSend(conn: *OriginConn) void {
+            assert(conn.sent_len < conn.transfer_len);
+            conn.origin.io.send(
+                conn.socket,
+                conn.buffer[conn.sent_len..conn.transfer_len],
+                &conn.send_completion,
+                OriginConn,
+                conn,
+                onSend,
+            );
+        }
+
+        fn onSend(conn: *OriginConn, result: Io.SendError!u32) void {
+            const sent = result catch {
+                conn.origin.io.closeNow(conn.socket);
+                conn.done = true;
+                return;
+            };
+            conn.sent_len += sent;
+            assert(conn.sent_len <= conn.transfer_len);
+            if (conn.sent_len < conn.transfer_len) {
+                conn.armSend();
+            } else {
+                conn.armRecv();
+            }
+        }
     };
 
     fn start(origin: *Origin, io: *SimIo, address: std.Io.net.IpAddress) !void {
@@ -79,24 +148,8 @@ const Origin = struct {
         origin.conns_count += 1;
         conn.origin = origin;
         conn.socket = socket;
-        origin.io.recv(socket, &conn.buffer, &conn.recv_completion, OriginConn, conn, onRecv);
+        conn.armRecv();
         origin.armAccept();
-    }
-
-    fn onRecv(conn: *OriginConn, result: Io.RecvError!u32) void {
-        if (result) |_| {
-            conn.origin.io.recv(
-                conn.socket,
-                &conn.buffer,
-                &conn.recv_completion,
-                OriginConn,
-                conn,
-                onRecv,
-            );
-        } else |_| {
-            conn.origin.io.closeNow(conn.socket);
-            conn.done = true;
-        }
     }
 
     fn stopListening(origin: *Origin) void {
@@ -107,12 +160,20 @@ const Origin = struct {
     }
 };
 
+/// A scripted client. In `exchange` mode it sends the token, expects the
+/// byte-exact echo, FINs, and waits for the proxied FIN back; otherwise
+/// it connects and stays silent (idle-deadline fodder).
 const Client = struct {
     scenario: *Scenario = undefined,
     connect_completion: SimIo.Completion = .{},
     recv_completion: SimIo.Completion = .{},
-    buffer: [64]u8 = undefined,
+    send_completion: SimIo.Completion = .{},
+    receive_buffer: [64]u8 = undefined,
     socket: SimIo.Socket = undefined,
+    exchange: bool = false,
+    sent_len: u32 = 0,
+    received_len: u32 = 0,
+    fin_sent: bool = false,
     outcome: Outcome = .pending,
 
     const Outcome = enum(u8) { pending, refused, eof, reset };
@@ -129,12 +190,38 @@ const Client = struct {
             return;
         };
         client.armRecv();
+        if (client.exchange) {
+            client.armSend();
+        }
+    }
+
+    fn armSend(client: *Client) void {
+        assert(client.sent_len < echo_token.len);
+        client.scenario.io.send(
+            client.socket,
+            echo_token[client.sent_len..],
+            &client.send_completion,
+            Client,
+            client,
+            onSend,
+        );
+    }
+
+    fn onSend(client: *Client, result: Io.SendError!u32) void {
+        // A send error mid-teardown is legal; the recv path reports the
+        // connection's fate.
+        const sent = result catch return;
+        client.sent_len += sent;
+        assert(client.sent_len <= echo_token.len);
+        if (client.sent_len < echo_token.len and client.outcome == .pending) {
+            client.armSend();
+        }
     }
 
     fn armRecv(client: *Client) void {
         client.scenario.io.recv(
             client.socket,
-            &client.buffer,
+            client.receive_buffer[client.received_len..],
             &client.recv_completion,
             Client,
             client,
@@ -143,10 +230,7 @@ const Client = struct {
     }
 
     fn onRecv(client: *Client, result: Io.RecvError!u32) void {
-        if (result) |_| {
-            client.armRecv();
-            return;
-        } else |err| {
+        const received = result catch |err| {
             client.outcome = switch (err) {
                 error.EndOfStream => .eof,
                 error.Reset => .reset,
@@ -154,7 +238,19 @@ const Client = struct {
             };
             client.scenario.io.closeNow(client.socket);
             client.scenario.clientEnded();
+            return;
+        };
+        client.received_len += received;
+        assert(client.received_len <= echo_token.len);
+        if (client.exchange) {
+            if (client.received_len == echo_token.len) {
+                if (!client.fin_sent) {
+                    client.fin_sent = true;
+                    client.scenario.io.shutdown(client.socket, .write);
+                }
+            }
         }
+        client.armRecv();
     }
 };
 
@@ -168,6 +264,13 @@ const TestBed = struct {
     server: ServerSim,
     scenario: Scenario,
 
+    const SetUpOptions = struct {
+        server: ServerSim.InitOptions = .{ .conn_slots = 4, .relay_buffers = 2 },
+        sim: SimIo.Options,
+        origin_listens: bool = true,
+        idle_timeout_ms: u32 = 1000,
+    };
+
     fn bindAddress() std.Io.net.IpAddress {
         return std.Io.net.IpAddress.parseLiteral("127.0.0.1:8080") catch unreachable;
     }
@@ -176,17 +279,12 @@ const TestBed = struct {
         return std.Io.net.IpAddress.parseLiteral("127.0.0.1:9000") catch unreachable;
     }
 
-    fn setUp(
-        bed: *TestBed,
-        options: ServerSim.InitOptions,
-        sim_options: SimIo.Options,
-        origin_listens: bool,
-    ) !void {
+    fn setUp(bed: *TestBed, options: SetUpOptions) !void {
         bed.arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
         errdefer bed.arena_state.deinit();
         const arena = bed.arena_state.allocator();
 
-        try bed.sim_io.init(arena, sim_options);
+        try bed.sim_io.init(arena, options.sim);
         bed.endpoints = .{originAddress()};
         bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints }};
         bed.listeners = .{.{ .bind_address = bindAddress(), .cluster_index = 0 }};
@@ -194,10 +292,10 @@ const TestBed = struct {
             .listeners = &bed.listeners,
             .clusters = &bed.clusters,
             .connect_timeout_ms = 50,
-            .idle_timeout_ms = 1000,
+            .idle_timeout_ms = options.idle_timeout_ms,
             .drain_deadline_ms = 1000,
         };
-        try bed.server.init(arena, &bed.sim_io, &bed.cfg, options);
+        try bed.server.init(arena, &bed.sim_io, &bed.cfg, options.server);
         try bed.server.start();
 
         bed.scenario = .{
@@ -207,16 +305,17 @@ const TestBed = struct {
             .clients = @splat(.{}),
             .clients_count = 0,
         };
-        if (origin_listens) {
+        if (options.origin_listens) {
             try bed.scenario.origin.start(&bed.sim_io, originAddress());
         }
     }
 
-    fn startClients(bed: *TestBed, count: u8) void {
+    fn startClients(bed: *TestBed, count: u8, exchange: bool) void {
         assert(count >= 1);
         assert(count <= bed.scenario.clients.len);
         bed.scenario.clients_count = count;
         for (bed.scenario.clients[0..count]) |*client| {
+            client.exchange = exchange;
             client.start(&bed.scenario, bindAddress());
         }
     }
@@ -232,48 +331,78 @@ const TestBed = struct {
     }
 };
 
-test "server: happy lifecycle drains pools and reconciles across seeds" {
+test "relay: proxied echo is byte-exact under the adversary across seeds" {
     var seed: u64 = 1;
-    while (seed <= 10) : (seed += 1) {
+    while (seed <= 15) : (seed += 1) {
         var bed: TestBed = undefined;
-        try bed.setUp(
-            .{ .conn_slots = 4, .relay_buffers = 2 },
-            .{ .seed = seed, .adversary = .{ .connect_delay_ns_max = 2_000_000 } },
-            true,
-        );
+        try bed.setUp(.{
+            .sim = .{
+                .seed = seed,
+                .adversary = .{ .partial_io = true, .connect_delay_ns_max = 2_000_000 },
+            },
+        });
         defer bed.tearDown();
 
-        bed.startClients(1);
+        bed.startClients(1, true);
         try bed.sim_io.run();
 
-        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("accepted"));
+        const client = &bed.scenario.clients[0];
+        try std.testing.expectEqual(Client.Outcome.eof, client.outcome);
+        try std.testing.expectEqualStrings(
+            echo_token,
+            client.receive_buffer[0..client.received_len],
+        );
+        try std.testing.expectEqual(@as(u8, 1), bed.scenario.origin.conns_count);
+        try std.testing.expect(bed.scenario.origin.conns[0].done);
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("admitted"));
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
-        try std.testing.expectEqual(@as(u8, 1), bed.scenario.outcomeCount(.eof));
-        // The slice-7 stub tears down right after dialing, so the origin's
-        // accept may adversarially lose the race against the end of the
-        // scenario; if it did accept, it must have observed the close.
-        // Slice 8's relay makes origin participation deterministic.
-        try std.testing.expect(bed.scenario.origin.conns_count <= 1);
-        if (bed.scenario.origin.conns_count == 1) {
-            try std.testing.expect(bed.scenario.origin.conns[0].done);
-        }
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("deadline_expired"));
         try bed.expectDrained();
     }
 }
 
+test "relay: idle timeout reaps a silent connection" {
+    var bed: TestBed = undefined;
+    try bed.setUp(.{ .sim = .{ .seed = 31 }, .idle_timeout_ms = 50 });
+    defer bed.tearDown();
+
+    bed.startClients(1, false);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(@as(u8, 1), bed.scenario.outcomeCount(.eof));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    try bed.expectDrained();
+}
+
+test "relay: an origin reset mid-exchange tears the connection down" {
+    var bed: TestBed = undefined;
+    try bed.setUp(.{ .sim = .{ .seed = 33, .adversary = .{ .partial_io = false } } });
+    defer bed.tearDown();
+
+    bed.scenario.origin.mode = .reset_on_first_chunk;
+    bed.startClients(1, true);
+    try bed.sim_io.run();
+
+    // The client observes the teardown (as FIN or the propagated reset);
+    // the echo never completes but the slot is fully reclaimed.
+    try std.testing.expect(bed.scenario.clients[0].outcome != .pending);
+    try std.testing.expect(bed.scenario.clients[0].received_len < echo_token.len);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    try bed.expectDrained();
+}
+
 test "server: conn-slot exhaustion sheds with RST; deadline reaps the holder" {
     var bed: TestBed = undefined;
-    try bed.setUp(
-        .{ .conn_slots = 1, .relay_buffers = 1 },
-        .{ .seed = 21 },
-        true,
-    );
+    try bed.setUp(.{
+        .server = .{ .conn_slots = 1, .relay_buffers = 1 },
+        .sim = .{ .seed = 21 },
+    });
     defer bed.tearDown();
 
     // Pin the proxy→origin dial only; the clients' own connects stay live.
     bed.sim_io.blackholeAddress(TestBed.originAddress());
-    bed.startClients(2);
+    bed.startClients(2, false);
     try bed.sim_io.run();
 
     // One client held the only slot until the connect deadline reaped it
@@ -291,15 +420,14 @@ test "server: conn-slot exhaustion sheds with RST; deadline reaps the holder" {
 
 test "server: relay-buffer exhaustion sheds with a quiet close" {
     var bed: TestBed = undefined;
-    try bed.setUp(
-        .{ .conn_slots = 2, .relay_buffers = 1 },
-        .{ .seed = 22 },
-        true,
-    );
+    try bed.setUp(.{
+        .server = .{ .conn_slots = 2, .relay_buffers = 1 },
+        .sim = .{ .seed = 22 },
+    });
     defer bed.tearDown();
 
     bed.sim_io.blackholeAddress(TestBed.originAddress());
-    bed.startClients(2);
+    bed.startClients(2, false);
     try bed.sim_io.run();
 
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("admitted"));
@@ -314,14 +442,14 @@ test "server: relay-buffer exhaustion sheds with a quiet close" {
 
 test "server: refused upstream tears the connection down and is counted" {
     var bed: TestBed = undefined;
-    try bed.setUp(
-        .{ .conn_slots = 2, .relay_buffers = 1 },
-        .{ .seed = 23 },
-        false, // no origin listening: every dial is refused
-    );
+    try bed.setUp(.{
+        .server = .{ .conn_slots = 2, .relay_buffers = 1 },
+        .sim = .{ .seed = 23 },
+        .origin_listens = false, // no origin: every dial is refused
+    });
     defer bed.tearDown();
 
-    bed.startClients(1);
+    bed.startClients(1, false);
     try bed.sim_io.run();
 
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("admitted"));
