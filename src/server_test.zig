@@ -392,6 +392,23 @@ test "relay: an origin reset mid-exchange tears the connection down" {
     try bed.expectDrained();
 }
 
+test "drain: terminate signal stops accepting and reaps stragglers at the drain deadline" {
+    var bed: TestBed = undefined;
+    try bed.setUp(.{ .sim = .{ .seed = 41 }, .idle_timeout_ms = 60_000 });
+    defer bed.tearDown();
+
+    // A silent client would idle for a minute; the drain must not wait
+    // for it — the server-owned drain timer reaps it instead.
+    bed.startClients(1, false);
+    bed.sim_io.scheduleSignal(.terminate, bed.sim_io.nowNs() + 5_000_000);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(@as(u8, 1), bed.scenario.outcomeCount(.eof));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("drained_at_deadline"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    try bed.expectDrained();
+}
+
 test "server: conn-slot exhaustion sheds with RST; deadline reaps the holder" {
     var bed: TestBed = undefined;
     try bed.setUp(.{

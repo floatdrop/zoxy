@@ -33,6 +33,7 @@ pub fn Server(comptime IoType: type) type {
         endpoints_next: []u16,
         counters: counters_module.Counters,
         draining: bool,
+        drain_deadline_completion: IoType.Completion,
 
         const Self = @This();
 
@@ -74,6 +75,7 @@ pub fn Server(comptime IoType: type) type {
             @memset(server.endpoints_next, 0);
             server.counters = .{};
             server.draining = false;
+            server.drain_deadline_completion = .{};
         }
 
         pub fn start(server: *Self) Io.ListenError!void {
@@ -90,16 +92,57 @@ pub fn Server(comptime IoType: type) type {
                 };
                 server.armAccept(state);
             }
+            server.io.signalWait(Self, server, onSignal);
         }
 
-        /// Drain (§8): stop accepting. Slice 9 adds deadline clamping and
-        /// the final stop; admitted work already finishes on its own.
+        /// Drain, not just death (§8): close listeners (armed accepts
+        /// cancel), let admitted work finish under one server-owned drain
+        /// timer, stop when the pools drain. A per-conn deadline clamp
+        /// would not work: a lazily re-armed timer never notices a
+        /// deadline moving *earlier* (§4) — so stragglers are reaped by
+        /// this one timer instead.
         pub fn beginDrain(server: *Self) void {
             if (server.draining) return;
             server.draining = true;
             for (server.listeners[0..server.listeners_count]) |*state| {
                 server.io.listenClose(state.listener);
             }
+            server.io.timerStart(
+                &server.drain_deadline_completion,
+                @as(u64, server.cfg.drain_deadline_ms) * std.time.ns_per_ms,
+                Self,
+                server,
+                onDrainDeadline,
+            );
+            server.maybeStopAfterDrain();
+        }
+
+        fn onDrainDeadline(server: *Self, result: Io.TimerError!void) void {
+            assert(server.draining);
+            // Nothing ever cancels the drain timer.
+            result catch unreachable;
+            for (server.conns.slots) |*conn| {
+                if (server.conns.isAcquired(conn)) {
+                    if (conn.state != .tearing_down) {
+                        server.counters.increment("drained_at_deadline");
+                        server.beginTeardown(conn);
+                    }
+                }
+            }
+        }
+
+        fn onSignal(server: *Self, signal: Io.Signal) void {
+            switch (signal) {
+                .terminate => server.beginDrain(),
+                .dump_counters => server.counters.dump(),
+            }
+        }
+
+        fn maybeStopAfterDrain(server: *Self) void {
+            if (!server.draining) return;
+            if (!server.conns.isFullyReleased()) return;
+            assert(server.relay_buffers.isFullyReleased());
+            server.io.stop();
         }
 
         /// The simulator's leak invariant (§9).
@@ -301,6 +344,7 @@ pub fn Server(comptime IoType: type) type {
             server.relay_buffers.release(conn.relay_buffer);
             server.conns.release(conn);
             server.counters.increment("completed");
+            server.maybeStopAfterDrain();
         }
 
         /// Public for the relay: activity pushes the idle deadline out;

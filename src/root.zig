@@ -9,6 +9,7 @@ pub const constants = @import("constants.zig");
 pub const counters = @import("counters.zig");
 pub const Io = @import("io/Io.zig");
 pub const Pool = @import("mem/Pool.zig").Pool;
+pub const RelayBuffer = @import("net/relay.zig").RelayBuffer;
 pub const Server = @import("Server.zig").Server;
 pub const shed = @import("shed.zig");
 

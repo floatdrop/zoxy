@@ -42,6 +42,18 @@ pub const Counters = struct {
         return @field(counters, name).load(.monotonic);
     }
 
+    /// Phase 0 exposure (§8): SIGUSR1 dumps to stderr through the signal
+    /// seam; the admin plane stays deferred (§10).
+    pub fn dump(counters: *const Counters) void {
+        std.debug.print("zoxy counters:", .{});
+        inline for (@typeInfo(Counters).@"struct".fields) |field| {
+            if (field.type == Value) {
+                std.debug.print(" {s}={d}", .{ field.name, counters.get(field.name) });
+            }
+        }
+        std.debug.print("\n", .{});
+    }
+
     /// The §9 invariant: admitted work is completed or still active, and
     /// every accepted connection was admitted or shed — no third outcome.
     pub fn reconcile(counters: *const Counters, active_count: u32) bool {
