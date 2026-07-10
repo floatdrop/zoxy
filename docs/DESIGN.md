@@ -242,6 +242,14 @@ separate deliberate decision, not a default.
   in the connection slot; submitting an op writes it in place. Zero
   per-operation allocation — verified property of libxev's io_uring
   backend, and the reason it fits this project at all.
+- **Ring sizing is explicit.** `ring_entries` lives in
+  `src/constants.zig` (libxev caps entries at 8191, requires a power of
+  two, and fixes the io_uring CQ at 2 × entries — not configurable
+  through libxev). When the kernel SQ is full, libxev parks submissions
+  in an intrusive userspace list bounded by in-flight completions —
+  which live in pool slots — so the no-unbounded-queue rule holds by
+  construction. The in-flight op budget that keeps CQ overflow
+  unreachable is part of the startup printout (§8).
 - **Backend selection.** Production: `io_uring` (Linux ≥ 5.11). Dev box:
   kqueue (macOS) — same API, same callbacks, so day-to-day development
   does not need a VM. Correctness claims are only made for Linux.
@@ -249,9 +257,14 @@ separate deliberate decision, not a default.
   it calls `src/io/Io.zig`, a comptime-selected facade with two backends:
   `XevIo` (production) and `SimIo` (deterministic simulation — virtual
   sockets, virtual clock, seeded adversarial scheduler, §9). The seam is
-  thin — accept/recv/send/connect/close/timer/async, caller-owned
-  completions — deliberately mirroring xev so it costs nothing in
-  production.
+  thin — accept/recv/send/connect/shutdown/close/timer/async/signal,
+  caller-owned completions — deliberately mirroring xev so it costs
+  nothing in production. `signal` is how SIGTERM reaches the loop: a
+  `sigaction` handler does an async-signal-safe wake (`xev.Async.notify`,
+  an eventfd write) and the loop's callback starts the drain (§8) —
+  never `loop.stop()`, which does not wake a blocked loop from another
+  thread (libxev #173). `SimIo` delivers drain as just another scheduled
+  event.
 - **Run to completion.** Callbacks never suspend (TigerStyle: assertions
   hold across the whole body). Completions are drained in bounded batches
   per loop tick; a callback may enqueue more work but never runs another
@@ -259,8 +272,15 @@ separate deliberate decision, not a default.
 - **Clock.** `Io.now_ns` is refreshed once per loop tick (the previous
   iteration measured per-callback `clock_gettime` at ~3% of data-path CPU)
   and is the seam the simulator's virtual clock replaces.
-- **Deadlines.** One timer per connection holding an *absolute* deadline;
-  state transitions move the deadline value, never cancel/re-arm the op.
+- **Deadlines.** One timer per connection holding an *absolute* deadline.
+  A state transition only *stores* the new deadline value — the armed op
+  is never touched. When the timer fires, the callback compares the
+  stored deadline against `Io.now_ns`: not yet due → re-arm for the
+  remainder with a fresh submit (libxev's `.rearm` return reuses the
+  stale absolute time and is never used); due → the deadline action.
+  **Teardown is the one place a timer is canceled** (§5 release rule).
+  libxev cancellation is internally cancel+resubmit and consumes its own
+  caller-owned completion, embedded in the slot like every other op.
 - **Plain ops only, at first.** Multishot accept/recv, buffer rings,
   `send_zc`, `splice` are deferred optimizations behind measurement — the
   previous iteration never became CPU-bound without them.
@@ -274,11 +294,12 @@ Three shared pools, all owned and touched only by the loop thread:
 
 1. **Connection slots — `Pool(Conn)`.** One contiguous object per
    connection: state machine, embedded completions (one per overlappable
-   op — the previous iteration grew a field per proven race), the deadline
-   timer, and a small fixed **head buffer** (L7 request/response heads;
-   idle on L4 connections, which relay through pool 2 only). Acquired at
-   accept, released at teardown. Intrusive free list, LIFO reuse for
-   cache warmth.
+   op — the previous iteration grew a field per proven race — including
+   the timer-cancel completion, §4), the deadline timer, and a small
+   fixed **head buffer** (L7 request/response heads; idle on L4
+   connections, which relay through pool 2 only). Acquired at accept,
+   released at teardown once the slot's armed-op set is empty (release
+   rule below). Intrusive free list, LIFO reuse for cache warmth.
 2. **Relay buffers — `Pool(RelayBuffer)`.** The large per-direction
    buffers for body/stream relaying, *decoupled from connection slots*.
    L7: acquired when a relay starts, **released when the connection goes
@@ -309,6 +330,17 @@ Rules:
   relays (§6).
 - **The config arena is the only allocating region** — parse-once,
   immutable, shared read-only. (Carried verbatim; it worked.)
+- **A slot is released only when its armed-op set is empty.** Every op
+  references a completion embedded in the slot, and the slot header
+  tracks which are armed. Teardown is a *state*, not an event: shutdown
+  both fds, cancel the timer (the one legal cancel, §4), then wait — the
+  last terminal completion (success, error, or cancellation) releases
+  the slot. An active completion is never resubmitted (libxev's
+  intrusive queues corrupt on re-enqueue), and LIFO reuse turns a
+  straggler completion landing in a recycled slot into memory
+  corruption — so slots carry a generation counter asserted on every
+  completion delivery, and the simulator asserts no completion is ever
+  delivered to a freed or reused slot (§9).
 - **No cross-thread sharing of pool memory.** Workers receive pointers
   into a slot that is *parked* (no data I/O in flight) for the duration
   of the job; ownership transfers through the job queue (loop → worker)
@@ -449,8 +481,18 @@ the loop thread.
   async and signal fds — computed from `src/constants.zig` and asserted
   against `RLIMIT_NOFILE` at startup, next to the memory printout, so
   `EMFILE` is unreachable rather than a ladder rung.
+- **The ring is pre-budgeted, not shed.** Worst-case in-flight op count
+  is closed-form — per-connection ops (bounded by the strict relay
+  discipline) × conn slots + parked upstreams + timers — computed from
+  `src/constants.zig`, printed at startup next to the memory and fd
+  budgets, and comptime-asserted to fit the completion queue
+  (2 × `ring_entries`, §4), so CQ overflow — kernel-side NODROP
+  buffering, an allocating path — is unreachable rather than a ladder
+  rung. libxev surfacing `error.CompletionQueueOvercommitted` is
+  therefore an invariant violation (assert), not load.
 
-**Drain, not just death.** SIGTERM → close listeners (stop accepting),
+**Drain, not just death.** SIGTERM (delivered through the seam's
+`signal` primitive, §4) → close listeners (stop accepting),
 stop honoring downstream keep-alive (`Connection: close` injection), let
 admitted work finish under one drain deadline (`drain_deadline_ms`), then
 tear down stragglers and exit. Drain reuses the pressure machinery — it
@@ -468,10 +510,11 @@ a feature without its gate is not done.
    connects, resets at every point in every exchange, misbehaving origins.
    Every request carries a token echoed into the body and verified
    byte-exact. Invariants per seed: no slot leaks (all pools drain to
-   zero), no deadlock, counters reconcile, every shed is witnessed, and
-   no loop-side write ever lands in a parked slot's scratch (the
-   scheduler deliberately fires deadlines while worker jobs are in
-   flight, §5). A failure prints its seed; the same seed replays the
+   zero), no deadlock, counters reconcile, every shed is witnessed, no
+   completion is delivered to a freed or reused slot (slot generations
+   checked on every delivery, §5), and no loop-side write ever lands in
+   a parked slot's scratch (the scheduler deliberately fires deadlines
+   while worker jobs are in flight, §5). A failure prints its seed; the same seed replays the
    exact schedule.
    `zig build sim -- fuzz` runs forever on entropy-derived seeds.
 2. **Fuzzing — `zig build test --fuzz`.** `std.testing.fuzz` on every
