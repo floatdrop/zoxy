@@ -16,6 +16,7 @@ const zoxy = @import("zoxy");
 const Io = zoxy.Io;
 const SimIo = zoxy.Io.SimIo;
 const ServerSim = zoxy.Server(SimIo);
+const Origin = zoxy.testing.Origin(SimIo);
 
 const assert = std.debug.assert;
 
@@ -158,8 +159,11 @@ const Harness = struct {
         try harness.server.init(arena, &harness.io, &harness.cfg, options);
         try harness.server.start();
 
-        harness.origin = .{ .harness = harness };
-        try harness.origin.start();
+        harness.origin = .{
+            .mode_selector = pickOriginMode,
+            .context = harness,
+        };
+        try harness.origin.start(&harness.io, Harness.originAddress());
 
         harness.clients_count = 1 + random.uintLessThan(u8, clients_max);
         harness.ended_count = 0;
@@ -228,143 +232,13 @@ const Harness = struct {
     }
 };
 
-/// Scripted origin with seed-picked misbehavior per accepted connection:
-/// echo, RST on the first chunk, mute (reads, never replies — the idle
-/// deadline path), or frozen (never reads — the backpressure path).
-const Origin = struct {
-    harness: *Harness,
-    listener: SimIo.Listener = undefined,
-    accept_completion: SimIo.Completion = .{},
-    conns: [16]OriginConn = @splat(.{}),
-    conns_count: u8 = 0,
-    listening: bool = false,
-
-    const Mode = enum(u8) { echo, reset_on_first_chunk, mute, frozen };
-
-    const OriginConn = struct {
-        origin: *Origin = undefined,
-        socket: SimIo.Socket = undefined,
-        recv_completion: SimIo.Completion = .{},
-        send_completion: SimIo.Completion = .{},
-        buffer: [token_bytes_max]u8 = undefined,
-        transfer_len: u32 = 0,
-        sent_len: u32 = 0,
-        mode: Mode = .echo,
-        done: bool = false,
-
-        fn armRecv(conn: *OriginConn) void {
-            conn.origin.harness.io.recv(
-                conn.socket,
-                &conn.buffer,
-                &conn.recv_completion,
-                OriginConn,
-                conn,
-                onRecv,
-            );
-        }
-
-        fn onRecv(conn: *OriginConn, result: Io.RecvError!u32) void {
-            const io = &conn.origin.harness.io;
-            const received = result catch {
-                io.closeNow(conn.socket);
-                conn.done = true;
-                return;
-            };
-            assert(received >= 1);
-            switch (conn.mode) {
-                .echo => {
-                    conn.transfer_len = received;
-                    conn.sent_len = 0;
-                    conn.armSend();
-                },
-                .reset_on_first_chunk => {
-                    io.setLingerRst(conn.socket) catch unreachable;
-                    io.closeNow(conn.socket);
-                    conn.done = true;
-                },
-                .mute => conn.armRecv(),
-                .frozen => unreachable,
-            }
-        }
-
-        fn armSend(conn: *OriginConn) void {
-            assert(conn.mode == .echo);
-            assert(conn.sent_len < conn.transfer_len);
-            conn.origin.harness.io.send(
-                conn.socket,
-                conn.buffer[conn.sent_len..conn.transfer_len],
-                &conn.send_completion,
-                OriginConn,
-                conn,
-                onSend,
-            );
-        }
-
-        fn onSend(conn: *OriginConn, result: Io.SendError!u32) void {
-            const sent = result catch {
-                conn.origin.harness.io.closeNow(conn.socket);
-                conn.done = true;
-                return;
-            };
-            conn.sent_len += sent;
-            assert(conn.sent_len <= conn.transfer_len);
-            if (conn.sent_len < conn.transfer_len) {
-                conn.armSend();
-            } else {
-                conn.armRecv();
-            }
-        }
-    };
-
-    fn start(origin: *Origin) !void {
-        origin.listener = try origin.harness.io.listen(Harness.originAddress());
-        origin.listening = true;
-        origin.armAccept();
-    }
-
-    fn armAccept(origin: *Origin) void {
-        origin.harness.io.accept(
-            origin.listener,
-            &origin.accept_completion,
-            Origin,
-            origin,
-            onAccept,
-        );
-    }
-
-    fn onAccept(origin: *Origin, result: Io.AcceptError!SimIo.Socket) void {
-        const socket = result catch |err| {
-            assert(err == error.Canceled);
-            return;
-        };
-        assert(origin.conns_count < origin.conns.len);
-        const conn = &origin.conns[origin.conns_count];
-        origin.conns_count += 1;
-        conn.origin = origin;
-        conn.socket = socket;
-        conn.mode = origin.harness.scenario_prng.random().enumValue(Mode);
-        if (conn.mode != .frozen) {
-            conn.armRecv();
-        }
-        origin.armAccept();
-    }
-
-    fn stopListening(origin: *Origin) void {
-        if (origin.listening) {
-            origin.harness.io.listenClose(origin.listener);
-            origin.listening = false;
-        }
-    }
-
-    fn closeRemaining(origin: *Origin) void {
-        for (origin.conns[0..origin.conns_count]) |*conn| {
-            if (!conn.done) {
-                origin.harness.io.closeNow(conn.socket);
-                conn.done = true;
-            }
-        }
-    }
-};
+/// Per-accept origin behavior, drawn from the harness's scenario PRNG so
+/// each proxied connection meets a random misbehavior (echo / RST / mute /
+/// frozen) — the §9 adversarial-origin coverage.
+fn pickOriginMode(context: ?*anyopaque) zoxy.testing.Mode {
+    const harness: *Harness = @ptrCast(@alignCast(context.?));
+    return harness.scenario_prng.random().enumValue(zoxy.testing.Mode);
+}
 
 /// A scripted client with a seed-derived token. Sends the token, FINs
 /// after the full echo, and treats any terminal recv as the end; silent
