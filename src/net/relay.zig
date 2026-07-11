@@ -89,7 +89,7 @@ pub fn Relay(comptime IoType: type) type {
         ) void {
             const server = conn.server;
             conn.delivered(dataOp(conn, direction), armedBitName(direction));
-            if (conn.state == .tearing_down) {
+            if (conn.isTearingDown()) {
                 server.continueTeardown(conn);
                 return;
             }
@@ -123,7 +123,7 @@ pub fn Relay(comptime IoType: type) type {
         ) void {
             const server = conn.server;
             conn.delivered(dataOp(conn, direction), armedBitName(direction));
-            if (conn.state == .tearing_down) {
+            if (conn.isTearingDown()) {
                 server.continueTeardown(conn);
                 return;
             }
