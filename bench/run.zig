@@ -42,12 +42,10 @@ pub fn main(init: std.process.Init) !u8 {
         origin_child = try spawnNginx(arena, io);
         break :spawn_origin try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{origin_port});
     };
-    defer if (origin_child) |*child| {
-        child.kill(io);
-        // Best-effort reap on the cleanup path; the process is already
-        // killed and the harness is exiting either way.
-        _ = child.wait(io) catch {};
-    };
+    // kill() blocks until the child dies and reaps it (and sets id null),
+    // so a wait() after it would trip wait's id != null assertion — UB
+    // that manifested as a SEGV in this ReleaseFast harness.
+    defer if (origin_child) |*child| child.kill(io);
 
     var zoxy_child = try spawnZoxy(arena, io, flags.zoxy_path, origin_address);
     var zoxy_running = true;
