@@ -25,7 +25,6 @@ pub fn Conn(comptime IoType: type) type {
         /// its presence one field means an unset upstream can never be
         /// read as a live fd handle.
         upstream_socket: ?IoType.Socket,
-        closes_submitted: bool,
         relay_buffer: *relay.RelayBuffer,
         /// Absolute deadline; state transitions only store a new value —
         /// the armed timer op is never touched (§4).
@@ -47,8 +46,19 @@ pub fn Conn(comptime IoType: type) type {
         pub const State = enum(u8) {
             connecting,
             relaying,
+            /// Teardown begun: sockets shut down, pending ops draining,
+            /// closes not yet submitted.
             tearing_down,
+            /// Closes submitted; the slot releases when the armed set
+            /// empties (§5). Splitting this from `tearing_down` lets an
+            /// assertion tell "still draining ops" from "awaiting closes".
+            closing,
         };
+
+        /// True once teardown has begun, in either teardown phase.
+        pub fn isTearingDown(conn: *const Self) bool {
+            return conn.state == .tearing_down or conn.state == .closing;
+        }
 
         pub const Direction = enum(u1) {
             client_to_upstream,
@@ -97,7 +107,6 @@ pub fn Conn(comptime IoType: type) type {
             conn.state = .connecting;
             conn.client_socket = client_socket;
             conn.upstream_socket = null;
-            conn.closes_submitted = false;
             conn.relay_buffer = buffer;
             conn.deadline_ns = 0;
             conn.armed = .{};

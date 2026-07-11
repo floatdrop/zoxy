@@ -279,7 +279,7 @@ pub fn Server(comptime IoType: type) type {
         fn onConnect(conn: *ConnType, result: Io.ConnectError!IoType.Socket) void {
             const server = conn.server;
             conn.delivered(&conn.op_connect, "connect");
-            if (conn.state == .tearing_down) {
+            if (conn.isTearingDown()) {
                 // The teardown raced the dial. A socket that arrived
                 // anyway must still be shut down and closed.
                 if (result) |socket| {
@@ -309,7 +309,7 @@ pub fn Server(comptime IoType: type) type {
         /// then closes once data ops drain; the last terminal completion
         /// releases the slot.
         pub fn beginTeardown(server: *Self, conn: *ConnType) void {
-            if (conn.state == .tearing_down) return;
+            if (conn.isTearingDown()) return;
             assert(conn.state == .connecting or conn.state == .relaying);
             conn.state = .tearing_down;
             server.io.shutdown(conn.client_socket, .both);
@@ -342,13 +342,13 @@ pub fn Server(comptime IoType: type) type {
         /// Public for the relay: a data completion delivered during
         /// teardown re-enters here (§5 — ops drain, then closes).
         pub fn continueTeardown(server: *Self, conn: *ConnType) void {
-            assert(conn.state == .tearing_down);
-            if (!conn.closes_submitted) {
+            assert(conn.isTearingDown());
+            if (conn.state == .tearing_down) {
                 const blocking_ops = conn.armed.connect or
                     conn.armed.data_client_to_upstream or
                     conn.armed.data_upstream_to_client;
                 if (!blocking_ops) {
-                    conn.closes_submitted = true;
+                    conn.state = .closing;
                     conn.arm(&conn.op_close_client, "close_client");
                     server.io.close(
                         conn.client_socket,
@@ -375,8 +375,8 @@ pub fn Server(comptime IoType: type) type {
         /// §5 release rule: closes submitted and the armed-op set empty —
         /// only then does the slot go back to the pool.
         fn maybeRelease(server: *Self, conn: *ConnType) void {
-            assert(conn.state == .tearing_down);
-            if (!conn.closes_submitted) return;
+            assert(conn.isTearingDown());
+            if (conn.state != .closing) return;
             if (conn.armedCount() != 0) return;
             server.relay_buffers.release(conn.relay_buffer);
             server.conns.release(conn);
@@ -409,7 +409,7 @@ pub fn Server(comptime IoType: type) type {
             const server = conn.server;
             conn.delivered(&conn.op_deadline, "deadline");
             if (result) |_| {
-                if (conn.state == .tearing_down) {
+                if (conn.isTearingDown()) {
                     // Fired while the cancel was in flight — legal race;
                     // the cancel completion still arrives (§4).
                     server.continueTeardown(conn);
@@ -423,7 +423,9 @@ pub fn Server(comptime IoType: type) type {
                 }
             } else |err| {
                 assert(err == error.Canceled);
-                assert(conn.state == .tearing_down);
+                // The deadline is not a blocking op, so its Canceled
+                // delivery can arrive after closes were submitted (.closing).
+                assert(conn.isTearingDown());
                 server.continueTeardown(conn);
             }
         }
