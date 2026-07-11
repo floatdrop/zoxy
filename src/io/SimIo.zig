@@ -216,7 +216,7 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     io.adversary = options.adversary;
     io.stopped = false;
     io.dump_on_deadlock = options.dump_on_deadlock;
-    io.trace_hash = 0xcbf29ce484222325;
+    io.trace_hash = std.hash.Fnv1a_64.init().value;
     io.blackholed_addresses = undefined;
     io.blackholed_count = 0;
     assert(io.sockets.isFullyReleased());
@@ -1001,6 +1001,11 @@ fn traceMix(io: *SimIo, completion: *const Completion, result: *const Result) vo
 }
 
 fn mix(io: *SimIo, value: u64) void {
-    // FNV-1a, folding each delivery into the run's trace hash.
-    io.trace_hash = (io.trace_hash ^ value) *% 0x100000001b3;
+    // Fold each delivery into the run's trace hash. std's FNV-1a owns the
+    // constants so a mistyped prime/basis can't silently degrade mixing;
+    // the hash only ever compares a seed against itself, so the byte order
+    // is immaterial.
+    var hasher = std.hash.Fnv1a_64{ .value = io.trace_hash };
+    hasher.update(std.mem.asBytes(&value));
+    io.trace_hash = hasher.value;
 }
