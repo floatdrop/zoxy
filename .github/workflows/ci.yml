@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main, libxev]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: test, lint & sim
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The same pinned toolchain as local dev (devenv.nix: zig_0_16),
+      # resolved through devenv.lock and served by the Nix binary cache.
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Install devenv
+        run: nix profile install nixpkgs#devenv
+
+      # zig-pkg (vendored, hash-pinned deps) is deliberately not checked.
+      - name: Check formatting
+        run: devenv shell -- zig fmt --check build.zig src bench sim scripts
+
+      - name: Build
+        run: devenv shell -- zig build
+
+      # The per-change gates (DESIGN.md §9): unit tests, the fd-boundary
+      # lint, and the deterministic simulator (failures replay locally with
+      # `zig build sim -- <seed> 1`). The Tier-1 bench is deliberately
+      # excluded — its verdict is a band comparison against a real origin
+      # at merge, not a blind shared-runner pass.
+      - name: Run gates (test + lint + sim)
+        run: devenv shell -- zig build ci --summary all
