@@ -220,7 +220,7 @@ const Harness = struct {
         harness.origin.closeRemaining();
 
         if (!harness.server.isIdle()) return error.PoolLeak;
-        if (!harness.server.counters.reconcile(0)) return error.CountersDiverged;
+        if (!harness.server.reconcile()) return error.CountersDiverged;
         if (!harness.io.sockets.isFullyReleased()) return error.SocketLeak;
         for (harness.clients[0..harness.clients_count]) |*client| {
             try client.verifyIntegrity();

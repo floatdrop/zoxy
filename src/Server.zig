@@ -164,6 +164,13 @@ pub fn Server(comptime IoType: type) type {
             return server.conns.acquired_count;
         }
 
+        /// Counter reconciliation (§8/§9) supplying the in-flight term
+        /// from the pool the server owns, so no caller has to guess it —
+        /// holds mid-scenario, not only when idle.
+        pub fn reconcile(server: *const Self) bool {
+            return server.counters.reconcile(server.activeCount());
+        }
+
         fn armAccept(server: *Self, state: *ListenerState) void {
             assert(!state.accepting);
             assert(!server.draining);

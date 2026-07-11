@@ -364,7 +364,7 @@ pub const TestBed = struct {
 
     pub fn expectDrained(bed: *TestBed) !void {
         try std.testing.expect(bed.server.isIdle());
-        try std.testing.expect(bed.server.counters.reconcile(0));
+        try std.testing.expect(bed.server.reconcile());
         try std.testing.expect(bed.sim_io.sockets.isFullyReleased());
     }
 };
