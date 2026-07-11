@@ -15,7 +15,7 @@ jobs:
     name: test, lint & sim
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The same pinned toolchain as local dev (devenv.nix: zig_0_16),
       # resolved through devenv.lock and served by the Nix binary cache.
