@@ -10,7 +10,7 @@
 const std = @import("std");
 
 const config_module = @import("config.zig");
-const Io = @import("io/Io.zig");
+const Io = @import("io/io.zig");
 const Server = @import("Server.zig").Server;
 const SimIo = @import("io/SimIo.zig");
 const origin_mod = @import("testing/origin.zig");
@@ -190,7 +190,7 @@ pub const TestBed = struct {
     endpoints: [1]std.Io.net.IpAddress,
     clusters: [1]config_module.Config.Cluster,
     listeners: [1]config_module.Config.Listener,
-    cfg: config_module.Config,
+    config: config_module.Config,
     server: ServerSim,
     scenario: Scenario,
 
@@ -218,14 +218,14 @@ pub const TestBed = struct {
         bed.endpoints = .{originAddress()};
         bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints }};
         bed.listeners = .{.{ .bind_address = bindAddress(), .cluster_index = 0 }};
-        bed.cfg = .{
+        bed.config = .{
             .listeners = &bed.listeners,
             .clusters = &bed.clusters,
             .connect_timeout_ms = 50,
             .idle_timeout_ms = options.idle_timeout_ms,
             .drain_deadline_ms = 1000,
         };
-        try bed.server.init(arena, &bed.sim_io, &bed.cfg, options.server);
+        try bed.server.init(arena, &bed.sim_io, &bed.config, options.server);
         try bed.server.start();
 
         bed.scenario = .{

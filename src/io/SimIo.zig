@@ -14,7 +14,7 @@
 const std = @import("std");
 
 const constants = @import("../constants.zig");
-const Io = @import("Io.zig");
+const Io = @import("io.zig");
 const Pool = @import("../mem/Pool.zig").Pool;
 
 const assert = std.debug.assert;

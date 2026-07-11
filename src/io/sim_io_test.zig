@@ -9,7 +9,7 @@
 const std = @import("std");
 
 const contract = @import("contract_test.zig");
-const Io = @import("Io.zig");
+const Io = @import("io.zig");
 const SimIo = @import("SimIo.zig");
 
 const assert = std.debug.assert;

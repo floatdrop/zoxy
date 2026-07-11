@@ -10,7 +10,7 @@
 
 const std = @import("std");
 
-const Io = @import("../io/Io.zig");
+const Io = @import("../io/io.zig");
 
 const assert = std.debug.assert;
 

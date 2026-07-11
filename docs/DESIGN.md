@@ -258,7 +258,7 @@ unmerged behind it, so the pin moves only after re-audit.
   kqueue (macOS) — same API, same callbacks, so day-to-day development
   does not need a VM. Correctness claims are only made for Linux.
 - **Our own `Io` seam on top.** The data path never names `xev` directly;
-  it calls `src/io/Io.zig`, a comptime-selected facade with two backends:
+  it calls `src/io/io.zig`, a comptime-selected facade with two backends:
   `XevIo` (production) and `SimIo` (deterministic simulation — virtual
   sockets, virtual clock, seeded adversarial scheduler, §9). The seam is
   thin — accept/recv/send/connect/shutdown/close/timer/async/signal,
@@ -667,7 +667,7 @@ src/
   constants.zig       // every static limit; total memory is f(these)
   config.zig          // strict JSON → arena-owned immutable Config
   io/
-    Io.zig            // the seam: comptime backend select
+    io.zig            // the seam: comptime backend select
     XevIo.zig         // production: libxev (io_uring / kqueue)
     SimIo.zig         // simulation: virtual sockets + clock + adversary
   mem/

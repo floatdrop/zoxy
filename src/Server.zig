@@ -13,7 +13,7 @@ const config_module = @import("config.zig");
 const constants = @import("constants.zig");
 const counters_module = @import("counters.zig");
 const conn_module = @import("net/Conn.zig");
-const Io = @import("io/Io.zig");
+const Io = @import("io/io.zig");
 const Pool = @import("mem/Pool.zig").Pool;
 const relay = @import("net/relay.zig");
 const shed = @import("shed.zig");
@@ -25,7 +25,7 @@ pub fn Server(comptime IoType: type) type {
 
     return struct {
         io: *IoType,
-        cfg: *const config_module.Config,
+        config: *const config_module.Config,
         conns: Pool(ConnType),
         relay_buffers: Pool(relay.RelayBuffer),
         listeners: []ListenerState,
@@ -66,20 +66,20 @@ pub fn Server(comptime IoType: type) type {
             server: *Self,
             arena: std.mem.Allocator,
             io: *IoType,
-            cfg: *const config_module.Config,
+            config: *const config_module.Config,
             options: InitOptions,
         ) error{OutOfMemory}!void {
-            assert(cfg.listeners.len >= 1);
-            assert(cfg.listeners.len <= constants.listeners_max);
+            assert(config.listeners.len >= 1);
+            assert(config.listeners.len <= constants.listeners_max);
             assert(options.relay_buffers >= 1);
             assert(options.relay_buffers <= options.conn_slots);
             server.io = io;
-            server.cfg = cfg;
+            server.config = config;
             try server.conns.init(arena, options.conn_slots);
             try server.relay_buffers.init(arena, options.relay_buffers);
-            server.listeners = try arena.alloc(ListenerState, cfg.listeners.len);
-            server.listeners_count = @intCast(cfg.listeners.len);
-            server.endpoints_next = try arena.alloc(u64, cfg.clusters.len);
+            server.listeners = try arena.alloc(ListenerState, config.listeners.len);
+            server.listeners_count = @intCast(config.listeners.len);
+            server.endpoints_next = try arena.alloc(u64, config.clusters.len);
             @memset(server.endpoints_next, 0);
             server.counters = .{};
             server.draining = false;
@@ -89,7 +89,7 @@ pub fn Server(comptime IoType: type) type {
         pub fn start(server: *Self) Io.ListenError!void {
             assert(!server.draining);
             assert(server.listeners_count >= 1);
-            for (server.cfg.listeners, 0..) |listener_config, index| {
+            for (server.config.listeners, 0..) |listener_config, index| {
                 const state = &server.listeners[index];
                 state.* = .{
                     .server = server,
@@ -118,7 +118,7 @@ pub fn Server(comptime IoType: type) type {
             }
             server.io.timerStart(
                 &server.drain_deadline_completion,
-                @as(u64, server.cfg.drain_deadline_ms) * std.time.ns_per_ms,
+                @as(u64, server.config.drain_deadline_ms) * std.time.ns_per_ms,
                 Self,
                 server,
                 onDrainDeadline,
@@ -254,15 +254,15 @@ pub fn Server(comptime IoType: type) type {
             server.io.setNodelay(client_socket) catch {
                 server.counters.increment("kernel_pressure_errors");
             };
-            server.storeDeadline(conn, server.cfg.connect_timeout_ms);
+            server.storeDeadline(conn, server.config.connect_timeout_ms);
             server.armDeadline(conn);
             server.armConnect(conn, state.cluster_index);
         }
 
         fn armConnect(server: *Self, conn: *ConnType, cluster_index: u16) void {
             assert(conn.state == .connecting);
-            assert(cluster_index < server.cfg.clusters.len);
-            const cluster = &server.cfg.clusters[cluster_index];
+            assert(cluster_index < server.config.clusters.len);
+            const cluster = &server.config.clusters[cluster_index];
             const endpoint_index: usize =
                 @intCast(server.endpoints_next[cluster_index] % cluster.endpoints.len);
             server.endpoints_next[cluster_index] += 1;
@@ -300,7 +300,7 @@ pub fn Server(comptime IoType: type) type {
                 server.counters.increment("kernel_pressure_errors");
             };
             conn.state = .relaying;
-            server.storeDeadline(conn, server.cfg.idle_timeout_ms);
+            server.storeDeadline(conn, server.config.idle_timeout_ms);
             relay.Relay(IoType).start(server, conn);
         }
 
