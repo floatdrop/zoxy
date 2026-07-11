@@ -12,6 +12,11 @@ pub const Pool = @import("mem/Pool.zig").Pool;
 pub const RelayBuffer = @import("net/relay.zig").RelayBuffer;
 pub const Server = @import("Server.zig").Server;
 pub const shed = @import("shed.zig");
+/// Shared test-support harness pieces (used by server_test and the sim).
+pub const testing = struct {
+    pub const Origin = @import("testing/origin.zig").Origin;
+    pub const Mode = @import("testing/origin.zig").Mode;
+};
 
 test {
     _ = config;
@@ -23,6 +28,7 @@ test {
     _ = @import("mem/Pool.zig");
     _ = @import("net/Conn.zig");
     _ = @import("net/relay.zig");
+    _ = @import("testing/origin.zig");
     _ = @import("io/contract_test.zig");
     _ = @import("io/sim_io_test.zig");
     _ = @import("io/xev_smoke_test.zig");

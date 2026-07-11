@@ -13,10 +13,12 @@ const config_module = @import("config.zig");
 const Io = @import("io/Io.zig");
 const Server = @import("Server.zig").Server;
 const SimIo = @import("io/SimIo.zig");
+const origin_mod = @import("testing/origin.zig");
 
 const assert = std.debug.assert;
 
 const ServerSim = Server(SimIo);
+const Origin = origin_mod.Origin(SimIo);
 
 const echo_token = "proxied-echo-token-0123456789abc";
 
@@ -27,6 +29,10 @@ pub const Scenario = struct {
     clients: [4]Client,
     clients_count: u8,
     ended_count: u8 = 0,
+    /// A client to start from the origin's first accept (the drain-race
+    /// test); the shared Origin fires on_accept on every accept, so the
+    /// hook makes this one-shot.
+    pending_racer: ?*Client = null,
 
     fn clientEnded(scenario: *Scenario) void {
         scenario.ended_count += 1;
@@ -44,126 +50,12 @@ pub const Scenario = struct {
         }
         return count;
     }
-};
 
-/// A scripted origin: echoes every chunk back (strict recv → send →
-/// recv, like the proxy), closes on the client's FIN — or, in `reset`
-/// mode, answers the first chunk with an RST (misbehaving origin, §9).
-pub const Origin = struct {
-    io: *SimIo = undefined,
-    listener: SimIo.Listener = undefined,
-    accept_completion: SimIo.Completion = .{},
-    conns: [4]OriginConn = @splat(.{}),
-    conns_count: u8 = 0,
-    listening: bool = false,
-    mode: Mode = .echo,
-    /// Orchestration hook: start this client the moment the origin accepts
-    /// a proxied connection (i.e. once the proxy has fully admitted one).
-    on_accept_start: ?*Client = null,
-
-    const Mode = enum(u8) { echo, reset_on_first_chunk };
-
-    const OriginConn = struct {
-        origin: *Origin = undefined,
-        socket: SimIo.Socket = undefined,
-        recv_completion: SimIo.Completion = .{},
-        send_completion: SimIo.Completion = .{},
-        buffer: [64]u8 = undefined,
-        transfer_len: u32 = 0,
-        sent_len: u32 = 0,
-        done: bool = false,
-
-        fn armRecv(conn: *OriginConn) void {
-            conn.origin.io.recv(
-                conn.socket,
-                &conn.buffer,
-                &conn.recv_completion,
-                OriginConn,
-                conn,
-                onRecv,
-            );
-        }
-
-        fn onRecv(conn: *OriginConn, result: Io.RecvError!u32) void {
-            const received = result catch {
-                conn.origin.io.closeNow(conn.socket);
-                conn.done = true;
-                return;
-            };
-            assert(received >= 1);
-            if (conn.origin.mode == .reset_on_first_chunk) {
-                conn.origin.io.setLingerRst(conn.socket) catch unreachable;
-                conn.origin.io.closeNow(conn.socket);
-                conn.done = true;
-                return;
-            }
-            conn.transfer_len = received;
-            conn.sent_len = 0;
-            conn.armSend();
-        }
-
-        fn armSend(conn: *OriginConn) void {
-            assert(conn.sent_len < conn.transfer_len);
-            conn.origin.io.send(
-                conn.socket,
-                conn.buffer[conn.sent_len..conn.transfer_len],
-                &conn.send_completion,
-                OriginConn,
-                conn,
-                onSend,
-            );
-        }
-
-        fn onSend(conn: *OriginConn, result: Io.SendError!u32) void {
-            const sent = result catch {
-                conn.origin.io.closeNow(conn.socket);
-                conn.done = true;
-                return;
-            };
-            conn.sent_len += sent;
-            assert(conn.sent_len <= conn.transfer_len);
-            if (conn.sent_len < conn.transfer_len) {
-                conn.armSend();
-            } else {
-                conn.armRecv();
-            }
-        }
-    };
-
-    fn start(origin: *Origin, io: *SimIo, address: std.Io.net.IpAddress) !void {
-        origin.io = io;
-        origin.listener = try io.listen(address);
-        origin.listening = true;
-        origin.armAccept();
-    }
-
-    fn armAccept(origin: *Origin) void {
-        origin.io.accept(origin.listener, &origin.accept_completion, Origin, origin, onAccept);
-    }
-
-    fn onAccept(origin: *Origin, result: Io.AcceptError!SimIo.Socket) void {
-        const socket = result catch |err| {
-            assert(err == error.Canceled);
-            return;
-        };
-        assert(origin.conns_count < origin.conns.len);
-        const conn = &origin.conns[origin.conns_count];
-        origin.conns_count += 1;
-        conn.origin = origin;
-        conn.socket = socket;
-        conn.armRecv();
-        if (origin.on_accept_start) |pending_client| {
-            origin.on_accept_start = null;
-            const scenario: *Scenario = @fieldParentPtr("origin", origin);
-            pending_client.start(scenario, TestBed.bindAddress());
-        }
-        origin.armAccept();
-    }
-
-    fn stopListening(origin: *Origin) void {
-        if (origin.listening) {
-            origin.io.listenClose(origin.listener);
-            origin.listening = false;
+    fn startPendingRacer(context: ?*anyopaque) void {
+        const scenario: *Scenario = @ptrCast(@alignCast(context.?));
+        if (scenario.pending_racer) |racer| {
+            scenario.pending_racer = null;
+            racer.start(scenario, TestBed.bindAddress());
         }
     }
 };
@@ -343,6 +235,8 @@ pub const TestBed = struct {
             .clients = @splat(.{}),
             .clients_count = 0,
         };
+        bed.scenario.origin.on_accept = Scenario.startPendingRacer;
+        bed.scenario.origin.context = &bed.scenario;
         if (options.origin_listens) {
             try bed.scenario.origin.start(&bed.sim_io, originAddress());
         }
@@ -490,7 +384,7 @@ test "drain: an accept that raced the drain is shed quietly and witnessed" {
     const holder = &bed.scenario.clients[0];
     const racer = &bed.scenario.clients[1];
     racer.drain_on_connect = true;
-    bed.scenario.origin.on_accept_start = racer;
+    bed.scenario.pending_racer = racer;
     holder.start(&bed.scenario, TestBed.bindAddress());
     try bed.sim_io.run();
 
