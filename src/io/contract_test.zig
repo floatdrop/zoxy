@@ -6,7 +6,7 @@
 
 const std = @import("std");
 
-const Io = @import("Io.zig");
+const Io = @import("io.zig");
 const SimIo = @import("SimIo.zig");
 const XevIo = @import("XevIo.zig");
 

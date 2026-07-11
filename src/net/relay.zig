@@ -10,7 +10,7 @@ const std = @import("std");
 
 const constants = @import("../constants.zig");
 const conn_module = @import("Conn.zig");
-const Io = @import("../io/Io.zig");
+const Io = @import("../io/io.zig");
 
 const assert = std.debug.assert;
 
@@ -102,7 +102,7 @@ pub fn Relay(comptime IoType: type) type {
                     // direction relaying under the deadline.
                     state.phase = .finished;
                     server.io.shutdown(targetSocket(conn, direction), .write);
-                    server.storeDeadline(conn, server.cfg.idle_timeout_ms);
+                    server.storeDeadline(conn, server.config.idle_timeout_ms);
                     maybeFinish(server, conn);
                     return;
                 }
@@ -142,7 +142,7 @@ pub fn Relay(comptime IoType: type) type {
             } else {
                 // A full exchange moved: this is activity — push the idle
                 // deadline out (§6); the armed timer op is not touched.
-                server.storeDeadline(conn, server.cfg.idle_timeout_ms);
+                server.storeDeadline(conn, server.config.idle_timeout_ms);
                 armRecv(server, conn, direction);
             }
         }

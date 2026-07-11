@@ -36,17 +36,17 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("zoxy: cannot read config '{s}': {t}\n", .{ args[1], err });
         return err;
     };
-    const cfg = zoxy.config.parse(arena, config_bytes) catch |err| {
+    const config = zoxy.config.parse(arena, config_bytes) catch |err| {
         std.debug.print("zoxy: invalid config '{s}': {t}\n", .{ args[1], err });
         return err;
     };
 
     try ensureFdBudget();
-    try printBudgets(init.io, &cfg);
+    try printBudgets(init.io, &config);
 
     try global_io.init(arena);
     var server: ServerXev = undefined;
-    try server.init(arena, &global_io, &cfg, .{});
+    try server.init(arena, &global_io, &config, .{});
     try server.start();
     installSignalHandlers();
 
@@ -74,7 +74,7 @@ fn ensureFdBudget() !void {
     try std.posix.setrlimit(.NOFILE, limits);
 }
 
-fn printBudgets(io: std.Io, cfg: *const zoxy.config.Config) !void {
+fn printBudgets(io: std.Io, config: *const zoxy.config.Config) !void {
     const constants = zoxy.constants;
     const memory_total = constants.memoryBytesTotal(
         @sizeOf(ServerXev.ConnType),
@@ -100,8 +100,8 @@ fn printBudgets(io: std.Io, cfg: *const zoxy.config.Config) !void {
         constants.ring_entries,
         constants.completion_queue_entries,
         constants.in_flight_ops_max,
-        cfg.listeners.len,
-        cfg.clusters.len,
+        config.listeners.len,
+        config.clusters.len,
     });
     try writer.flush();
 }

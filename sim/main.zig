@@ -109,7 +109,7 @@ const Harness = struct {
     endpoints: [1]std.Io.net.IpAddress,
     clusters: [1]zoxy.config.Config.Cluster,
     listener_configs: [1]zoxy.config.Config.Listener,
-    cfg: zoxy.config.Config,
+    config: zoxy.config.Config,
     origin: Origin,
     clients: [clients_max]Client,
     clients_count: u8,
@@ -142,7 +142,7 @@ const Harness = struct {
         harness.endpoints = .{originAddress()};
         harness.clusters = .{.{ .name = "origin", .endpoints = &harness.endpoints }};
         harness.listener_configs = .{.{ .bind_address = bindAddress(), .cluster_index = 0 }};
-        harness.cfg = .{
+        harness.config = .{
             .listeners = &harness.listener_configs,
             .clusters = &harness.clusters,
             .connect_timeout_ms = 20 + random.uintAtMost(u32, 40),
@@ -156,7 +156,7 @@ const Harness = struct {
             .{ .conn_slots = 1 + random.uintLessThan(u32, 2), .relay_buffers = 1 }
         else
             .{ .conn_slots = 2 * clients_max, .relay_buffers = clients_max };
-        try harness.server.init(arena, &harness.io, &harness.cfg, options);
+        try harness.server.init(arena, &harness.io, &harness.config, options);
         try harness.server.start();
 
         harness.origin = .{

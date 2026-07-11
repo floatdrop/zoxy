@@ -13,7 +13,7 @@ const std = @import("std");
 const xev = @import("xev");
 
 const constants = @import("../constants.zig");
-const Io = @import("Io.zig");
+const Io = @import("io.zig");
 
 const assert = std.debug.assert;
 const linux = std.os.linux;
