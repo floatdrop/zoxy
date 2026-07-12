@@ -81,12 +81,20 @@ pub fn init(io: *XevIo, arena: std.mem.Allocator) !void {
         .entries = constants.ring_entries,
         .io_uring_flags = fast_ring_flags,
         .thread_pool = if (comptime close_needs_thread_pool) &io.thread_pool else null,
-    }) catch |err| switch (err) {
-        error.ArgumentsInvalid => try xev.Loop.init(.{
-            .entries = constants.ring_entries,
-            .thread_pool = if (comptime close_needs_thread_pool) &io.thread_pool else null,
-        }),
-        else => return err,
+    }) catch |err| retry: {
+        // Only the io_uring backend rejects these setup flags
+        // (EINVAL -> ArgumentsInvalid on kernels < 6.1). On other
+        // backends fast_ring_flags is 0 and Loop.init's error set has
+        // no ArgumentsInvalid member, so this prong must be pruned at
+        // comptime rather than referenced unconditionally.
+        if (comptime xev.backend == .io_uring) switch (err) {
+            error.ArgumentsInvalid => break :retry try xev.Loop.init(.{
+                .entries = constants.ring_entries,
+                .thread_pool = if (comptime close_needs_thread_pool) &io.thread_pool else null,
+            }),
+            else => {},
+        };
+        return err;
     };
     errdefer io.loop.deinit();
     io.notifier = try xev.Async.init();
