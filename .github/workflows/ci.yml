@@ -50,3 +50,29 @@ jobs:
       # at merge, not a blind shared-runner pass.
       - name: Run gates (test + lint + sim)
         run: devenv shell -- zig build ci --summary all
+
+  coverage:
+    name: coverage
+    # kcov is Linux-only (devenv.nix); the merged report is the unit tests
+    # plus a simulator sweep, which reaches error paths unit tests cannot.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Install devenv
+        run: nix profile install nixpkgs#devenv
+
+      - name: Measure coverage (kcov)
+        run: devenv shell -- zig build coverage
+
+      - name: Upload to Coveralls
+        uses: coverallsapp/github-action@v2
+        with:
+          file: zig-out/coverage/kcov-merged/cobertura.xml
+          format: cobertura

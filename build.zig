@@ -153,4 +153,76 @@ pub fn build(b: *std.Build) void {
     ci_step.dependOn(test_step);
     ci_step.dependOn(lint_step);
     ci_step.dependOn(sim_step);
+
+    // Line coverage via kcov (Linux-only, in the dev shell): the unit-test
+    // binary plus a simulator sweep, merged — the simulator reaches error
+    // paths and race interleavings unit tests cannot.
+    //
+    // Gotcha: kcov 43 cannot read the DWARF line tables the self-hosted
+    // x86_64 Debug backend emits (0 lines found), so both binaries are built
+    // through the LLVM backend (use_llvm = true). The build graph wires the
+    // module imports (xev, example_config) that a hand-rolled `zig test`
+    // could not resolve.
+    const cov_tests = b.addTest(.{
+        .name = "coverage-tests",
+        .root_module = zoxy_module,
+        .use_llvm = true,
+    });
+    const cov_sim = b.addExecutable(.{
+        .name = "coverage-sim",
+        .use_llvm = true,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("sim/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zoxy", .module = zoxy_module },
+            },
+        }),
+    });
+
+    // Absolute src root: kcov filters recorded files by this prefix, and the
+    // cobertura patch below rewrites it back to the repo-relative "src".
+    const src_abs = b.path("src").getPath(b);
+    const include_arg = b.fmt("--include-path={s}", .{src_abs});
+
+    const kcov_tests = b.addSystemCommand(&.{"kcov"});
+    kcov_tests.addArg(include_arg);
+    const tests_cov = kcov_tests.addOutputDirectoryArg("cov-tests");
+    kcov_tests.addArtifactArg(cov_tests);
+
+    const kcov_sim = b.addSystemCommand(&.{"kcov"});
+    kcov_sim.addArg(include_arg);
+    const sim_cov = kcov_sim.addOutputDirectoryArg("cov-sim");
+    kcov_sim.addArtifactArg(cov_sim);
+    kcov_sim.addArgs(&.{ "0", "150" });
+
+    const kcov_merge = b.addSystemCommand(&.{ "kcov", "--merge" });
+    const merged_cov = kcov_merge.addOutputDirectoryArg("cov-merged");
+    kcov_merge.addDirectoryArg(tests_cov);
+    kcov_merge.addDirectoryArg(sim_cov);
+
+    // kcov writes an absolute <source> root; Coveralls resolves each file by
+    // joining source + filename before fetching from GitHub, so the root must
+    // be repo-relative or every file reads "source not available".
+    const patch_cov = b.addSystemCommand(&.{
+        "sed",
+        "-i",
+        // kcov appends a trailing slash to the source root; `/*` absorbs it.
+        b.fmt("s|<source>{s}/*</source>|<source>src</source>|", .{src_abs}),
+    });
+    patch_cov.addFileArg(merged_cov.path(b, "kcov-merged/cobertura.xml"));
+
+    const install_cov = b.addInstallDirectory(.{
+        .source_dir = merged_cov,
+        .install_dir = .{ .custom = "coverage" },
+        .install_subdir = "",
+    });
+    install_cov.step.dependOn(&patch_cov.step);
+
+    const cov_step = b.step(
+        "coverage",
+        "Line coverage via kcov (Linux): unit tests + sim, merged to zig-out/coverage",
+    );
+    cov_step.dependOn(&install_cov.step);
 }
