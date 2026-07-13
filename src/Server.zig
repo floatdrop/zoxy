@@ -37,6 +37,11 @@ pub fn Server(comptime IoType: type) type {
         endpoints_next: []u64,
         counters: counters_module.Counters,
         draining: bool,
+        /// §8 watermark state for the relay-buffer pool: set once the pool
+        /// crosses its high watermark, cleared once it drains back below
+        /// the low one (hysteresis). Biases idle timeouts shorter so quiet
+        /// connections return their buffers before the wall is reached.
+        relay_pressure: bool,
         drain_deadline_completion: IoType.Completion,
 
         const Self = @This();
@@ -83,6 +88,7 @@ pub fn Server(comptime IoType: type) type {
             @memset(server.endpoints_next, 0);
             server.counters = .{};
             server.draining = false;
+            server.relay_pressure = false;
             server.drain_deadline_completion = .{};
         }
 
@@ -250,6 +256,7 @@ pub fn Server(comptime IoType: type) type {
                 return;
             };
             server.counters.increment("admitted");
+            server.updateRelayPressure();
             conn.prepare(server, client_socket, buffer);
             server.io.setNodelay(client_socket) catch {
                 server.counters.increment("kernel_pressure_errors");
@@ -300,7 +307,7 @@ pub fn Server(comptime IoType: type) type {
                 server.counters.increment("kernel_pressure_errors");
             };
             conn.state = .relaying;
-            server.storeDeadline(conn, server.config.idle_timeout_ms);
+            server.storeDeadline(conn, server.idleTimeoutMs());
             relay.Relay(IoType).start(server, conn);
         }
 
@@ -379,9 +386,40 @@ pub fn Server(comptime IoType: type) type {
             if (conn.state != .closing) return;
             if (conn.armedCount() != 0) return;
             server.relay_buffers.release(conn.relay_buffer);
+            server.updateRelayPressure();
             server.conns.release(conn);
             server.counters.increment("completed");
             server.maybeStopAfterDrain();
+        }
+
+        /// §8 watermarks before walls: recompute the relay-buffer pressure
+        /// flag with hysteresis after every acquire/release. The engage
+        /// crossing is witnessed; the wall (admit-time shed) still backs it
+        /// up if pressure fails to relieve the load in time.
+        fn updateRelayPressure(server: *Self) void {
+            const held = server.relay_buffers.acquired_count;
+            const capacity: u32 = @intCast(server.relay_buffers.slots.len);
+            if (server.relay_pressure) {
+                if (held <= constants.relayPressureOff(capacity)) {
+                    server.relay_pressure = false;
+                }
+            } else if (held >= constants.relayPressureOn(capacity)) {
+                server.relay_pressure = true;
+                server.counters.increment("relay_pressure_engaged");
+            }
+        }
+
+        /// The idle timeout to apply now, shortened under relay-buffer
+        /// pressure so quiet connections return their buffers sooner (§8).
+        /// Only the idle deadline is biased — the connect deadline is a
+        /// correctness bound and stays fixed. Because a timer never moves
+        /// *earlier* once armed (§4), this reaches a connection at its next
+        /// deadline store (activity or half-close), not retroactively; the
+        /// admit-time wall covers connections that never transact again.
+        pub fn idleTimeoutMs(server: *const Self) u32 {
+            const configured = server.config.idle_timeout_ms;
+            if (!server.relay_pressure) return configured;
+            return @max(configured / constants.relay_pressure_idle_divisor, 1);
         }
 
         /// Public for the relay: activity pushes the idle deadline out;

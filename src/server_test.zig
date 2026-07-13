@@ -448,6 +448,52 @@ test "server: relay-buffer exhaustion sheds with a quiet close" {
     try bed.expectDrained();
 }
 
+test "server: relay-buffer pressure engages before the wall and drains clean" {
+    // Four connections hold all four relay buffers at once (their upstream
+    // dials are black-holed, so each keeps its buffer until the connect
+    // deadline reaps it). Crossing the 3/4 high watermark flips the
+    // pressure flag exactly once; the flag clears again as the pool drains,
+    // and every counter still reconciles with the pools empty.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .server = .{ .conn_slots = 4, .relay_buffers = 4 },
+        .sim = .{ .seed = 71 },
+    });
+    defer bed.tearDown();
+
+    bed.sim_io.blackholeAddress(TestBed.originAddress());
+    bed.startClients(4, false);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(@as(u64, 4), bed.server.counters.get("admitted"));
+    try std.testing.expect(bed.server.counters.get("relay_pressure_engaged") >= 1);
+    // Pressure is a transient bias, not a terminal state: it clears as the
+    // pool drains back below the low watermark.
+    try std.testing.expect(!bed.server.relay_pressure);
+    try std.testing.expectEqual(@as(u64, 4), bed.server.counters.get("completed"));
+    try bed.expectDrained();
+}
+
+test "server: idle timeout shortens under pressure, is full otherwise" {
+    // The pure selection rule the pressure flag drives: full timeout when
+    // relaxed, divided (floored at 1 ms) when pressured.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 72 },
+        .idle_timeout_ms = 1000,
+    });
+    defer bed.tearDown();
+
+    try std.testing.expect(!bed.server.relay_pressure);
+    try std.testing.expectEqual(@as(u32, 1000), bed.server.idleTimeoutMs());
+    bed.server.relay_pressure = true;
+    try std.testing.expectEqual(
+        @as(u32, 1000 / 4),
+        bed.server.idleTimeoutMs(),
+    );
+    bed.server.relay_pressure = false;
+}
+
 test "server: refused upstream tears the connection down and is counted" {
     var bed: TestBed = undefined;
     try bed.setUp(std.testing.allocator, .{

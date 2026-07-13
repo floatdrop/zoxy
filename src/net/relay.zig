@@ -102,7 +102,7 @@ pub fn Relay(comptime IoType: type) type {
                     // direction relaying under the deadline.
                     state.phase = .finished;
                     server.io.shutdown(targetSocket(conn, direction), .write);
-                    server.storeDeadline(conn, server.config.idle_timeout_ms);
+                    server.storeDeadline(conn, server.idleTimeoutMs());
                     maybeFinish(server, conn);
                     return;
                 }
@@ -142,7 +142,7 @@ pub fn Relay(comptime IoType: type) type {
             } else {
                 // A full exchange moved: this is activity — push the idle
                 // deadline out (§6); the armed timer op is not touched.
-                server.storeDeadline(conn, server.config.idle_timeout_ms);
+                server.storeDeadline(conn, server.idleTimeoutMs());
                 armRecv(server, conn, direction);
             }
         }

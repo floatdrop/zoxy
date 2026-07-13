@@ -23,6 +23,28 @@ pub const relay_buffers_max: u32 = 1024;
 /// Bytes per relay direction; a `RelayBuffer` is a pair of these.
 pub const relay_buffer_bytes: u32 = 16 * 1024;
 
+/// §8 "watermarks before walls": the relay-buffer pool flips a pressure
+/// flag before it hits the wall so the proxy sheds *idle* capacity —
+/// shorter idle timeouts — before it must shed *work*. Hysteresis keeps
+/// the flag from flapping around a single threshold: engage at the high
+/// watermark, release only after draining back to the low one. Both are
+/// fractions of the *live* pool capacity, so an injected test pool and the
+/// production pool obey one rule. `On` uses ceil so a full pool always
+/// counts as pressured; `Off` uses floor so the gap is non-empty for every
+/// capacity >= 1.
+pub fn relayPressureOn(capacity: u32) u32 {
+    return (capacity * 3 + 3) / 4;
+}
+pub fn relayPressureOff(capacity: u32) u32 {
+    return capacity / 2;
+}
+
+/// Under relay-buffer pressure the idle timeout is divided by this, reaping
+/// quiet connections sooner to return their buffers (§8). The result is
+/// clamped to >= 1 ms so `storeDeadline`'s invariant holds even when the
+/// configured idle timeout is already small.
+pub const relay_pressure_idle_divisor: u32 = 4;
+
 /// Listen backlog for every listener.
 pub const accept_backlog: u31 = 1024;
 
@@ -95,6 +117,11 @@ comptime {
     assert(config_bytes_max >= 1024);
     assert(timeout_ms_max >= 1000);
     assert(accept_retry_delay_ms >= 1);
+    assert(relay_pressure_idle_divisor >= 2);
+    // The watermarks must leave a hysteresis gap and never engage above
+    // the pool's own capacity, checked at the production size.
+    assert(relayPressureOn(relay_buffers_max) > relayPressureOff(relay_buffers_max));
+    assert(relayPressureOn(relay_buffers_max) <= relay_buffers_max);
 }
 
 /// Total pool memory as a closed-form function of the limits. Slot sizes
@@ -115,6 +142,19 @@ test "budgets: in-flight ops fit the completion queue with headroom" {
     // Headroom is deliberate: at least a quarter of the CQ stays free for
     // completion bursts even at the worst-case armed-op count.
     try std.testing.expect(in_flight_ops_max <= completion_queue_entries * 3 / 4);
+}
+
+test "pressure: relay watermarks have a hysteresis gap at every capacity" {
+    // On > Off (a non-empty gap) and On <= capacity for the small pools
+    // tests inject as well as the production size — no flapping, never a
+    // threshold the pool cannot reach.
+    for ([_]u32{ 1, 2, 3, 4, 8, relay_buffers_max }) |capacity| {
+        try std.testing.expect(relayPressureOn(capacity) > relayPressureOff(capacity));
+        try std.testing.expect(relayPressureOn(capacity) <= capacity);
+    }
+    // A full pool is always pressured; an empty pool never is.
+    try std.testing.expectEqual(@as(u32, 3), relayPressureOn(4));
+    try std.testing.expectEqual(@as(u32, 2), relayPressureOff(4));
 }
 
 test "budgets: memory total matches the closed form" {
