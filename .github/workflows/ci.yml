@@ -35,19 +35,14 @@ jobs:
           nix_conf: |
             experimental-features = nix-command flakes
 
-      # Restore /nix/store across runs, keyed on the pinned toolchain
-      # (devenv.lock) plus the shell definition. On a hit the devenv install
-      # and the zig toolchain the first `devenv shell` would build are served
-      # from cache instead of rebuilt/re-downloaded — the macOS bottleneck.
-      - name: Cache Nix store
-        uses: nix-community/cache-nix-action@v7
-        with:
-          primary-key: nix-v2-${{ runner.os }}-${{ hashFiles('devenv.nix', 'devenv.lock', 'devenv.yaml') }}
-          restore-prefixes-first-match: nix-v2-${{ runner.os }}-
-
       # Serve prebuilt devenv from the public binary cache instead of
-      # building it from source (the macOS `nix profile install` was the
-      # single slowest step on a cold store). Pull-only: no auth token.
+      # building it from source — the macOS `nix profile install` was the
+      # single slowest step (3m37s → ~30s). Pull-only: no auth token.
+      #
+      # A /nix/store cache (cache-nix-action) was measured and dropped: on
+      # macOS restoring the ~950 MB store took longer than the install it
+      # replaced (net slower), and on Linux it was a wash — the fast
+      # single-user install plus this cache already do the work.
       - name: Set up devenv binary cache
         uses: cachix/cachix-action@v15
         with:
@@ -87,12 +82,6 @@ jobs:
         with:
           nix_conf: |
             experimental-features = nix-command flakes
-
-      - name: Cache Nix store
-        uses: nix-community/cache-nix-action@v7
-        with:
-          primary-key: nix-v2-${{ runner.os }}-${{ hashFiles('devenv.nix', 'devenv.lock', 'devenv.yaml') }}
-          restore-prefixes-first-match: nix-v2-${{ runner.os }}-
 
       - name: Set up devenv binary cache
         uses: cachix/cachix-action@v15
