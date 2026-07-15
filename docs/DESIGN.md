@@ -304,17 +304,23 @@ unmerged behind it, so the pin moves only after re-audit.
 - **Plain ops only, at first.** Multishot accept/recv, buffer rings,
   `send_zc`, `splice` are deferred optimizations behind measurement — the
   previous iteration never became CPU-bound without them.
-- **Measured libxev-fork target: CQE reaping.** The pinned `zig build
-  profile` (§9) shows that once CPU-bound (~100k req/s loopback), libxev's
-  `copy_cqes` — `memcpy`-ing completions out of the io_uring CQ into a stack
-  array before dispatch — is the largest userspace cost after the loop body
-  (~17% of on-CPU cycles, the second-hottest symbol). Reaping CQEs in place
-  is the first fork optimization to reach for; deferred behind the same gate
-  as the op upgrades — it must dominate a *real* workload, not just a
-  loopback microbench, before the pin moves (§4 re-audit). The clock read on
-  the same path was the cheap win taken first: the idle-deadline refresh used
-  `CLOCK_MONOTONIC`, ~7% of on-CPU, cut to <1% by reading the coarse clock in
-  `XevIo.nowNs` (every deadline here is second-scale) — no fork change.
+- **Profiled and shelved: CQE reaping.** The pinned `zig build profile` (§9)
+  flags libxev's `copy_cqes` — `memcpy`-ing completions out of the io_uring CQ
+  into a stack array before dispatch — as ~17% of on-CPU under load (~100k
+  req/s loopback), the second-hottest symbol. Reaping in place (liburing's
+  `io_uring_for_each_cqe`: peek `cq.head` → acquire-loaded `tail`, invoke from
+  ring memory, `cq_advance` once) is a ~25-line fork change and passes libxev's
+  suite — but an A/B at a fixed ~99.8k req/s measured **no win**: total on-CPU
+  samples held at ~74k either way, the `memcpy` symbol vanishing only to
+  reappear inlined in the loop body. The 17% was an attribution artifact — the
+  `memcpy` call/setup plus the unavoidable per-CQE touch, not removable copy
+  work — so the pin stays put; a §4 re-audit is not spent on a non-win.
+  Revisit only under genuine CPU saturation with large CQE batches, never
+  loopback. Recorded so the profiler's headline symbol is not re-chased. The
+  clock read on the same path *was* a real cheap win: the idle-deadline
+  refresh used `CLOCK_MONOTONIC` (~7% of on-CPU), cut to <1% by reading the
+  coarse clock in `XevIo.nowNs` (every deadline here is second-scale) — no
+  fork change.
 
 ## 5. Memory — shared pools, fixed at startup
 
