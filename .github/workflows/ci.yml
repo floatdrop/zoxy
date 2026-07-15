@@ -84,6 +84,22 @@ jobs:
           nix_conf: |
             experimental-features = nix-command flakes
 
+      # Persist /nix/store across runs so the realised nixpkgs bootstrap paths
+      # — including the `ldexpl.c` source that devenv 2.x's shell-eval IFD
+      # flakily re-substitutes from cache.nixos.org — survive between runs.
+      # That kills the intermittent `path '...ldexpl.c' is not valid` coverage
+      # failure at its root (a restored path is already valid) and skips the
+      # re-fetch, so the job gets faster, not slower. Coverage-only: Linux +
+      # single-user Nix (nix-quick-install-action), where restore works — the
+      # daemon install's permission problem that broke it is gone. Keyed on
+      # devenv.lock (the nixpkgs pin that fixes the bootstrap paths); the prefix
+      # restores the newest store on a miss so the bootstrap survives a bump.
+      - name: Cache Nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-coverage-v1-${{ hashFiles('devenv.lock') }}
+          restore-prefixes-first-match: nix-coverage-v1-
+
       - name: Set up devenv binary cache
         uses: cachix/cachix-action@v17
         with:
