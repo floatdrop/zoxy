@@ -25,14 +25,33 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # The same pinned toolchain as local dev (devenv.nix: zig_0_16),
-      # resolved through devenv.lock and served by the Nix binary cache.
       - name: Install Nix
         uses: cachix/install-nix-action@v30
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
+      # Restore /nix/store across runs, keyed on the pinned toolchain
+      # (devenv.lock) plus the shell definition. On a hit the devenv install
+      # and the zig toolchain the first `devenv shell` would build are served
+      # from cache instead of rebuilt/re-downloaded — the macOS bottleneck.
+      - name: Cache Nix store
+        uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('devenv.nix', 'devenv.lock', 'devenv.yaml') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+
+      # Serve prebuilt devenv from the public binary cache instead of
+      # building it from source (the macOS `nix profile install` was the
+      # single slowest step). Pull-only: no auth token, no push.
+      - name: Set up devenv binary cache
+        uses: cachix/cachix-action@v15
+        with:
+          name: devenv
+          skipPush: true
+
+      # The same pinned toolchain as local dev (devenv.nix: zig_0_16),
+      # resolved through devenv.lock and served by the Nix binary cache.
       - name: Install devenv
         run: nix profile install nixpkgs#devenv
 
@@ -64,6 +83,18 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
+
+      - name: Cache Nix store
+        uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('devenv.nix', 'devenv.lock', 'devenv.yaml') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+
+      - name: Set up devenv binary cache
+        uses: cachix/cachix-action@v15
+        with:
+          name: devenv
+          skipPush: true
 
       - name: Install devenv
         run: nix profile install nixpkgs#devenv
