@@ -44,7 +44,7 @@ jobs:
       # replaced (net slower), and on Linux it was a wash — the fast
       # single-user install plus this cache already do the work.
       - name: Set up devenv binary cache
-        uses: cachix/cachix-action@v15
+        uses: cachix/cachix-action@v17
         with:
           name: devenv
           skipPush: true
@@ -84,7 +84,7 @@ jobs:
             experimental-features = nix-command flakes
 
       - name: Set up devenv binary cache
-        uses: cachix/cachix-action@v15
+        uses: cachix/cachix-action@v17
         with:
           name: devenv
           skipPush: true
