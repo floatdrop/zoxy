@@ -25,14 +25,32 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # The same pinned toolchain as local dev (devenv.nix: zig_0_16),
-      # resolved through devenv.lock and served by the Nix binary cache.
+      # Single-user install (the runner owns /nix), which cache-nix-action
+      # requires: the daemon install cachix/install-nix-action does leaves
+      # /nix root-owned, so restoring the store as the runner fails with
+      # "Cannot mkdir: Permission denied" and silently degrades to a miss.
       - name: Install Nix
-        uses: cachix/install-nix-action@v30
+        uses: nixbuild/nix-quick-install-action@v35
         with:
-          extra_nix_config: |
+          nix_conf: |
             experimental-features = nix-command flakes
 
+      # Serve prebuilt devenv from the public binary cache instead of
+      # building it from source — the macOS `nix profile install` was the
+      # single slowest step (3m37s → ~30s). Pull-only: no auth token.
+      #
+      # A /nix/store cache (cache-nix-action) was measured and dropped: on
+      # macOS restoring the ~950 MB store took longer than the install it
+      # replaced (net slower), and on Linux it was a wash — the fast
+      # single-user install plus this cache already do the work.
+      - name: Set up devenv binary cache
+        uses: cachix/cachix-action@v15
+        with:
+          name: devenv
+          skipPush: true
+
+      # The same pinned toolchain as local dev (devenv.nix: zig_0_16),
+      # resolved through devenv.lock and served by the Nix binary cache.
       - name: Install devenv
         run: nix profile install nixpkgs#devenv
 
@@ -60,10 +78,16 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v30
+        uses: nixbuild/nix-quick-install-action@v35
         with:
-          extra_nix_config: |
+          nix_conf: |
             experimental-features = nix-command flakes
+
+      - name: Set up devenv binary cache
+        uses: cachix/cachix-action@v15
+        with:
+          name: devenv
+          skipPush: true
 
       - name: Install devenv
         run: nix profile install nixpkgs#devenv
