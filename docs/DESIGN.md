@@ -13,6 +13,10 @@ L7-only, share-nothing, thread-per-core proxy directly on `io_uring`; its
 measured lessons are carried forward here (§2) and its dead ends are not
 revisited.
 
+This document is the settled design. Phasing and future work live in
+[`PLANS.md`](PLANS.md); measured findings and shelved experiments in
+[`IMPLEMENTATION_NOTES.md`](IMPLEMENTATION_NOTES.md).
+
 ---
 
 ## 1. Goals and non-goals
@@ -46,7 +50,7 @@ Non-goals (deliberate, recorded so they are decisions rather than drift):
   when they do).
 - Config reload. Config is parse-once immutable (§5); a change is a
   process restart — consistent with process-per-port scale-out (§3). Hot
-  restart / drain-to-successor stays deferred (§10).
+  restart / drain-to-successor stays deferred ([PLANS.md](PLANS.md)).
 - Dynamic DNS for upstreams. Cluster endpoints are static socket
   addresses resolved once at config load (§7); re-resolution waits for a
   demonstrated need.
@@ -236,7 +240,7 @@ takes its recorded exceptions here, and both are pure Zig, vendored by
 content hash in `build.zig.zon`: **libxev** (this section) and **hparse**
 (the HTTP/1.1 head parser — as a hardened fork, §7). No C-FFI dependency
 exists in the codebase; any future one (a TLS stack is the known
-candidate, §10 Phase 3) is a
+Phase-3 candidate — [PLANS.md](PLANS.md)) is a
 separate deliberate decision, not a default. The pinned hash is an
 *audited commit*, never a branch tip — libxev's Zig 0.16 support is a
 self-described compatibility shim (PR #220) with real fixes still
@@ -254,6 +258,15 @@ unmerged behind it, so the pin moves only after re-audit.
   which live in pool slots — so the no-unbounded-queue rule holds by
   construction. The in-flight op budget that keeps CQ overflow
   unreachable is part of the startup printout (§8).
+- **Ring setup flags.** The ring is created with `SINGLE_ISSUER`,
+  `COOP_TASKRUN`, and `DEFER_TASKRUN`: completion task-work stays on
+  the loop thread and is batched at the reap point instead of
+  interrupting it. Sound by construction here — the loop thread is the
+  only submitter (§3), and the loop always enters the kernel waiting
+  (GETEVENTS), which is where deferred task-work is flushed. Kernels
+  older than 6.1 reject the flags with EINVAL; startup degrades to a
+  plain ring rather than refuse to start. (Measured win:
+  `IMPLEMENTATION_NOTES.md`.)
 - **Backend selection.** Production: `io_uring` (Linux ≥ 5.11). Dev box:
   kqueue (macOS) — same API, same callbacks, so day-to-day development
   does not need a VM. Correctness claims are only made for Linux.
@@ -288,7 +301,10 @@ unmerged behind it, so the pin moves only after re-audit.
   callback inline.
 - **Clock.** `Io.now_ns` is refreshed once per loop tick (the previous
   iteration measured per-callback `clock_gettime` at ~3% of data-path CPU)
-  and is the seam the simulator's virtual clock replaces. Anything
+  and is the seam the simulator's virtual clock replaces. The refresh
+  reads the *coarse* monotonic clock — every consumer is a second-scale
+  deadline, and the precise read was measured at ~7% of on-CPU
+  (`IMPLEMENTATION_NOTES.md`). Anything
   computed from it may be stale by up to one tick's completion batch —
   deadline logic must stay correct under that bound, and the simulator
   makes the staleness adversarial (§9).
@@ -301,26 +317,12 @@ unmerged behind it, so the pin moves only after re-audit.
   **Teardown is the one place a timer is canceled** (§5 release rule).
   libxev cancellation is internally cancel+resubmit and consumes its own
   caller-owned completion, embedded in the slot like every other op.
-- **Plain ops only, at first.** Multishot accept/recv, buffer rings,
-  `send_zc`, `splice` are deferred optimizations behind measurement — the
-  previous iteration never became CPU-bound without them.
-- **Profiled and shelved: CQE reaping.** The pinned `zig build profile` (§9)
-  flags libxev's `copy_cqes` — `memcpy`-ing completions out of the io_uring CQ
-  into a stack array before dispatch — as ~17% of on-CPU under load (~100k
-  req/s loopback), the second-hottest symbol. Reaping in place (liburing's
-  `io_uring_for_each_cqe`: peek `cq.head` → acquire-loaded `tail`, invoke from
-  ring memory, `cq_advance` once) is a ~25-line fork change and passes libxev's
-  suite — but an A/B at a fixed ~99.8k req/s measured **no win**: total on-CPU
-  samples held at ~74k either way, the `memcpy` symbol vanishing only to
-  reappear inlined in the loop body. The 17% was an attribution artifact — the
-  `memcpy` call/setup plus the unavoidable per-CQE touch, not removable copy
-  work — so the pin stays put; a §4 re-audit is not spent on a non-win.
-  Revisit only under genuine CPU saturation with large CQE batches, never
-  loopback. Recorded so the profiler's headline symbol is not re-chased. The
-  clock read on the same path *was* a real cheap win: the idle-deadline
-  refresh used `CLOCK_MONOTONIC` (~7% of on-CPU), cut to <1% by reading the
-  coarse clock in `XevIo.nowNs` (every deadline here is second-scale) — no
-  fork change.
+- **Plain ops only.** Multishot accept/recv, buffer rings, `send_zc`,
+  `splice` stay behind measurement — the previous iteration never became
+  CPU-bound without them, and this one is latency-bound with CPU
+  headroom. Each has since been evaluated: verdicts and revisit
+  conditions live in [`PLANS.md`](PLANS.md), the measurements behind
+  them in [`IMPLEMENTATION_NOTES.md`](IMPLEMENTATION_NOTES.md).
 
 ## 5. Memory — shared pools, fixed at startup
 
@@ -354,8 +356,8 @@ Three shared pools, all owned and touched only by the loop thread:
    as an idle timeout (kept below typical origin keep-alive windows, so
    most origin-side closes are pre-empted), a close that slips through is
    detected at checkout and absorbed by the stale-replay rung (§7), and
-   active health checks — when they land (§10) — close the parked
-   connections of ejected endpoints.
+   active health checks — when they land ([PLANS.md](PLANS.md)) — close
+   the parked connections of ejected endpoints.
 
 Sizing shape (illustrative defaults, all tunable):
 
@@ -539,9 +541,9 @@ the loop thread.
   readers, so a metrics/admin thread can read without a data race and
   single-writer stays intact. The simulator asserts counters reconcile
   (admitted = completed + shed + in-flight) under every seed. Counters
-  live in `counters.zig` (§11); Phase 0 exposure is a SIGUSR1-triggered
+  live in `counters.zig` (§10); Phase 0 exposure is a SIGUSR1-triggered
   dump (through the seam's `signal` primitive, §4) — the admin plane
-  stays deferred (§10).
+  stays deferred ([PLANS.md](PLANS.md)).
 - **File descriptors are pre-budgeted, not shed.** Worst-case fd count is
   closed-form — listeners + connection slots + upstream slots + ring,
   async and signal fds — computed from `src/constants.zig` and asserted
@@ -644,62 +646,7 @@ explicit allowlist for `main.zig` startup work (the `RLIMIT_NOFILE`
 assert, `sigaction`). Cheap, and it turns "no direct syscalls on the
 data path" from prose into CI.
 
-## 10. Phasing
-
-Each phase ships behind all four gates of §9.
-
-- **Phase 0 — skeleton + L4.** `Io` seam with `XevIo` + `SimIo`,
-  `Pool(T)`, `constants.zig`, config (strict JSON, arena, parse-once),
-  accept gate, TCP relay, deadline timer, SIGTERM drain, the exhaustion
-  ladder rungs that exist so far, all four test gates, static-memory and
-  fd-budget printout.
-- **Phase 1 — L7 HTTP/1.1.** Head parser + framing, routing, upstream
-  pool + keep-alive both sides, relay-buffer decoupling (idle costs no
-  relay memory), static error responses, remaining ladder rungs.
-- **Phase 2 — shedding hardening + minimal resilience.** Pressure
-  watermarks, P2C pick, stale-replay, per-try deadline, counter
-  reconciliation invariants in the sim, overload benchmark scenario
-  (offered load ≫ capacity: assert flat memory, bounded latency for
-  admitted work, all excess shed with correct status).
-- **Phase 3 — TLS.** CPU worker pool + job queues for handshakes (§3 seam
-  activates). The stack is an **open decision under the Zig-first policy**
-  (§4). Leading candidate (surveyed 2026-07-12): **ztls**
-  (github.com/mattrobenolt/ztls) — a sans-I/O TLS 1.3 state machine in
-  Zig. The fit is almost point-for-point: caller-owned buffers and zero
-  allocations in library code (its own claim, matching §5), both server
-  and client roles (termination + upstream re-encryption), ALPN,
-  handshake randomness injected by the caller (drivable from the
-  simulator without sockets), kTLS key-packing helpers matching the
-  proven switchover recipe, CI gated on Zig 0.16, and TLS-Anvil
-  conformance runs. Two eyes-open costs, re-check both at adoption time:
-  (1) pre-alpha — version 0.0.0, API explicitly unstable; no session
-  resumption, 0-RTT, HelloRetryRequest, or client certs yet; TLS 1.3
-  only. (2) Not pure Zig at the bottom: crypto primitives are libcrypto
-  via `@cImport` (OpenSSL/AWS-LC/BoringSSL; no pure-Zig backend), so
-  adopting it is still a deliberate C-FFI exception (§4) — though far
-  narrower than libssl, since the protocol layer stays in Zig and only
-  primitives cross the boundary; the fixed FFI heap behind
-  `CRYPTO_set_mem_functions` still applies to keep the zero-alloc
-  promise. If ztls hasn't matured by Phase 3, the fallback ladder
-  (surveyed 2026-07-12) is: **picotls** (h2o/picotls) — sans-I/O like
-  ztls, battle-tested in H2O/quicly at Fastly, feature-complete where
-  ztls is not (resumption, 0-RTT, HRR, client certs, ECH), injectable
-  `random_bytes`/`get_time` (sim-drivable), kTLS-ready via
-  `ptls_export_secret`/`update_traffic_key`, and its minicrypto backend
-  even drops the system-library link for termination — but the protocol
-  layer itself is C (the §4 exception swallows the whole TLS layer) and
-  it mallocs internally with no allocator hook, so the zero-alloc
-  promise needs link-time interposition or a documented carve-out. Last
-  rung: the previous iteration's full OpenSSL/libssl recipe (sans-io BIO
-  pair + fixed FFI heap, kTLS switchover) — proven by us, heaviest, and
-  now likely displaced by picotls even as a fallback.
-- **Deferred, revisit on evidence:** HTTP/2, richer resilience (breakers,
-  outlier ejection, budgets, health checks), hot restart + drain-to-
-  successor, config DSL, metrics/admin plane beyond counters-on-a-thread,
-  io_uring op upgrades (multishot, buffer rings, `send_zc`, `splice`,
-  `SINGLE_ISSUER`/`DEFER_TASKRUN` flags).
-
-## 11. Module map (target)
+## 10. Module map (target)
 
 ```
 src/
@@ -729,7 +676,7 @@ sim/                  // simulator harness + invariants
 bench/                // micro benches (poop) + loopback harness (zrk), §9
 ```
 
-## 12. Key references
+## 11. Key references
 
 - [libxev](https://github.com/mitchellh/libxev) — proactor event loop,
   io_uring/kqueue backends, caller-owned completions.
