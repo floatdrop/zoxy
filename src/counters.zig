@@ -49,7 +49,7 @@ pub const Counters = struct {
     }
 
     /// Phase 0 exposure (§8): SIGUSR1 dumps to stderr through the signal
-    /// seam; the admin plane stays deferred (§10).
+    /// seam; the admin plane stays deferred (docs/PLANS.md).
     pub fn dump(counters: *const Counters) void {
         std.debug.print("zoxy counters:", .{});
         inline for (@typeInfo(Counters).@"struct".fields) |field| {
