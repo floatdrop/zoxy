@@ -144,7 +144,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const micro_step = b.step("bench-micro", "Build Tier-0 micro binaries for poop A/B");
-    for ([_][]const u8{ "pool_acquire_release", "relay_chunking" }) |micro_name| {
+    for ([_][]const u8{ "pool_acquire_release", "relay_chunking", "l7_head_pipeline" }) |micro_name| {
         const micro_exe = b.addExecutable(.{
             .name = b.fmt("zoxy-bench-{s}", .{micro_name}),
             .root_module = b.createModule(.{
