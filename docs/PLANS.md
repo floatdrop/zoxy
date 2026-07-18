@@ -18,7 +18,9 @@ behind all four gates of §9.
   upstream pool + keep-alive both sides, relay-buffer decoupling (idle
   costs no relay memory), static error responses, remaining ladder
   rungs. Entry gate: the hparse fork must clear the hardening list
-  recorded in §7 before this phase lands.
+  recorded in §7 before this phase lands — **cleared 2026-07-18**
+  (zoxy-io/hparse PR #3: CRLF-only line terminators + extension-method
+  tokens; pin at 65521ed).
 - **Phase 2 — shedding hardening + minimal resilience.** P2C pick,
   stale-replay, per-try deadline, counter reconciliation invariants in
   the sim, overload benchmark scenario (offered load ≫ capacity: assert
