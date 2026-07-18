@@ -34,8 +34,9 @@ const report_path = work_directory ++ "/zoxy.report";
 
 const Flags = struct {
     rate: u64 = 100_000,
+    // zrk serves one thread per connection, so this is both the
+    // connection count and the load-thread count.
     connections: u32 = 64,
-    threads: u32 = 4,
     duration_s: u64 = 30,
     freq: u32 = 4000,
     /// Core to dedicate to zoxy; null auto-picks the last P-core (or last cpu).
@@ -125,9 +126,6 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
         } else if (std.mem.eql(u8, arg, "--connections")) {
             index += 1;
             flags.connections = try std.fmt.parseUnsigned(u32, args[index], 10);
-        } else if (std.mem.eql(u8, arg, "--threads")) {
-            index += 1;
-            flags.threads = try std.fmt.parseUnsigned(u32, args[index], 10);
         } else if (std.mem.eql(u8, arg, "--seconds")) {
             index += 1;
             flags.duration_s = try std.fmt.parseUnsigned(u64, args[index], 10);
@@ -154,7 +152,7 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
         } else {
             std.debug.print(
                 "usage: profile [zoxy-path] [--rate N] [--connections N] " ++
-                    "[--threads N] [--seconds N] [--freq N] [--cpu N]\n",
+                    "[--seconds N] [--freq N] [--cpu N]\n",
                 .{},
             );
             return error.InvalidArguments;
@@ -260,10 +258,9 @@ fn spawnPerf(
 
 // --- load (zrk, in-process, like bench/run.zig) -----------------------------
 
-fn benchConfig(port: u16, rate: u64, connections: u32, threads: u32) zrk.cli.Config {
+fn benchConfig(port: u16, rate: u64, connections: u32) zrk.cli.Config {
     return .{
         .url = .{ .scheme = .http, .host = "127.0.0.1", .port = port, .target = "/" },
-        .threads = threads,
         .connections = connections,
         .rate = rate,
         .timeout_ns = 2 * std.time.ns_per_s,
@@ -277,9 +274,9 @@ fn awaitResponsive(arena: std.mem.Allocator, io: Io, flags: *const Flags) !void 
     const retry_sleep = Io.Duration.fromNanoseconds(200 * std.time.ns_per_ms);
     var attempt: u8 = 0;
     while (attempt < attempts_max) : (attempt += 1) {
-        var config = benchConfig(flags.zoxyPort(), 20_000, 16, 2);
+        var config = benchConfig(flags.zoxyPort(), 20_000, 16);
         config.duration_ns = std.time.ns_per_s / 2;
-        const report = zrk.runner.run(arena, io, &config, null, null) catch {
+        const report = zrk.runner.run(arena, io, &config, 0, null, null) catch {
             if (attempt == attempts_max - 1) return error.TargetUnresponsive;
             io.sleep(retry_sleep, .awake) catch {};
             continue;
@@ -291,9 +288,9 @@ fn awaitResponsive(arena: std.mem.Allocator, io: Io, flags: *const Flags) !void 
 }
 
 fn loadTest(arena: std.mem.Allocator, io: Io, flags: *const Flags) !zrk.runner.Report {
-    var config = benchConfig(flags.zoxyPort(), flags.rate, flags.connections, flags.threads);
+    var config = benchConfig(flags.zoxyPort(), flags.rate, flags.connections);
     config.duration_ns = flags.duration_s * std.time.ns_per_s;
-    return zrk.runner.run(arena, io, &config, null, null);
+    return zrk.runner.run(arena, io, &config, 0, null, null);
 }
 
 fn printReport(report: *const zrk.runner.Report) void {
