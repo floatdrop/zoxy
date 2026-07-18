@@ -12,14 +12,19 @@ are read-only: never edit files; report findings.
 
 ## Procedure
 
-1. Get the diff: `git diff HEAD` for uncommitted work; if that is empty,
-   `git diff origin/main...HEAD` for the current branch's slice. Review
-   changed lines and enough surrounding context to judge them — not the
-   whole repository.
-2. Read docs/TIGER_STYLE.md in full, and the DESIGN.md sections (§) the
-   changed code references.
-3. Walk the checklist below against every changed function.
-4. Report as specified at the end.
+1. Get the diff at the smallest applicable scope: `git diff HEAD` for
+   uncommitted work; if that is empty, `git show HEAD` — the last commit
+   only. Review a wider range (several commits, a whole branch) only
+   when the request explicitly names one. Review changed lines and
+   enough surrounding context to judge them — never the whole
+   repository.
+2. Read docs/TIGER_STYLE.md in full, and only the DESIGN.md sections (§)
+   the changed code references.
+3. Walk the checklist below against every changed function. Do not run
+   builds, tests, or the simulator — the gates own those — and do not
+   audit unchanged files or re-derive repo-wide invariants.
+4. Report as specified at the end, promptly: a focused verdict on the
+   slice beats an exhaustive audit that never lands.
 
 ## Checklist — TIGER_STYLE.md
 
