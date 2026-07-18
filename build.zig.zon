@@ -42,8 +42,8 @@
             .hash = "libxev-0.0.0-86vtc1cTFACGErSvTkJp2mZSFDLCgOHl7R45UZwS5wBZ",
         },
         .zrk = .{
-            .url = "git+https://github.com/floatdrop/zrk#e13a1fb1ed1278202c170def5502ca4ad37cd0bd",
-            .hash = "zrk-0.1.0-WqdFO9erAQDo_HjVH3qPGzyGOC-7XJ_1k_Cc51HqJ52c",
+            .url = "git+https://github.com/floatdrop/zrk#dfab0b0e6bbe01c3db147b5025a0d6b38f37f830",
+            .hash = "zrk-0.3.6-WqdFO8JiAwCaTpT5YBAsjbn_73dLTDUA5-qtoX29FwET",
         },
         // Audited fork: zoxy-io/hparse main at the DESIGN.md §7
         // hardening-gate merge (PR #3: CRLF-only line terminators +
