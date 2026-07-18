@@ -559,23 +559,26 @@ pub fn Proxy(comptime IoType: type) type {
             // record the head boundary so the deferred render agrees.
             conn.l7.response_head_len_marker = response.head_len;
             if (conn.l7.request_head_vacated) {
-                beginResponseForward(server, conn);
+                // conn.head is already free, so render straight from the
+                // parse we just did — no second parse of the same bytes.
+                // This is the common path: the request head vacates long
+                // before the origin answers.
+                renderResponse(server, conn, &response);
             } else {
                 conn.l7.response_render_pending = true;
             }
         }
 
-        /// Render the origin's head into conn.head (free once the request
-        /// head has vacated it) and forward the coalesced body excess
-        /// straight from upstream.head — never copied through a relay
-        /// buffer, so an oversized coalesced body is fine.
+        /// Deferred render path: the origin answered before the request
+        /// head vacated conn.head, so the first parse's stack storage is
+        /// gone and the bytes must be re-parsed (unchanged, §7 single
+        /// source of truth, so it cannot fail). The common path renders
+        /// from the first parse via `renderResponse` and never gets here.
         fn beginResponseForward(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.response_leg == .awaiting_head);
             assert(conn.l7.request_head_vacated);
             const upstream = conn.upstream.?;
-            // The same bytes parsed successfully already (§7 single source
-            // of truth), so this re-parse cannot fail.
             var storage: parser.HeaderStorage = undefined;
             const response = parser.parseResponseHead(
                 upstream.head[0..upstream.head_len],
@@ -584,6 +587,22 @@ pub fn Proxy(comptime IoType: type) type {
                 conn.l7.request_method,
             ) catch unreachable;
             assert(response.head_len == conn.l7.response_head_len_marker);
+            renderResponse(server, conn, &response);
+        }
+
+        /// Render the origin's head into conn.head (free once the request
+        /// head has vacated it) and forward the coalesced body excess
+        /// straight from upstream.head — never copied through a relay
+        /// buffer, so an oversized coalesced body is fine.
+        fn renderResponse(
+            server: *ServerType,
+            conn: *ConnType,
+            response: *const parser.ResponseHead,
+        ) void {
+            assert(conn.state == .l7_exchanging);
+            assert(conn.l7.response_leg == .awaiting_head);
+            assert(conn.l7.request_head_vacated);
+            const upstream = conn.upstream.?;
 
             // The §8 persistence decision, made once and honored: honor
             // the client's ask unless pipelining, pressure, or drain says
@@ -597,7 +616,7 @@ pub fn Proxy(comptime IoType: type) type {
             conn.l7.downstream_close_announced = !keep_downstream;
             conn.l7.upstream_reusable = response.keep_alive;
             const rendered = render.renderResponseHead(
-                &response,
+                response,
                 !keep_downstream,
                 &conn.head,
             ) catch {
