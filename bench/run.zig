@@ -21,8 +21,10 @@ const zrk = @import("zrk");
 const assert = std.debug.assert;
 
 const zoxy_port: u16 = 18180;
+const zoxy_http_port: u16 = 18181;
 const origin_port: u16 = 19180;
 const haproxy_port: u16 = 17180;
+const haproxy_http_port: u16 = 17181;
 const work_directory = ".zig-cache/zoxy-bench";
 
 const Flags = struct {
@@ -60,8 +62,10 @@ pub fn main(init: std.process.Init) !u8 {
 
     // Warm all paths up and prove they answer before measuring.
     _ = try awaitResponsive(arena, io, originPortOf(origin_address), "origin");
-    _ = try awaitResponsive(arena, io, zoxy_port, "zoxy");
-    _ = try awaitResponsive(arena, io, haproxy_port, "haproxy");
+    _ = try awaitResponsive(arena, io, zoxy_port, "zoxy L4");
+    _ = try awaitResponsive(arena, io, zoxy_http_port, "zoxy L7");
+    _ = try awaitResponsive(arena, io, haproxy_port, "haproxy tcp");
+    _ = try awaitResponsive(arena, io, haproxy_http_port, "haproxy http");
 
     const rss_before_kb = try readRssKb(arena, io, zoxy_child.id);
 
@@ -70,19 +74,23 @@ pub fn main(init: std.process.Init) !u8 {
         .{ flags.rate, flags.connections, flags.duration_s },
     );
     const direct = try loadTest(arena, io, originPortOf(origin_address), &flags);
-    const proxied = try loadTest(arena, io, zoxy_port, &flags);
+    const proxied_l4 = try loadTest(arena, io, zoxy_port, &flags);
+    const proxied_l7 = try loadTest(arena, io, zoxy_http_port, &flags);
 
+    // The RSS window closes after both zoxy runs, so the zero-alloc
+    // witness means "zoxy served L4 and L7 load", not "zoxy idled".
     const rss_after_kb = try readRssKb(arena, io, zoxy_child.id);
 
-    // The reference run happens outside the RSS window so the zero-alloc
-    // witness keeps meaning "zoxy sat under load", not "zoxy idled while
-    // haproxy was measured".
-    const reference = try loadTest(arena, io, haproxy_port, &flags);
+    // The reference runs happen outside the RSS window.
+    const reference_tcp = try loadTest(arena, io, haproxy_port, &flags);
+    const reference_http = try loadTest(arena, io, haproxy_http_port, &flags);
 
-    printReport("direct ", &direct);
-    printReport("proxied", &proxied);
-    printReport("haproxy", &reference);
-    printOverhead(&direct, &proxied, &reference);
+    printReport("direct      ", &direct);
+    printReport("zoxy L4     ", &proxied_l4);
+    printReport("zoxy L7     ", &proxied_l7);
+    printReport("haproxy tcp ", &reference_tcp);
+    printReport("haproxy http", &reference_http);
+    printOverhead(&direct, &proxied_l4, &proxied_l7, &reference_tcp, &reference_http);
 
     std.debug.print("zoxy RSS: {d} KiB -> {d} KiB\n", .{ rss_before_kb, rss_after_kb });
 
@@ -100,7 +108,8 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("FAIL: zoxy RSS grew under load\n", .{});
     }
     const completed = direct.snapshot.counters.completed > 0 and
-        proxied.snapshot.counters.completed > 0;
+        proxied_l4.snapshot.counters.completed > 0 and
+        proxied_l7.snapshot.counters.completed > 0;
     if (!completed) {
         std.debug.print("FAIL: a run completed zero requests\n", .{});
     }
@@ -109,12 +118,16 @@ pub fn main(init: std.process.Init) !u8 {
     // stay under 1% or a relay stall passes silently. Status errors are
     // excluded: a faithfully relayed 4xx/5xx is not a proxy failure (and
     // the loopback origin may legitimately answer non-2xx).
-    const proxied_socket_errors = proxied.snapshot.counters.socketErrors();
-    const errors_ok = proxied_socket_errors * 100 <= proxied.snapshot.counters.completed;
+    const l4_socket_errors = proxied_l4.snapshot.counters.socketErrors();
+    const l7_socket_errors = proxied_l7.snapshot.counters.socketErrors();
+    const errors_ok =
+        l4_socket_errors * 100 <= proxied_l4.snapshot.counters.completed and
+        l7_socket_errors * 100 <= proxied_l7.snapshot.counters.completed;
     if (!errors_ok) {
         std.debug.print(
-            "FAIL: proxied socket-error rate too high ({d} socket-errors, {d} completed)\n",
-            .{ proxied_socket_errors, proxied.snapshot.counters.completed },
+            "FAIL: proxied socket-error rate too high " ++
+                "(L4 {d}, L7 {d} socket-errors)\n",
+            .{ l4_socket_errors, l7_socket_errors },
         );
     }
     return if (rss_flat and completed and errors_ok and drained_cleanly) 0 else 1;
@@ -216,10 +229,16 @@ fn spawnZoxy(
     origin_address: []const u8,
 ) !std.process.Child {
     const config_path = work_directory ++ "/zoxy.json";
+    // Both protocols on one process (§6, §7): the L4 relay and the L7
+    // reverse proxy serve the same origin, so one run bands both paths.
+    // idle_ms stays below nginx's default 75 s keepalive_timeout so
+    // parked upstream connections are reaped before the origin closes
+    // them (§5).
     const config_json = try std.fmt.allocPrint(arena,
         \\{{
         \\    "listeners": [
-        \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin" }}
+        \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "l4" }},
+        \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "http" }}
         \\    ],
         \\    "clusters": {{
         \\        "origin": {{ "endpoints": ["{s}"] }}
@@ -231,7 +250,7 @@ fn spawnZoxy(
         \\    }}
         \\}}
         \\
-    , .{ zoxy_port, origin_address });
+    , .{ zoxy_port, zoxy_http_port, origin_address });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config_json });
 
     return std.process.spawn(io, .{
@@ -272,7 +291,12 @@ fn spawnHaproxy(
         \\    bind 127.0.0.1:{d}
         \\    server origin {s}
         \\
-    , .{ haproxy_port, origin_address });
+        \\listen bench_http
+        \\    mode http
+        \\    bind 127.0.0.1:{d}
+        \\    server origin {s}
+        \\
+    , .{ haproxy_port, origin_address, haproxy_http_port, origin_address });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = conf_path, .data = conf });
 
     // -db keeps haproxy in the foreground so kill() reaches the process
@@ -374,16 +398,26 @@ fn printReport(label: []const u8, report: *const zrk.runner.Report) void {
 
 fn printOverhead(
     direct: *const zrk.runner.Report,
-    proxied: *const zrk.runner.Report,
-    reference: *const zrk.runner.Report,
+    proxied_l4: *const zrk.runner.Report,
+    proxied_l7: *const zrk.runner.Report,
+    reference_tcp: *const zrk.runner.Report,
+    reference_http: *const zrk.runner.Report,
 ) void {
     const direct_p50 = direct.snapshot.hist.valueAtPercentile(50.0);
-    const proxied_p50 = proxied.snapshot.hist.valueAtPercentile(50.0);
-    const reference_p50 = reference.snapshot.hist.valueAtPercentile(50.0);
+    const l4_p50 = proxied_l4.snapshot.hist.valueAtPercentile(50.0);
+    const l7_p50 = proxied_l7.snapshot.hist.valueAtPercentile(50.0);
+    const tcp_p50 = reference_tcp.snapshot.hist.valueAtPercentile(50.0);
+    const http_p50 = reference_http.snapshot.hist.valueAtPercentile(50.0);
     std.debug.print(
-        "hop overhead p50: zoxy +{d} us, haproxy +{d} us " ++
+        "hop overhead p50: zoxy L4 +{d} us, zoxy L7 +{d} us, " ++
+            "haproxy tcp +{d} us, haproxy http +{d} us " ++
             "(bands, not single numbers — §9)\n",
-        .{ proxied_p50 -| direct_p50, reference_p50 -| direct_p50 },
+        .{
+            l4_p50 -| direct_p50,
+            l7_p50 -| direct_p50,
+            tcp_p50 -| direct_p50,
+            http_p50 -| direct_p50,
+        },
     );
 }
 
