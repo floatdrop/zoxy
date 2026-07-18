@@ -23,7 +23,8 @@ const zrk = @import("zrk");
 const assert = std.debug.assert;
 
 const origin_port: u16 = 19190;
-const zoxy_port: u16 = 18190;
+const zoxy_l4_port: u16 = 18190;
+const zoxy_http_port: u16 = 18191;
 const work_directory = ".zig-cache/zoxy-profile";
 const perf_data_path = work_directory ++ "/zoxy.perf.data";
 const script_path = work_directory ++ "/zoxy.script";
@@ -39,7 +40,18 @@ const Flags = struct {
     freq: u32 = 4000,
     /// Core to dedicate to zoxy; null auto-picks the last P-core (or last cpu).
     zoxy_cpu: ?u16 = null,
+    /// Which listener to drive: the L4 relay or the L7 reverse proxy.
+    protocol: Protocol = .l4,
     zoxy_path: []const u8 = "zig-out/bin/zoxy-profile",
+
+    const Protocol = enum { l4, http };
+
+    fn zoxyPort(flags: *const Flags) u16 {
+        return switch (flags.protocol) {
+            .l4 => zoxy_l4_port,
+            .http => zoxy_http_port,
+        };
+    }
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -67,7 +79,7 @@ pub fn main(init: std.process.Init) !u8 {
     var origin_child = try spawnNginx(arena, io);
     defer origin_child.kill(io);
 
-    var zoxy_child = try spawnZoxy(arena, io, flags.zoxy_path);
+    var zoxy_child = try spawnZoxy(arena, io, flags.zoxy_path, &flags);
     var zoxy_running = true;
     defer if (zoxy_running) zoxy_child.kill(io);
     const zoxy_pid = zoxy_child.id orelse return error.NoZoxyPid;
@@ -76,10 +88,10 @@ pub fn main(init: std.process.Init) !u8 {
     linux.sched_setaffinity(zoxy_pid, &zoxy_only) catch {};
 
     // Warm up and prove the path serves before spending a measured run on it.
-    try awaitResponsive(arena, io);
+    try awaitResponsive(arena, io, &flags);
     std.debug.print(
-        "profile: zoxy pid {d} pinned to cpu {d}; origin + load pinned off it\n",
-        .{ zoxy_pid, zoxy_cpu },
+        "profile: zoxy pid {d} pinned to cpu {d}; driving {s} listener; origin + load pinned off it\n",
+        .{ zoxy_pid, zoxy_cpu, @tagName(flags.protocol) },
     );
 
     // Record only the zoxy pid for the load's duration while zrk saturates it.
@@ -130,6 +142,16 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
         } else if (std.mem.eql(u8, arg, "--cpu")) {
             index += 1;
             flags.zoxy_cpu = try std.fmt.parseUnsigned(u16, args[index], 10);
+        } else if (std.mem.eql(u8, arg, "--protocol")) {
+            index += 1;
+            if (std.mem.eql(u8, args[index], "l4")) {
+                flags.protocol = .l4;
+            } else if (std.mem.eql(u8, args[index], "http")) {
+                flags.protocol = .http;
+            } else {
+                std.debug.print("profile: --protocol must be l4 or http\n", .{});
+                return error.InvalidArguments;
+            }
         } else if (!zoxy_path_set and !std.mem.startsWith(u8, arg, "--")) {
             // First bare argument is the zoxy binary (passed by `zig build`).
             flags.zoxy_path = arg;
@@ -242,16 +264,23 @@ fn spawnZoxy(
     arena: std.mem.Allocator,
     io: Io,
     zoxy_path: []const u8,
+    flags: *const Flags,
 ) !std.process.Child {
+    // Both listeners always exist so the flag only picks which one zrk
+    // drives; the idle one adds no load.
     const config_path = work_directory ++ "/zoxy.json";
     const config_json = try std.fmt.allocPrint(arena,
         \\{{
-        \\    "listeners": [ {{ "bind": "127.0.0.1:{d}", "cluster": "origin" }} ],
+        \\    "listeners": [
+        \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "l4" }},
+        \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "http" }}
+        \\    ],
         \\    "clusters": {{ "origin": {{ "endpoints": ["127.0.0.1:{d}"] }} }},
         \\    "timeouts": {{ "connect_ms": 5000, "idle_ms": 60000, "drain_deadline_ms": 5000 }}
         \\}}
         \\
-    , .{ zoxy_port, origin_port });
+    , .{ zoxy_l4_port, zoxy_http_port, origin_port });
+    _ = flags;
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config_json });
 
     return std.process.spawn(io, .{
@@ -292,9 +321,9 @@ fn spawnPerf(
 
 // --- load (zrk, in-process, like bench/run.zig) -----------------------------
 
-fn benchConfig(rate: u64, connections: u32, threads: u32) zrk.cli.Config {
+fn benchConfig(port: u16, rate: u64, connections: u32, threads: u32) zrk.cli.Config {
     return .{
-        .url = .{ .scheme = .http, .host = "127.0.0.1", .port = zoxy_port, .target = "/" },
+        .url = .{ .scheme = .http, .host = "127.0.0.1", .port = port, .target = "/" },
         .threads = threads,
         .connections = connections,
         .rate = rate,
@@ -304,12 +333,12 @@ fn benchConfig(rate: u64, connections: u32, threads: u32) zrk.cli.Config {
     };
 }
 
-fn awaitResponsive(arena: std.mem.Allocator, io: Io) !void {
+fn awaitResponsive(arena: std.mem.Allocator, io: Io, flags: *const Flags) !void {
     const attempts_max: u8 = 10;
     const retry_sleep = Io.Duration.fromNanoseconds(200 * std.time.ns_per_ms);
     var attempt: u8 = 0;
     while (attempt < attempts_max) : (attempt += 1) {
-        var config = benchConfig(20_000, 16, 2);
+        var config = benchConfig(flags.zoxyPort(), 20_000, 16, 2);
         config.duration_ns = std.time.ns_per_s / 2;
         const report = zrk.runner.run(arena, io, &config, null, null) catch {
             if (attempt == attempts_max - 1) return error.TargetUnresponsive;
@@ -323,7 +352,7 @@ fn awaitResponsive(arena: std.mem.Allocator, io: Io) !void {
 }
 
 fn loadTest(arena: std.mem.Allocator, io: Io, flags: *const Flags) !zrk.runner.Report {
-    var config = benchConfig(flags.rate, flags.connections, flags.threads);
+    var config = benchConfig(flags.zoxyPort(), flags.rate, flags.connections, flags.threads);
     config.duration_ns = flags.duration_s * std.time.ns_per_s;
     return zrk.runner.run(arena, io, &config, null, null);
 }
@@ -351,8 +380,9 @@ fn generateFlamegraph(arena: std.mem.Allocator, io: Io) !void {
     try runToFile(io, &.{ "perf", "script", "-i", perf_data_path }, script_path);
     try runToFile(io, &.{ "stackcollapse-perf.pl", script_path }, folded_path);
     try runToFile(io, &.{
-        "flamegraph.pl",                                       "--title",
-        "zoxy L4 relay under load (cycles:u, LBR call-graph)", folded_path,
+        "flamegraph.pl", "--title",
+        "zoxy under load (cycles:u, LBR call-graph) — see run for path",
+        folded_path,
     }, svg_path);
     std.debug.print("profile: flamegraph -> {s}\n", .{svg_path});
 }
