@@ -11,11 +11,10 @@
 //! caller re-parses from byte 0 once more bytes arrive, bounded by
 //! `constants.head_bytes_max`.
 //!
-//! Two §7 fork-gate items are still open against the current pin and are
-//! handled here until the pin moves: bare-LF line terminators are rejected
-//! by `rejectBareLineFeeds` (hparse still accepts them), and extension
-//! methods (PROPFIND, ...) surface as `error.Malformed` because hparse's
-//! method enum is still closed.
+//! The §7 fork hardening gate is fully cleared at the current pin: the
+//! fork rejects bare-LF line terminators itself (CRLF only) and parses
+//! extension methods (PROPFIND, ...) as tokens. The tests below keep both
+//! behaviors witnessed through this wrapper.
 
 const std = @import("std");
 const hparse = @import("hparse");
@@ -23,9 +22,10 @@ const constants = @import("../constants.zig");
 
 const assert = std.debug.assert;
 
-/// The nine methods the pinned hparse recognizes. Owned here (not
-/// re-exported) so opening the fork's method enum to extension tokens
-/// changes only this file's mapping, not every consumer.
+/// Request methods. The nine registered methods parse to their tags; any
+/// other RFC 9110 token (PROPFIND, MKCOL, ...) parses to `.extension`
+/// with the raw bytes in `RequestHead.method_token`. Owned here (not
+/// re-exported) so fork API changes stay confined to this file.
 pub const Method = enum(u8) {
     get,
     post,
@@ -36,6 +36,7 @@ pub const Method = enum(u8) {
     options,
     trace,
     patch,
+    extension,
 };
 
 /// HTTP/1.0 and HTTP/1.1 are served; anything else is malformed (§1
@@ -88,6 +89,9 @@ pub const HeadError = error{
 /// begins.
 pub const RequestHead = struct {
     method: Method,
+    /// The method's raw token bytes ("GET", "PROPFIND", ...) — what the
+    /// renderer writes into the upstream request line, whatever the tag.
+    method_token: []const u8,
     target: []const u8,
     version: Version,
     headers: []const Header,
@@ -128,6 +132,7 @@ pub fn parseRequestHead(
     }
 
     var raw_method: hparse.Method = .unknown;
+    var raw_method_token: ?[]const u8 = null;
     var raw_target: ?[]const u8 = null;
     var raw_version: hparse.Version = .@"1.0";
     var raw_headers: [constants.headers_max]hparse.Header = undefined;
@@ -135,6 +140,7 @@ pub fn parseRequestHead(
     const head_len = hparse.parseRequest(
         head,
         &raw_method,
+        &raw_method_token,
         &raw_target,
         &raw_version,
         &raw_headers,
@@ -156,8 +162,9 @@ pub fn parseRequestHead(
     assert(head_len <= head.len);
     assert(raw_header_count <= constants.headers_max);
 
-    try rejectBareLineFeeds(head[0..head_len]);
     const target = raw_target.?; // A successful parse always sets the target.
+    const method_token = raw_method_token.?; // Same contract as the target.
+    assert(method_token.len >= 1);
     const method = methodFromRaw(raw_method);
     try validateTarget(target, method);
     const version = versionFromRaw(raw_version);
@@ -175,6 +182,7 @@ pub fn parseRequestHead(
 
     return .{
         .method = method,
+        .method_token = method_token,
         .target = target,
         .version = version,
         .headers = headers_storage[0..raw_header_count],
@@ -226,7 +234,6 @@ pub fn parseResponseHead(
     assert(head_len <= head.len);
     assert(raw_header_count <= constants.headers_max);
 
-    try rejectBareLineFeeds(head[0..head_len]);
     // hparse only checks for three digits; the status class is ours.
     if (raw_status < 100) {
         return error.Malformed;
@@ -725,25 +732,6 @@ fn parseContentLength(value: []const u8) error{Malformed}!u64 {
     return total;
 }
 
-/// §7 fork-gate item still open: the pinned hparse accepts a bare LF as a
-/// line terminator — a smuggling ingredient when intermediaries disagree
-/// on where lines end. Enforce CRLF-only here until the fork rejects it
-/// at parse time; this scan then becomes a redundant second witness.
-fn rejectBareLineFeeds(head: []const u8) error{Malformed}!void {
-    assert(head.len >= 1);
-    for (head, 0..) |byte, index| {
-        if (byte != '\n') {
-            continue;
-        }
-        if (index == 0) {
-            return error.Malformed;
-        }
-        if (head[index - 1] != '\r') {
-            return error.Malformed;
-        }
-    }
-}
-
 /// The 414 vs 431 verdict for a request head that cannot complete inside
 /// a full head buffer (§7): no line terminator at all means the request
 /// line itself overflowed.
@@ -769,6 +757,7 @@ fn methodFromRaw(raw_method: hparse.Method) Method {
         .options => .options,
         .trace => .trace,
         .patch => .patch,
+        .extension => .extension,
     };
 }
 
@@ -816,6 +805,7 @@ test "http parser: plain GET parses with keep-alive and no body" {
     var storage: HeaderStorage = undefined;
     const request = try parseRequestHead(head, false, &storage);
     try testing.expectEqual(Method.get, request.method);
+    try testing.expectEqualStrings("GET", request.method_token);
     try testing.expectEqualStrings("/path?q=1", request.target);
     try testing.expectEqual(Version.http_1_1, request.version);
     try testing.expectEqualStrings("origin.example", request.host.?);
@@ -948,20 +938,32 @@ test "http parser: keep-alive follows version defaults and Connection tokens" {
     }
 }
 
-test "http parser: bare LF line terminators are malformed (fork-gate stopgap)" {
-    // The pinned hparse still accepts every one of these (§7 fork gate);
-    // the wrapper's CRLF-only scan must reject them.
+test "http parser: bare LF line terminators are malformed" {
+    // The hardened fork rejects bare LF at parse time (§7 fork gate,
+    // closed); these witness the contract through the wrapper's mapping.
     try expectRequestError(error.Malformed, "GET / HTTP/1.1\nHost: a\r\n\r\n", false);
     try expectRequestError(error.Malformed, "GET / HTTP/1.1\r\nHost: a\n\r\n", false);
     try expectRequestError(error.Malformed, "GET / HTTP/1.1\r\nHost: a\r\n\n", false);
     try expectResponseError(error.Malformed, "HTTP/1.1 200 OK\nContent-Length: 0\r\n\r\n", .get);
 }
 
-test "http parser: extension methods are malformed until the fork opens the enum" {
-    // §7 fork-gate item: hparse's method enum is closed, so PROPFIND-class
-    // tokens surface as 400 today. When the fork opens the enum this test
-    // flips to expecting a parsed extension method.
-    try expectRequestError(error.Malformed, "PROPFIND /dav HTTP/1.1\r\nHost: a\r\n\r\n", false);
+test "http parser: extension methods parse with their raw token" {
+    var storage: HeaderStorage = undefined;
+    const request = try parseRequestHead(
+        "PROPFIND /dav HTTP/1.1\r\nHost: a\r\nDepth: 1\r\n\r\n",
+        false,
+        &storage,
+    );
+    try testing.expectEqual(Method.extension, request.method);
+    try testing.expectEqualStrings("PROPFIND", request.method_token);
+    try testing.expectEqualStrings("/dav", request.target);
+    // Origin-form is still required: extension methods get no target
+    // leniency on a reverse proxy.
+    try expectRequestError(
+        error.Malformed,
+        "M-SEARCH * HTTP/1.1\r\nHost: a\r\n\r\n",
+        false,
+    );
 }
 
 test "http parser: request targets must be origin-form (or OPTIONS *)" {
@@ -1203,6 +1205,8 @@ fn checkRequestParse(input: []const u8, head_is_full: bool) void {
     assert(request.head_len <= input.len);
     assert(sliceWithin(input, request.target));
     assert(request.target.len >= 1);
+    assert(sliceWithin(input, request.method_token));
+    assert(request.method_token.len >= 1);
     if (request.host) |host| {
         assert(host.len >= 1);
         assert(sliceWithin(input, host));
@@ -1236,12 +1240,18 @@ fn checkResponseParse(input: []const u8, head_is_full: bool) void {
 }
 
 const fuzz_corpus_request = "POST /submit HTTP/1.1\r\nHost: origin\r\nContent-Length: 5\r\n\r\nhello";
+const fuzz_corpus_extension = "PROPFIND /dav HTTP/1.1\r\nHost: origin\r\nDepth: 1\r\n\r\n";
 const fuzz_corpus_response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
 const fuzz_corpus_chunked = "5\r\nhello\r\n0\r\nX-Trailer: v\r\n\r\n";
 
 test "fuzz: heads and chunked framing — parse or reject, no third outcome" {
     try std.testing.fuzz({}, fuzzParserInputs, .{
-        .corpus = &.{ fuzz_corpus_request, fuzz_corpus_response, fuzz_corpus_chunked },
+        .corpus = &.{
+            fuzz_corpus_request,
+            fuzz_corpus_extension,
+            fuzz_corpus_response,
+            fuzz_corpus_chunked,
+        },
     });
 }
 
