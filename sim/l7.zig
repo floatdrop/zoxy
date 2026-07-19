@@ -23,22 +23,65 @@ const parser = zoxy.http.parser;
 
 const assert = std.debug.assert;
 
-/// The canonical 200 the well-behaved origin serves: body bytes are fixed
-/// so the client can detect corruption without correlating connections.
+/// The canonical 200s the origin serves: bodies are fixed so the client
+/// can detect corruption without correlating connections. The proxy
+/// relays body wire bytes verbatim, so the client prefix-checks the raw
+/// framed forms.
 pub const sized_body = "canonical-sized-response-body-00";
 pub const sized_head = "HTTP/1.1 200 OK\r\nContent-Length: 32\r\n\r\n";
 const sized_response = sized_head ++ sized_body;
+pub const chunked_wire = "10\r\nchunked-body-16b\r\n0\r\n\r\n";
+pub const chunked_head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+const chunked_response = chunked_head ++ chunked_wire;
+pub const until_close_body = "until-close-stream";
+pub const until_close_head = "HTTP/1.1 200 OK\r\n\r\n";
+const until_close_response = until_close_head ++ until_close_body;
+const truncated_response = sized_head ++ sized_body[0..16];
+
+/// A parseable head that cannot survive the render: 8190 bytes fits the
+/// proxy's 8 KiB response buffer, but no Content-Length and no
+/// Transfer-Encoding makes it until-close framing, which forces a
+/// Connection: close injection — and 8190 plus that header overflows
+/// 8192. Sent at accept time, it races the request legs into the
+/// deferred-render path (§7 buffer rotation) and must die as a clean
+/// 502 or teardown, never a crash.
+const oversize_head = "HTTP/1.1 200 OK\r\nx-pad: " ++ ("p" ** 8162) ++ "\r\n\r\n";
 
 comptime {
     assert(sized_body.len == 32);
+    assert(chunked_wire[0] == '1' and chunked_wire[1] == '0');
+    assert(chunked_wire.len == 4 + 16 + 2 + 5);
+    assert(oversize_head.len == 8190);
 }
 
-/// Per-connection origin behavior. Slice 1 ships the well-behaved mode;
-/// the misbehavior matrix (early, oversize, truncated, ...) follows.
+/// Per-connection origin behavior: the well-behaved framings, then the
+/// misbehavior matrix (§9 adversarial-origin coverage). Clean seeds pin
+/// every connection to `sized`.
 pub const OriginMode = enum(u8) {
     /// Parse each request, wait for its full body, answer the canonical
     /// sized 200, keep the connection open for reuse (§5 parking).
     sized,
+    /// As `sized`, with the chunked canonical 200.
+    chunked,
+    /// Answer the until-close canonical 200 and close after it: the FIN
+    /// delimits the body, and the connection is never reusable.
+    until_close,
+    /// Send the sized head but only half its body, then close: a
+    /// truncated length-delimited response the proxy must cut, never
+    /// repair.
+    truncated,
+    /// RST on the first forwarded byte.
+    reset,
+    /// Read forever, never answer: the proxy's idle deadline reaps the
+    /// exchange.
+    mute,
+    /// Answer the canonical 200 at accept time — before any request
+    /// byte — then only drain. Early responses are legal (§7) and race
+    /// the request legs' buffer rotation.
+    instant_sized,
+    /// Send the oversize-after-edits head at accept time, then drain:
+    /// the render-failure race into the deferred-render path.
+    instant_oversize,
 };
 
 /// What the origin verifies about every byte the proxy forwards (§7):
@@ -81,6 +124,14 @@ pub fn HttpOrigin(comptime IoType: type) type {
             content_remaining: u64 = 0,
             chunk_scanner: parser.ChunkedScanner = .{},
             mode: OriginMode = .sized,
+            /// What this connection answers with, per its mode.
+            response_bytes: []const u8 = sized_response,
+            /// Close right after the response: until-close and truncated
+            /// bodies are delimited by the FIN itself.
+            close_after_response: bool = false,
+            /// Instant and mute modes never answer parsed requests; any
+            /// forwarded bytes are read and discarded.
+            drain_only: bool = false,
             response_sent: u32 = 0,
             requests_served: u32 = 0,
             done: bool = false,
@@ -105,9 +156,39 @@ pub fn HttpOrigin(comptime IoType: type) type {
                     return;
                 };
                 assert(received >= 1);
+                if (conn.mode == .reset) {
+                    conn.origin.io.setLingerRst(conn.socket) catch unreachable;
+                    conn.close();
+                    return;
+                }
                 conn.request_len += received;
                 assert(conn.request_len <= conn.request_buffer.len);
                 conn.advance();
+            }
+
+            /// The drain loop for instant and mute modes: forwarded bytes
+            /// are legal but never answered — recv into the front of the
+            /// buffer and discard, so it can never fill.
+            fn armDrainRecv(conn: *Conn) void {
+                assert(!conn.done);
+                assert(conn.drain_only);
+                conn.origin.io.recv(
+                    conn.socket,
+                    conn.request_buffer[0..],
+                    &conn.recv_completion,
+                    Conn,
+                    conn,
+                    onDrainRecv,
+                );
+            }
+
+            fn onDrainRecv(conn: *Conn, result: Io.RecvError!u32) void {
+                assert(conn.drain_only);
+                _ = result catch {
+                    conn.close();
+                    return;
+                };
+                conn.armDrainRecv();
             }
 
             /// Drive head → body → respond over the buffered bytes; arms
@@ -226,10 +307,10 @@ pub fn HttpOrigin(comptime IoType: type) type {
             }
 
             fn armSend(conn: *Conn) void {
-                assert(conn.response_sent < sized_response.len);
+                assert(conn.response_sent < conn.response_bytes.len);
                 conn.origin.io.send(
                     conn.socket,
-                    sized_response[conn.response_sent..],
+                    conn.response_bytes[conn.response_sent..],
                     &conn.send_completion,
                     Conn,
                     conn,
@@ -243,16 +324,68 @@ pub fn HttpOrigin(comptime IoType: type) type {
                     return;
                 };
                 conn.response_sent += sent;
-                assert(conn.response_sent <= sized_response.len);
-                if (conn.response_sent < sized_response.len) {
+                assert(conn.response_sent <= conn.response_bytes.len);
+                if (conn.response_sent < conn.response_bytes.len) {
                     conn.armSend();
+                    return;
+                }
+                conn.requests_served += 1;
+                if (conn.close_after_response) {
+                    // The FIN is the delimiter (until-close), or the
+                    // truncation itself (truncated).
+                    conn.close();
+                    return;
+                }
+                if (conn.drain_only) {
+                    // Instant modes answered at accept; whatever the
+                    // proxy still forwards is read and dropped.
+                    conn.armDrainRecv();
                     return;
                 }
                 // Keep-alive: the next request parses from the new offset
                 // (its bytes may already be buffered).
-                conn.requests_served += 1;
                 conn.phase = .head;
                 conn.advance();
+            }
+
+            /// Wire a fresh connection per its mode: pick the response,
+            /// decide whether the FIN delimits it, and for the instant
+            /// modes answer now — before any request byte arrives.
+            fn beginMode(conn: *Conn) void {
+                assert(!conn.done);
+                assert(conn.phase == .head);
+                switch (conn.mode) {
+                    .sized, .reset => conn.armRecv(),
+                    .chunked => {
+                        conn.response_bytes = chunked_response;
+                        conn.armRecv();
+                    },
+                    .until_close => {
+                        conn.response_bytes = until_close_response;
+                        conn.close_after_response = true;
+                        conn.armRecv();
+                    },
+                    .truncated => {
+                        conn.response_bytes = truncated_response;
+                        conn.close_after_response = true;
+                        conn.armRecv();
+                    },
+                    .mute => {
+                        conn.drain_only = true;
+                        conn.armDrainRecv();
+                    },
+                    .instant_sized => {
+                        conn.drain_only = true;
+                        conn.phase = .respond;
+                        conn.beginRespond();
+                    },
+                    .instant_oversize => {
+                        conn.response_bytes = oversize_head;
+                        conn.drain_only = true;
+                        conn.phase = .respond;
+                        conn.beginRespond();
+                    },
+                }
             }
 
             fn close(conn: *Conn) void {
@@ -287,7 +420,7 @@ pub fn HttpOrigin(comptime IoType: type) type {
                 select(origin.context)
             else
                 .sized;
-            conn.armRecv();
+            conn.beginMode();
             origin.armAccept();
         }
 
@@ -316,6 +449,12 @@ pub const Script = enum(u8) {
     get,
     /// A POST with a 24-byte sized body; expects one canonical 200.
     post_sized,
+    /// A POST with a 6000-byte sized body: bigger than one virtual-socket
+    /// push, so the body spans multiple deliveries — the excess-forward
+    /// and body-pump paths race the response leg for the head buffer
+    /// (§7 buffer rotation), which is where a misbehaving instant origin
+    /// meets the deferred render.
+    post_big,
     /// A POST with a valid chunked body; expects one canonical 200.
     post_chunked,
     /// A chunked POST whose first body byte violates chunk framing —
@@ -401,8 +540,20 @@ pub fn Client(comptime IoType: type) type {
 
         const post_body = "request-body-24-bytes-ab";
         const get_request = "GET /sim HTTP/1.1\r\nHost: sim\r\n\r\n";
+        /// Deterministic 6000-byte body for `post_big`, cycled so the
+        /// origin-side §7 oracle can spot any reordering.
+        const big_body = blk: {
+            @setEvalBranchQuota(30_000);
+            var bytes: [6000]u8 = undefined;
+            for (&bytes, 0..) |*byte, index| {
+                byte.* = 'a' + @as(u8, @intCast(index % 26));
+            }
+            const frozen = bytes;
+            break :blk frozen;
+        };
         comptime {
             assert(post_body.len == 24);
+            assert(big_body.len == 6000);
         }
 
         fn requestBytes(script: Script) []const u8 {
@@ -410,6 +561,8 @@ pub fn Client(comptime IoType: type) type {
                 .get => get_request,
                 .post_sized => "POST /sim HTTP/1.1\r\nHost: sim\r\n" ++
                     "Content-Length: 24\r\n\r\n" ++ post_body,
+                .post_big => "POST /big HTTP/1.1\r\nHost: sim\r\n" ++
+                    "Content-Length: 6000\r\n\r\n" ++ big_body,
                 .post_chunked => "POST /sim HTTP/1.1\r\nHost: sim\r\n" ++
                     "Transfer-Encoding: chunked\r\n\r\n" ++ "8\r\nabcdefgh\r\n0\r\n\r\n",
                 // "Z" is no chunk-size digit: the framing violation is in
@@ -747,8 +900,9 @@ pub fn Client(comptime IoType: type) type {
         /// Null means the body is still incomplete (a legal partial
         /// tail); otherwise the verdict carries the wire length consumed
         /// and any corruption found. Framings are pinned before any byte
-        /// comparison: the canonical 200 is Content-Length 32, every
-        /// legal non-200 is a static with Content-Length 0 — so a
+        /// comparison: a 200 carries exactly one canonical body per
+        /// framing (the proxy relays body wire bytes verbatim), and
+        /// every legal non-200 is a static with Content-Length 0 — so a
         /// corrupted length fails even before its body arrives.
         fn walkBody(response: parser.ResponseHead, body: []const u8) ?BodyVerdict {
             switch (response.framing) {
@@ -757,31 +911,62 @@ pub fn Client(comptime IoType: type) type {
                         if (length != sized_body.len) {
                             return .{ .body_len = 0, .violation = ClientError.ResponseBodyCorrupted };
                         }
-                        const have: u32 = @intCast(@min(@as(u64, body.len), length));
-                        if (!std.mem.eql(u8, body[0..have], sized_body[0..have])) {
-                            return .{ .body_len = have, .violation = ClientError.ResponseBodyCorrupted };
-                        }
-                        if (body.len < length) return null;
-                        return .{ .body_len = @intCast(length), .violation = null };
+                        return prefixVerdict(body, sized_body, @intCast(length));
                     }
                     if (length != 0) {
                         return .{ .body_len = 0, .violation = ClientError.ResponseBodyCorrupted };
                     }
                     return .{ .body_len = 0, .violation = null };
                 },
-                // No legal transcript uses these framings yet: the sized
-                // origin frames by length and the statics are
-                // Content-Length 0. The misbehavior matrix widens this.
-                .none, .chunked, .until_close => return .{
+                .chunked => {
+                    if (response.status != 200) {
+                        return .{ .body_len = 0, .violation = ClientError.ResponseCorrupted };
+                    }
+                    return prefixVerdict(body, chunked_wire, chunked_wire.len);
+                },
+                .until_close => {
+                    if (response.status != 200) {
+                        return .{ .body_len = 0, .violation = ClientError.ResponseCorrupted };
+                    }
+                    // The FIN delimits this body, so it is transcript-
+                    // final: bytes beyond the canonical body — or past
+                    // where the close must fall — are corruption, and
+                    // whatever arrived counts as the (possibly cut)
+                    // complete response.
+                    if (body.len > until_close_body.len) {
+                        return .{ .body_len = 0, .violation = ClientError.ResponseBodyCorrupted };
+                    }
+                    const have: u32 = @intCast(body.len);
+                    if (!std.mem.eql(u8, body[0..have], until_close_body[0..have])) {
+                        return .{ .body_len = have, .violation = ClientError.ResponseBodyCorrupted };
+                    }
+                    return .{ .body_len = have, .violation = null };
+                },
+                // No canonical 200 is bodiless, and the statics carry an
+                // explicit Content-Length: 0.
+                .none => return .{
                     .body_len = 0,
                     .violation = ClientError.ResponseCorrupted,
                 },
             }
         }
 
+        /// Verdict for a wire-exact canonical body: the received prefix
+        /// must match byte-for-byte; short is incomplete (null), full is
+        /// complete at exactly `wire_len`.
+        fn prefixVerdict(body: []const u8, canonical: []const u8, wire_len: u32) ?BodyVerdict {
+            assert(canonical.len == wire_len);
+            const have: u32 = @intCast(@min(body.len, canonical.len));
+            if (!std.mem.eql(u8, body[0..have], canonical[0..have])) {
+                return .{ .body_len = have, .violation = ClientError.ResponseBodyCorrupted };
+            }
+            if (body.len < wire_len) return null;
+            return .{ .body_len = wire_len, .violation = null };
+        }
+
         fn expectedResponses(script: Script) u8 {
             return switch (script) {
-                .get, .post_sized, .post_chunked => 1,
+                .get, .post_sized, .post_big, .post_chunked => 1,
                 .post_chunked_malformed, .malformed_head => 1,
                 .oversize_uri, .connect_method, .pipelined => 1,
                 .keepalive_pair => 2,
@@ -808,7 +993,7 @@ pub fn Client(comptime IoType: type) type {
         /// value unread.
         fn goldenStatus(script: Script) u16 {
             return switch (script) {
-                .get, .post_sized, .post_chunked, .keepalive_pair, .pipelined => 200,
+                .get, .post_sized, .post_big, .post_chunked, .keepalive_pair, .pipelined => 200,
                 .post_chunked_malformed, .malformed_head => 400,
                 .oversize_uri => 414,
                 .connect_method => 501,
@@ -822,7 +1007,7 @@ pub fn Client(comptime IoType: type) type {
         /// and the 501 static carries no body either way.
         fn methodOf(script: Script) parser.Method {
             return switch (script) {
-                .post_sized, .post_chunked, .post_chunked_malformed => .post,
+                .post_sized, .post_big, .post_chunked, .post_chunked_malformed => .post,
                 .get, .malformed_head, .oversize_uri => .get,
                 .connect_method, .keepalive_pair, .pipelined, .silent => .get,
             };
@@ -835,7 +1020,7 @@ pub fn Client(comptime IoType: type) type {
         /// client may see nothing at all.
         fn statusAllowed(script: Script, status: u16) bool {
             return switch (script) {
-                .get, .post_sized, .post_chunked, .keepalive_pair, .pipelined => //
+                .get, .post_sized, .post_big, .post_chunked, .keepalive_pair, .pipelined => //
                 status == 200 or status == 502 or status == 503,
                 // The head routes before its body is validated, so the §8
                 // rungs and a killed dial can still precede the 400.

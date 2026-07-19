@@ -250,7 +250,10 @@ const Harness = struct {
             .context = harness,
         };
         try harness.origin.start(&harness.io, Harness.originAddress());
-        harness.origin_http = .{};
+        harness.origin_http = .{
+            .mode_selector = pickHttpOriginMode,
+            .context = harness,
+        };
         try harness.origin_http.start(&harness.io, Harness.httpOriginAddress());
     }
 
@@ -365,6 +368,15 @@ fn l7ClientEnded(context: ?*anyopaque) void {
 fn pickOriginMode(context: ?*anyopaque) zoxy.testing.Mode {
     const harness: *Harness = @ptrCast(@alignCast(context.?));
     return harness.scenario_prng.random().enumValue(zoxy.testing.Mode);
+}
+
+/// Per-accept HTTP-origin misbehavior, drawn like the L4 origin's. Clean
+/// seeds pin every connection to the well-behaved sized mode so golden
+/// outcomes stay exact.
+fn pickHttpOriginMode(context: ?*anyopaque) l7.OriginMode {
+    const harness: *Harness = @ptrCast(@alignCast(context.?));
+    if (harness.clean) return .sized;
+    return harness.scenario_prng.random().enumValue(l7.OriginMode);
 }
 
 /// A scripted client with a seed-derived token. Sends the token, FINs
