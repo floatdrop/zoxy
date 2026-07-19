@@ -36,6 +36,9 @@ pub const Counters = struct {
     l7_uri_too_long: Value = Value.init(0),
     l7_headers_too_large: Value = Value.init(0),
     l7_not_implemented: Value = Value.init(0),
+    /// No route matched the request's canonical path (§7), answered 404.
+    /// Like the other reject counters the connection completes normally.
+    l7_no_route: Value = Value.init(0),
     /// §8 rungs at the L7 request level, answered 503: relay buffers or
     /// upstream slots exhausted when a valid request needed them. Like
     /// the reject counters these connections complete normally, so they

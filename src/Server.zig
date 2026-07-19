@@ -20,6 +20,7 @@ const conn_module = @import("net/Conn.zig");
 const Io = @import("io/io.zig");
 const Pool = @import("mem/Pool.zig").Pool;
 const proxy = @import("http/proxy.zig");
+const router = @import("http/router.zig");
 const relay = @import("net/relay.zig");
 const shed = @import("shed.zig");
 const upstream_module = @import("net/upstream.zig");
@@ -82,6 +83,9 @@ pub fn Server(comptime IoType: type) type {
             /// ring budget stays one op (§8).
             retry_completion: IoType.Completion,
             cluster_index: u16,
+            /// The listener's §7 route table, handed to each admitted L7
+            /// connection so `routeRequest` can pick a cluster by path.
+            routes: []const router.Route,
             /// Copied from config so admission forks without reaching back
             /// through the listener index (§6, §7).
             protocol: config_module.Config.Listener.Protocol,
@@ -129,6 +133,7 @@ pub fn Server(comptime IoType: type) type {
                     // L7 admits under the first route and refines to the
                     // path's route once the head parses (§7).
                     .cluster_index = listener_config.routes[0].cluster_index,
+                    .routes = listener_config.routes,
                     .protocol = listener_config.protocol,
                     .accepting = false,
                 };
@@ -406,6 +411,10 @@ pub fn Server(comptime IoType: type) type {
                 server.idleTimeoutMs(),
                 state.cluster_index,
             );
+            // The L7 path routes by canonical path once the head parses;
+            // hand it the listener's table (§7).
+            conn.routes = state.routes;
+            assert(conn.routes.len >= 1);
             Proxy.start(server, conn);
         }
 

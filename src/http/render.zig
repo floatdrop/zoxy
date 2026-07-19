@@ -40,19 +40,23 @@ const protected_names = [_][]const u8{
 /// that this upstream connection will not be reused (§2).
 pub fn renderRequestHead(
     request: *const parser.RequestHead,
+    target: parser.CanonicalTarget,
     inject_close: bool,
     buffer: []u8,
 ) error{Oversize}![]const u8 {
     // The proxy answers CONNECT with 501 itself, never forwards it (§7).
     assert(request.method != .connect);
     assert(request.method_token.len >= 1);
-    assert(request.target.len >= 1);
+    // The forwarded target is the §7 canonical form the router matched on
+    // (or `*` for OPTIONS), so the origin sees exactly the path we routed.
+    assert(target.path.len >= 1);
     assert(buffer.len <= std.math.maxInt(u32));
 
     var staging = Staging{ .buffer = buffer };
     try staging.append(request.method_token);
     try staging.append(" ");
-    try staging.append(request.target);
+    try staging.append(target.path);
+    try staging.append(target.query);
     try staging.append(switch (request.version) {
         .http_1_0 => " HTTP/1.0\r\n",
         .http_1_1 => " HTTP/1.1\r\n",
@@ -238,13 +242,13 @@ test "render: request strips hop-by-hop and nominated, keeps the rest" {
     const request = try parser.parseRequestHead(head, false, &storage);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
 
-    const rendered = try renderRequestHead(&request, false, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, false, &buffer);
     try testing.expectEqualStrings(
         "GET /p HTTP/1.1\r\nHost: a\r\nX-Keep: yes\r\n\r\n",
         rendered,
     );
 
-    const closed = try renderRequestHead(&request, true, &buffer);
+    const closed = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, true, &buffer);
     try testing.expectEqualStrings(
         "GET /p HTTP/1.1\r\nHost: a\r\nX-Keep: yes\r\nConnection: close\r\n\r\n",
         closed,
@@ -259,7 +263,7 @@ test "render: nominating a protected header does not strip it" {
     var storage: parser.HeaderStorage = undefined;
     const request = try parser.parseRequestHead(head, false, &storage);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, false, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/u", .query = "" }, false, &buffer);
     try testing.expectEqualStrings(
         "POST /u HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\n",
         rendered,
@@ -277,7 +281,7 @@ test "render: standard Connection options do not nominate a same-named header" {
     var storage: parser.HeaderStorage = undefined;
     const request = try parser.parseRequestHead(head, false, &storage);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, false, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, false, &buffer);
     // Connection stripped (hop-by-hop) and Keep-Alive stripped (a
     // hop-by-hop name); the "Close" header survives — close nominates
     // nothing.
@@ -292,7 +296,7 @@ test "render: framing headers travel with the body" {
     var storage: parser.HeaderStorage = undefined;
     const request = try parser.parseRequestHead(head, false, &storage);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, false, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/u", .query = "" }, false, &buffer);
 
     var reparse_storage: parser.HeaderStorage = undefined;
     const reparsed = try parser.parseRequestHead(rendered, false, &reparse_storage);
@@ -303,7 +307,7 @@ test "render: client version is preserved" {
     var storage: parser.HeaderStorage = undefined;
     const request = try parser.parseRequestHead("GET / HTTP/1.0\r\n\r\n", false, &storage);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, false, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, false, &buffer);
     try testing.expectEqualStrings("GET / HTTP/1.0\r\n\r\n", rendered);
 }
 
@@ -341,8 +345,9 @@ test "render: a head that no longer fits is Oversize" {
     const head = "GET /path HTTP/1.1\r\nHost: origin.example\r\n\r\n";
     var storage: parser.HeaderStorage = undefined;
     const request = try parser.parseRequestHead(head, false, &storage);
+    const target = parser.CanonicalTarget{ .path = "/path", .query = "" };
     var small: [16]u8 = undefined;
-    try testing.expectError(error.Oversize, renderRequestHead(&request, false, &small));
+    try testing.expectError(error.Oversize, renderRequestHead(&request, target, false, &small));
 }
 
 // Fuzzing (§9 gate 2): whatever the parser accepts, the renderer must
@@ -355,8 +360,17 @@ fn checkRequestRender(input: []const u8) void {
     if (request.method == .connect) {
         return; // Never rendered: the proxy answers CONNECT itself.
     }
+    // Mirror the routeRequest gate (§7): an origin-form target that will
+    // not canonicalize is a 400 and never reaches the renderer; OPTIONS
+    // asterisk-form has no path and forwards verbatim.
+    var scratch: [constants.head_bytes_max]u8 = undefined;
+    const target: parser.CanonicalTarget = if (request.target[0] == '/')
+        (parser.canonicalTarget(request.target, &scratch) catch return)
+    else
+        .{ .path = request.target, .query = "" };
+
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = renderRequestHead(&request, false, &buffer) catch unreachable;
+    const rendered = renderRequestHead(&request, target, false, &buffer) catch unreachable;
 
     var reparse_storage: parser.HeaderStorage = undefined;
     // A rendered head failing our own parser would mean the proxy emits
@@ -364,7 +378,11 @@ fn checkRequestRender(input: []const u8) void {
     const reparsed = parser.parseRequestHead(rendered, false, &reparse_storage) catch unreachable;
     assert(reparsed.method == request.method);
     assert(std.mem.eql(u8, reparsed.method_token, request.method_token));
-    assert(std.mem.eql(u8, reparsed.target, request.target));
+    // §7 canonical forwarding: the origin sees the canonical path plus the
+    // verbatim query — exactly what the router matched on.
+    assert(reparsed.target.len == target.path.len + target.query.len);
+    assert(std.mem.startsWith(u8, reparsed.target, target.path));
+    assert(std.mem.eql(u8, reparsed.target[target.path.len..], target.query));
     assert(reparsed.version == request.version);
     assert(std.meta.eql(reparsed.framing, request.framing));
     if (request.host) |host| {

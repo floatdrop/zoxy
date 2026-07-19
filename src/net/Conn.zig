@@ -10,6 +10,7 @@ const std = @import("std");
 
 const constants = @import("../constants.zig");
 const parser = @import("../http/parser.zig");
+const router = @import("../http/router.zig");
 const relay = @import("relay.zig");
 const upstream_module = @import("upstream.zig");
 
@@ -60,9 +61,14 @@ pub fn Conn(comptime IoType: type) type {
         /// memory, shrunk from the front as bytes are sent. Empty
         /// otherwise; idle on the L4 path.
         response_pending: []const u8,
-        /// The listener's cluster; the L7 path routes and dials after the
-        /// head parses, long after admission (§7).
+        /// The cluster to dial. Seeded from the listener at admission; on
+        /// the L7 path `routeRequest` overwrites it with the request
+        /// path's cluster once the head parses (§7).
         cluster_index: u16,
+        /// The listener's §7 route table (empty on the L4 path, which has
+        /// no path to match). Set once at admission and constant for the
+        /// connection's life, so it survives keep-alive turnarounds.
+        routes: []const router.Route,
         /// The leased upstream slot during an L7 exchange; released at
         /// teardown alongside the conn slot (§5). Null outside exchanges
         /// and on the whole L4 path.
@@ -265,6 +271,8 @@ pub fn Conn(comptime IoType: type) type {
             conn.head_len = 0;
             conn.response_pending = &.{};
             conn.cluster_index = cluster_index;
+            // L4 never routes by path; admitHttp installs the real table.
+            conn.routes = &.{};
             conn.upstream = null;
             conn.l7 = .{};
             conn.op_data_client_to_upstream = .{};
