@@ -20,6 +20,7 @@ const zoxy = @import("zoxy");
 
 const Io = zoxy.Io;
 const parser = zoxy.http.parser;
+const constants = zoxy.constants;
 
 const assert = std.debug.assert;
 
@@ -206,6 +207,32 @@ pub fn HttpOrigin(comptime IoType: type) type {
                 conn.beginRespond();
             }
 
+            /// True when `target` is already in §7 canonical form:
+            /// re-canonicalizing leaves the path unchanged and the query
+            /// verbatim, so path + query reproduces the target exactly.
+            /// OPTIONS asterisk-form has no path and is trivially canonical.
+            fn targetIsCanonical(conn: *Conn, target: []const u8) bool {
+                _ = conn;
+                assert(target.len >= 1);
+                if (target[0] != '/') {
+                    return true;
+                }
+                var canon_buf: [constants.head_bytes_max]u8 = undefined;
+                const canonical = parser.canonicalTarget(target, &canon_buf) catch {
+                    return false;
+                };
+                assert(canonical.path.len >= 1);
+                assert(canonical.path[0] == '/');
+                if (canonical.path.len + canonical.query.len != target.len) {
+                    return false;
+                }
+                assert(canonical.path.len <= target.len);
+                if (!std.mem.startsWith(u8, target, canonical.path)) {
+                    return false;
+                }
+                return std.mem.eql(u8, target[canonical.path.len..], canonical.query);
+            }
+
             /// Returns true when the head is parsed and the phase moved
             /// on; false when it armed a recv or closed on a violation.
             fn parseHead(conn: *Conn) bool {
@@ -228,6 +255,16 @@ pub fn HttpOrigin(comptime IoType: type) type {
                     conn.close();
                     return false;
                 };
+                // §7 canonical forwarding: the proxy sends the canonical
+                // path the router matched on, so what the origin receives
+                // must already be canonical — re-canonicalizing is a no-op.
+                // A raw dot-segment or decodable escape here would mean the
+                // router and the origin could disagree about the resource.
+                if (!conn.targetIsCanonical(request.target)) {
+                    conn.origin.violations += 1;
+                    conn.close();
+                    return false;
+                }
                 switch (request.framing) {
                     .none => conn.framing_tag = .none,
                     .content_length => |length| {
@@ -478,6 +515,12 @@ pub const Script = enum(u8) {
     /// Connects and sends nothing: the head-read deadline reaps it;
     /// any response byte is a violation.
     silent,
+    /// A GET whose path only reaches the routable resource after
+    /// canonicalization — an encoded `..` that collapses a segment away
+    /// (`/deep/%2e%2e/sim` → `/sim`). It must route and forward exactly as
+    /// `/sim` would; the origin's canonical oracle catches a raw-path
+    /// forward, and a router matching raw bytes would route it elsewhere.
+    confusion,
 };
 
 /// A verify-time verdict over everything the client received.
@@ -581,6 +624,9 @@ pub fn Client(comptime IoType: type) type {
                 .keepalive_pair => get_request,
                 .pipelined => get_request ++ get_request,
                 .silent => "",
+                // Canonicalizes to /sim (the `/deep` segment is popped by
+                // the decoded `..`), so it routes and forwards as /sim.
+                .confusion => "GET /deep/%2e%2e/sim HTTP/1.1\r\nHost: sim\r\n\r\n",
             };
         }
 
@@ -966,7 +1012,7 @@ pub fn Client(comptime IoType: type) type {
 
         fn expectedResponses(script: Script) u8 {
             return switch (script) {
-                .get, .post_sized, .post_big, .post_chunked => 1,
+                .get, .post_sized, .post_big, .post_chunked, .confusion => 1,
                 .post_chunked_malformed, .malformed_head => 1,
                 .oversize_uri, .connect_method, .pipelined => 1,
                 .keepalive_pair => 2,
@@ -993,7 +1039,7 @@ pub fn Client(comptime IoType: type) type {
         /// value unread.
         fn goldenStatus(script: Script) u16 {
             return switch (script) {
-                .get, .post_sized, .post_big, .post_chunked, .keepalive_pair, .pipelined => 200,
+                .get, .post_sized, .post_big, .post_chunked, .keepalive_pair, .pipelined, .confusion => 200,
                 .post_chunked_malformed, .malformed_head => 400,
                 .oversize_uri => 414,
                 .connect_method => 501,
@@ -1008,7 +1054,7 @@ pub fn Client(comptime IoType: type) type {
         fn methodOf(script: Script) parser.Method {
             return switch (script) {
                 .post_sized, .post_big, .post_chunked, .post_chunked_malformed => .post,
-                .get, .malformed_head, .oversize_uri => .get,
+                .get, .malformed_head, .oversize_uri, .confusion => .get,
                 .connect_method, .keepalive_pair, .pipelined, .silent => .get,
             };
         }
@@ -1020,7 +1066,7 @@ pub fn Client(comptime IoType: type) type {
         /// client may see nothing at all.
         fn statusAllowed(script: Script, status: u16) bool {
             return switch (script) {
-                .get, .post_sized, .post_big, .post_chunked, .keepalive_pair, .pipelined => //
+                .get, .post_sized, .post_big, .post_chunked, .keepalive_pair, .pipelined, .confusion => //
                 status == 200 or status == 502 or status == 503,
                 // The head routes before its body is validated, so the §8
                 // rungs and a killed dial can still precede the 400.
