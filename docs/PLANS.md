@@ -27,27 +27,9 @@ behind all four gates of §9.
   (361213f); the remaining watermarks land here.
 - **Phase 3 — TLS.** CPU worker pool + job queues for handshakes (§3 seam
   activates). The stack is an **open decision under the Zig-first policy**
-  (§4). Leading candidate (surveyed 2026-07-12): **ztls**
-  (github.com/mattrobenolt/ztls) — a sans-I/O TLS 1.3 state machine in
-  Zig. The fit is almost point-for-point: caller-owned buffers and zero
-  allocations in library code (its own claim, matching §5), both server
-  and client roles (termination + upstream re-encryption), ALPN,
-  handshake randomness injected by the caller (drivable from the
-  simulator without sockets), kTLS key-packing helpers matching the
-  proven switchover recipe, CI gated on Zig 0.16, and TLS-Anvil
-  conformance runs. Two eyes-open costs, re-check both at adoption time:
-  (1) pre-alpha — version 0.0.0, API explicitly unstable; no session
-  resumption, 0-RTT, HelloRetryRequest, or client certs yet; TLS 1.3
-  only. (2) Not pure Zig at the bottom: crypto primitives are libcrypto
-  via `@cImport` (OpenSSL/AWS-LC/BoringSSL; no pure-Zig backend), so
-  adopting it is still a deliberate C-FFI exception (§4) — though far
-  narrower than libssl, since the protocol layer stays in Zig and only
-  primitives cross the boundary; the fixed FFI heap behind
-  `CRYPTO_set_mem_functions` still applies to keep the zero-alloc
-  promise. If ztls hasn't matured by Phase 3, the fallback ladder
-  (surveyed 2026-07-12) is: **picotls** (h2o/picotls) — sans-I/O like
-  ztls, battle-tested in H2O/quicly at Fastly, feature-complete where
-  ztls is not (resumption, 0-RTT, HRR, client certs, ECH), injectable
+  (§4). Leading candidate (surveyed 2026-07-12): **picotls** (h2o/picotls)
+  — sans-I/O, battle-tested in H2O/quicly at Fastly, feature-complete
+  (resumption, 0-RTT, HRR, client certs, ECH), injectable
   `random_bytes`/`get_time` (sim-drivable), kTLS-ready via
   `ptls_export_secret`/`update_traffic_key`, and its minicrypto backend
   even drops the system-library link for termination — but the protocol
