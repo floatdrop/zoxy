@@ -725,10 +725,11 @@ test "l7: the head-read deadline reaps a slowloris that never completes" {
     try bed.expectDrained();
 }
 
-test "l7: the head-ingestion path allocates nothing after init" {
-    // §9 zero-alloc gate for L7: run a full proxied exchange under a
-    // counting allocator, then again under one that *fails* past the
-    // init count.
+test "l7: a single close-terminated exchange allocates nothing after init" {
+    // §9 zero-alloc gate for the L7 upstream leg: a full proxied
+    // exchange — dial, request head + body, response, forward, close —
+    // under a counting allocator, then again under one that *fails* past
+    // the init count.
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var bed: Http1Bed = undefined;
@@ -746,6 +747,40 @@ test "l7: the head-ingestion path allocates nothing after init" {
     try strict_bed.setUp(strict.allocator(), .{ .seed = 9, .partial_io = true, .origin_response = response });
     defer strict_bed.tearDown();
     try strict_bed.exchange("POST /p HTTP/1.1\r\nHost: o\r\nConnection: close\r\nContent-Length: 3\r\n\r\nabc");
+    try strict_bed.expectDrained();
+}
+
+test "l7: the keep-alive reuse turnaround allocates nothing after init" {
+    // §9 zero-alloc gate for the §5 park/checkout/reset path: two
+    // requests on one client connection reuse the parked upstream — the
+    // most allocation-prone L7 lifecycle code, and the one a single
+    // close-terminated exchange never touches. Counting run, then a
+    // failing run pinned to the init count.
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    const second_request = "GET /two HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    const first_request = "GET /one HTTP/1.1\r\nHost: o\r\n\r\n";
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var bed: Http1Bed = undefined;
+    try bed.setUp(failing.allocator(), .{ .seed = 50, .origin_response = response });
+    defer bed.tearDown();
+    const allocations_after_init = failing.allocations;
+    bed.client.second_request = second_request;
+    try bed.exchange(first_request);
+    try bed.expectDrained();
+    // The turnaround must actually have parked and reused the upstream,
+    // or this gates nothing.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_reused"));
+    try std.testing.expectEqual(allocations_after_init, failing.allocations);
+
+    var strict = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = allocations_after_init,
+    });
+    var strict_bed: Http1Bed = undefined;
+    try strict_bed.setUp(strict.allocator(), .{ .seed = 50, .origin_response = response });
+    defer strict_bed.tearDown();
+    strict_bed.client.second_request = second_request;
+    try strict_bed.exchange(first_request);
     try strict_bed.expectDrained();
 }
 
