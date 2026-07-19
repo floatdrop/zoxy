@@ -352,6 +352,9 @@ const Http1Bed = struct {
         origin_response: []const u8 = "",
         origin_listens: bool = true,
         origin_closes: bool = false,
+        /// The single route's prefix; "/" is the catch-all. A narrower
+        /// prefix lets a test drive the no-route 404 path (§7).
+        route_prefix: []const u8 = "/",
     };
 
     fn setUp(bed: *Http1Bed, gpa: std.mem.Allocator, options: Options) !void {
@@ -365,7 +368,7 @@ const Http1Bed = struct {
         });
         bed.endpoints = .{originAddress()};
         bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints }};
-        bed.routes = .{.{ .prefix = "/", .cluster_index = 0 }};
+        bed.routes = .{.{ .prefix = options.route_prefix, .cluster_index = 0 }};
         bed.listeners = .{.{ .bind_address = bindAddress(), .routes = &bed.routes, .protocol = .http }};
         bed.config = .{
             .listeners = &bed.listeners,
@@ -579,6 +582,68 @@ test "l7: a GET is proxied and the origin's response relayed back" {
     try std.testing.expect(forwarded.keep_alive);
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    try bed.expectDrained();
+}
+
+test "l7: the origin sees the canonical path, query verbatim (§7)" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 12,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    // Dot-segments collapse, %2E decodes then collapses; the query is
+    // opaque and forwarded byte-for-byte, %2F and all.
+    try bed.exchange("GET /a/%2e%2e/b/./c?x=1%2F2 HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    var storage: parser.HeaderStorage = undefined;
+    const forwarded = try parser.parseRequestHead(
+        bed.origin.conn.request_buffer[0..bed.origin.conn.request_len],
+        false,
+        &storage,
+    );
+    // Router and origin agree on the same canonical resource: /a/.. pops
+    // to /, then /b/./c collapses to /b/c; the query rides along untouched.
+    try std.testing.expectEqualStrings("/b/c?x=1%2F2", forwarded.target);
+    try bed.expectDrained();
+}
+
+test "l7: an unroutable path is answered 404" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{ .seed = 13, .route_prefix = "/api" });
+    defer bed.tearDown();
+
+    // The only route is /api; /elsewhere matches nothing, so the origin is
+    // never dialed and the client gets a 404 (§7, §8).
+    try bed.exchange("GET /elsewhere HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_no_route"));
+    try std.testing.expectEqual(@as(u64, 0), bed.origin.requests_served);
+    try bed.expectDrained();
+}
+
+test "l7: a structure-changing escape in the path is answered 400" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{ .seed = 14 });
+    defer bed.tearDown();
+
+    // %2F is an encoded slash: it would change the path's structure, so
+    // the canonicalizer rejects it before routing (§7).
+    try bed.exchange("GET /a%2Fb HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_request"));
     try bed.expectDrained();
 }
 

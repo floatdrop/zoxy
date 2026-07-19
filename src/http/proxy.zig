@@ -35,6 +35,7 @@ const conn_module = @import("../net/Conn.zig");
 const Io = @import("../io/io.zig");
 const parser = @import("parser.zig");
 const render = @import("render.zig");
+const router = @import("router.zig");
 const shed = @import("../shed.zig");
 
 const assert = std.debug.assert;
@@ -120,10 +121,49 @@ pub fn Proxy(comptime IoType: type) type {
             routeRequest(server, conn, &request);
         }
 
+        /// The cluster for `request`'s canonical path (§7). Origin-form is
+        /// canonicalized and matched by longest prefix; OPTIONS
+        /// asterisk-form has no path and routes to the catch-all. A target
+        /// that will not canonicalize is BadPath (400); an unmatched path
+        /// is NoRoute (404).
+        fn resolveCluster(
+            conn: *ConnType,
+            request: *const parser.RequestHead,
+            scratch: *[constants.head_bytes_max]u8,
+        ) error{ BadPath, NoRoute }!u16 {
+            assert(request.target.len >= 1);
+            assert(conn.routes.len >= 1);
+            if (request.target[0] != '/') {
+                // validateTarget admitted only asterisk-form here.
+                assert(request.method == .options);
+                return router.catchAll(conn.routes) orelse error.NoRoute;
+            }
+            const canonical = parser.canonicalTarget(request.target, scratch) catch {
+                return error.BadPath;
+            };
+            return router.route(conn.routes, canonical.path) orelse error.NoRoute;
+        }
+
+        /// The canonical bytes to forward for `request` (§7): origin-form
+        /// canonicalizes, OPTIONS asterisk-form passes through. routeRequest
+        /// already proved canonicalization succeeds, so this cannot fail —
+        /// the same bytes are the single source of truth.
+        fn effectiveTarget(
+            request: *const parser.RequestHead,
+            scratch: *[constants.head_bytes_max]u8,
+        ) parser.CanonicalTarget {
+            assert(request.target.len >= 1);
+            if (request.target[0] != '/') {
+                return .{ .path = request.target, .query = "" };
+            }
+            return parser.canonicalTarget(request.target, scratch) catch unreachable;
+        }
+
         /// Policy gate, then the exchange's admission: tunnels and
-        /// upgrades are non-goals (§1, §7) — 501; a routable request
-        /// claims its relay buffer and upstream slot (§8 rungs, 503) and
-        /// dials the balancer's pick for the listener's cluster.
+        /// upgrades are non-goals (§1, §7) — 501; the canonical path
+        /// selects a cluster (400 if it will not canonicalize, 404 if no
+        /// route matches, §7/§8); a routable request then claims its
+        /// relay buffer and upstream slot (§8 rungs, 503) and dials.
         fn routeRequest(server: *ServerType, conn: *ConnType, request: *const parser.RequestHead) void {
             assert(conn.state == .l7_reading_head);
             assert(request.head_len <= conn.head_len);
@@ -133,6 +173,15 @@ pub fn Proxy(comptime IoType: type) type {
             if (parser.headerValue(request.headers, "upgrade") != null) {
                 return respond(server, conn, 501, "l7_not_implemented");
             }
+
+            // §7 path routing: canonicalize the target and match it to a
+            // cluster before acquiring any resource, so a bad path or an
+            // unrouted one is rejected cheaply.
+            var scratch: [constants.head_bytes_max]u8 = undefined;
+            conn.cluster_index = resolveCluster(conn, request, &scratch) catch |err| switch (err) {
+                error.BadPath => return respond(server, conn, 400, "l7_bad_request"),
+                error.NoRoute => return respond(server, conn, 404, "l7_no_route"),
+            };
 
             conn.relay_buffer = server.acquireRelayBuffer() orelse {
                 return respond(server, conn, 503, "l7_shed_relay_buffers");
@@ -230,10 +279,14 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_dialing);
             assert(request.head_len == conn.l7.request_head_len);
             const upstream = conn.upstream.?;
+            // Forward the §7 canonical target the router matched on, so the
+            // origin and the router never disagree about the resource.
+            var scratch: [constants.head_bytes_max]u8 = undefined;
+            const target = effectiveTarget(request, &scratch);
             // No close announcement upstream: the connection is a parking
             // candidate (§5), and stripping the client's Connection header
             // already made persistence the wire default.
-            const rendered = render.renderRequestHead(request, false, &upstream.head) catch {
+            const rendered = render.renderRequestHead(request, target, false, &upstream.head) catch {
                 // Valid on arrival but no longer fits after edits: the §7
                 // oversize-after-edits verdict.
                 return respond(server, conn, 431, "l7_headers_too_large");

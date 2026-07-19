@@ -34,6 +34,20 @@ pub fn route(routes: []const Route, path: []const u8) ?u16 {
     return null;
 }
 
+/// The cluster of the catch-all route (`prefix == "/"`), or null if the
+/// table has none. Used for a target with no path — OPTIONS asterisk-form
+/// (§7) — which cannot match a path prefix but still names the whole
+/// server.
+pub fn catchAll(routes: []const Route) ?u16 {
+    assert(routes.len >= 1);
+    for (routes) |candidate| {
+        if (candidate.prefix.len == 1 and candidate.prefix[0] == '/') {
+            return candidate.cluster_index;
+        }
+    }
+    return null;
+}
+
 /// A prefix matches only when it covers whole path segments: the path
 /// equals the prefix, the prefix is slash-terminated, or the byte right
 /// after the prefix is `/`. So `/api` matches `/api` and `/api/v1` but
@@ -94,4 +108,16 @@ test "router: a slash-terminated prefix matches its whole subtree" {
     try std.testing.expectEqual(@as(?u16, 5), route(&routes, "/assets/img.png"));
     // "/assets" (no trailing slash) is not under "/assets/"; catch-all.
     try std.testing.expectEqual(@as(?u16, 0), route(&routes, "/assets"));
+}
+
+test "router: catchAll finds the root route for pathless targets" {
+    const with_root = [_]Route{
+        .{ .prefix = "/api", .cluster_index = 1 },
+        .{ .prefix = "/", .cluster_index = 7 },
+    };
+    try std.testing.expectEqual(@as(?u16, 7), catchAll(&with_root));
+    const without_root = [_]Route{
+        .{ .prefix = "/api", .cluster_index = 1 },
+    };
+    try std.testing.expectEqual(@as(?u16, null), catchAll(&without_root));
 }
