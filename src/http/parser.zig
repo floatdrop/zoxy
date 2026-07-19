@@ -121,6 +121,47 @@ pub const ResponseHead = struct {
     head_len: u32,
 };
 
+/// The raw request-line and header outputs hparse fills. Kept in the
+/// caller's frame and written through by pointer so `parseRequestHead`
+/// copies no [headers_max]Header.
+const RawRequest = struct {
+    method: hparse.Method = .unknown,
+    method_token: ?[]const u8 = null,
+    target: ?[]const u8 = null,
+    version: hparse.Version = .@"1.0",
+    headers: [constants.headers_max]hparse.Header = undefined,
+    header_count: usize = 0,
+};
+
+/// Runs hparse over the request line and headers, mapping its verdicts
+/// to head errors (§7): a head that cannot complete inside a full buffer
+/// is oversize, not partial (request line still open → 414, else 431);
+/// Invalid is malformed; a full header array is load, not malice.
+fn parseRequestRaw(head: []const u8, head_is_full: bool, raw: *RawRequest) HeadError!u32 {
+    const head_len = hparse.parseRequest(
+        head,
+        &raw.method,
+        &raw.method_token,
+        &raw.target,
+        &raw.version,
+        &raw.headers,
+        &raw.header_count,
+    ) catch |err| switch (err) {
+        error.Incomplete => {
+            if (head_is_full) {
+                return oversizeRequestError(head);
+            }
+            return error.Incomplete;
+        },
+        error.Invalid => return error.Malformed,
+        error.TooManyHeaders => return error.HeadTooLarge,
+    };
+    assert(head_len >= 1);
+    assert(head_len <= head.len);
+    assert(raw.header_count <= constants.headers_max);
+    return @intCast(head_len);
+}
+
 /// Parses and validates one request head from `head`. `head_is_full` says
 /// the head buffer has no room left, turning a partial parse into the 414
 /// vs 431 oversize verdict instead of `error.Incomplete` (§7, §8).
@@ -134,45 +175,17 @@ pub fn parseRequestHead(
         assert(head.len >= 1);
     }
 
-    var raw_method: hparse.Method = .unknown;
-    var raw_method_token: ?[]const u8 = null;
-    var raw_target: ?[]const u8 = null;
-    var raw_version: hparse.Version = .@"1.0";
-    var raw_headers: [constants.headers_max]hparse.Header = undefined;
-    var raw_header_count: usize = 0;
-    const head_len = hparse.parseRequest(
-        head,
-        &raw_method,
-        &raw_method_token,
-        &raw_target,
-        &raw_version,
-        &raw_headers,
-        &raw_header_count,
-    ) catch |err| switch (err) {
-        // A head that cannot complete inside a full buffer is oversize,
-        // not partial (§7): request line still open → 414, else 431.
-        error.Incomplete => {
-            if (head_is_full) {
-                return oversizeRequestError(head);
-            }
-            return error.Incomplete;
-        },
-        error.Invalid => return error.Malformed,
-        // The bounded header array filling up is load, not malice (§7).
-        error.TooManyHeaders => return error.HeadTooLarge,
-    };
-    assert(head_len >= 1);
-    assert(head_len <= head.len);
-    assert(raw_header_count <= constants.headers_max);
+    var raw: RawRequest = .{};
+    const head_len = try parseRequestRaw(head, head_is_full, &raw);
 
-    const target = raw_target.?; // A successful parse always sets the target.
-    const method_token = raw_method_token.?; // Same contract as the target.
+    const target = raw.target.?; // A successful parse always sets the target.
+    const method_token = raw.method_token.?; // Same contract as the target.
     assert(method_token.len >= 1);
-    const method = methodFromRaw(raw_method);
+    const method = methodFromRaw(raw.method);
     try validateTarget(target, method);
-    const version = versionFromRaw(raw_version);
+    const version = versionFromRaw(raw.version);
 
-    const analysis = try analyzeHeaders(raw_headers[0..raw_header_count], headers_storage);
+    const analysis = try analyzeHeaders(raw.headers[0..raw.header_count], headers_storage);
     // An HTTP/1.1 request must carry exactly one Host (RFC 9112 §3.2);
     // duplicates were already rejected during analysis.
     if (version == .http_1_1) {
@@ -188,11 +201,11 @@ pub fn parseRequestHead(
         .method_token = method_token,
         .target = target,
         .version = version,
-        .headers = headers_storage[0..raw_header_count],
+        .headers = headers_storage[0..raw.header_count],
         .host = analysis.host,
         .framing = framing,
         .keep_alive = keepAliveDefault(version, &analysis),
-        .head_len = @intCast(head_len),
+        .head_len = head_len,
     };
 }
 
