@@ -190,6 +190,9 @@ const Harness = struct {
             .partial_io = true,
             .connect_delay_ns_max = random.uintAtMost(u64, 5_000_000),
             .connect_refuse_percent = random.uintAtMost(u8, 20),
+            // A blackholed dial hangs until the connect deadline — the §8
+            // dial-timeout 504 path, exercised under schedule fuzz.
+            .connect_blackhole_percent = random.uintAtMost(u8, 10),
             .reset_percent = random.uintAtMost(u8, 10),
             .kernel_pressure_percent = random.uintAtMost(u8, 8),
         };
@@ -198,9 +201,19 @@ const Harness = struct {
     fn deriveTopology(harness: *Harness, random: std.Random) void {
         harness.endpoints_l4 = .{originAddress()};
         harness.endpoints_http = .{httpOriginAddress()};
+        // Each cluster draws its pick policy independently so mixed
+        // rr+p2c configs (one cluster each way) flow through the balancer
+        // under the schedule fuzz, not just the two uniform pairings.
+        // Single-endpoint clusters short-circuit either policy identically
+        // today; the draw is pre-wired coverage for a multi-endpoint
+        // topology.
+        const pick_l4: zoxy.config.Config.Cluster.Pick =
+            if (random.boolean()) .p2c else .rr;
+        const pick_http: zoxy.config.Config.Cluster.Pick =
+            if (random.boolean()) .p2c else .rr;
         harness.clusters = .{
-            .{ .name = "origin-l4", .endpoints = &harness.endpoints_l4 },
-            .{ .name = "origin-http", .endpoints = &harness.endpoints_http },
+            .{ .name = "origin-l4", .endpoints = &harness.endpoints_l4, .pick = pick_l4 },
+            .{ .name = "origin-http", .endpoints = &harness.endpoints_http, .pick = pick_http },
         };
         harness.routes_l4 = .{.{ .prefix = "/", .cluster_index = 0 }};
         harness.routes_http = .{.{ .prefix = "/", .cluster_index = 1 }};
@@ -261,12 +274,19 @@ const Harness = struct {
             }
         else
             .{
+                // Clean seeds size every pool so its §8 pressure
+                // watermark (ceil of 3/4 capacity: 9 of 12) sits above
+                // the whole client population (6): a golden outcome must
+                // never meet a pressure-announced close or a shortened
+                // parked deadline — correct behavior, but not the
+                // script's exact transcript. All three flags (relay,
+                // conn, upstream) ride this margin; a clean-seed client
+                // bump must re-check it, and the upstream margin also
+                // rides the single-endpoint topology (checkout-before-
+                // dial caps acquired at the live client count — parked
+                // conns per endpoint could accumulate past it under a
+                // multi-endpoint clean topology).
                 .conn_slots = 2 * clients_max,
-                // Clean seeds size the pool so the §8 pressure watermark
-                // (ceil of 3/4 capacity) sits above the whole client
-                // population: a golden outcome must never meet a
-                // pressure-announced close, which is correct behavior
-                // but not the script's exact transcript.
                 .relay_buffers = if (harness.clean) 2 * clients_max else clients_max,
                 .upstream_slots = 2 * clients_max,
             };

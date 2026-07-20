@@ -184,6 +184,16 @@ pub fn Conn(comptime IoType: type) type {
             /// True once any response byte reached the client — the §8
             /// verdict split between answering 502 and plain teardown.
             response_started: bool = false,
+            /// A verdict decided while data ops were still armed, acted on
+            /// when the last one settles: ops are never canceled (§5), they
+            /// are *forced* — the upstream socket is shut down and each
+            /// armed op completes with an error its handler diverts on.
+            pending_verdict: PendingVerdict = .none,
+            /// The armed request-leg op is a recv on the CLIENT socket
+            /// (the body pump). Such an op cannot be forced without closing
+            /// the client the verdict would answer, so expiry stays a
+            /// teardown then — the stall is the client's own body (§8).
+            request_op_on_client: bool = false,
             /// The client's persistence ask (RFC 9112 §9), captured at
             /// routing; the render-time decision may still announce close
             /// (pressure, drain, §8).
@@ -200,6 +210,17 @@ pub fn Conn(comptime IoType: type) type {
             /// exchange completes and the connection closes, dropping the
             /// early bytes (§2 note; clients recover per RFC).
             client_pipelined: bool = false,
+            /// This try runs over a checked-out parked connection (§5) —
+            /// the precondition for the §7 stale replay: only a *reused*
+            /// connection's early failure is blamed on staleness.
+            upstream_was_reused: bool = false,
+            /// The request leg entered the body pump: relay-buffer chunks
+            /// flowed and were overwritten, so the try is no longer
+            /// reconstructible from conn.head — replay is off the table.
+            request_body_pumped: bool = false,
+            /// The one free replay is spent (§7): a failure on the replay
+            /// try answers 502 like any other, never a second replay.
+            replay_used: bool = false,
 
             pub const Leg = enum(u8) {
                 idle,
@@ -211,6 +232,15 @@ pub fn Conn(comptime IoType: type) type {
                 sending_body_excess,
                 pumping_body,
                 done,
+            };
+
+            /// The deferred verdicts: the §8 request-deadline 504 and the
+            /// §7 stale-replay retry, both settled once the last armed
+            /// data op is forced to completion.
+            pub const PendingVerdict = enum(u8) {
+                none,
+                gateway_timeout,
+                replay,
             };
         };
 

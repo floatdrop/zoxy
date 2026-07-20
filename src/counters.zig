@@ -19,10 +19,13 @@ pub const Counters = struct {
     shed_conn_slots: Value = Value.init(0),
     /// §8 rung: relay buffers exhausted at admission → close.
     shed_relay_buffers: Value = Value.init(0),
-    /// §8 "watermarks before walls": relay-buffer pressure engaged
-    /// (false→true crossings of the high watermark). Not a shed — a bias
-    /// that precedes the wall — so it stays out of `reconcile`.
+    /// §8 "watermarks before walls": pool pressure engaged (false→true
+    /// crossings of a pool's high watermark), one counter per pool. Not
+    /// sheds — biases that precede the walls — so they stay out of
+    /// `reconcile`.
     relay_pressure_engaged: Value = Value.init(0),
+    conn_pressure_engaged: Value = Value.init(0),
+    upstream_pressure_engaged: Value = Value.init(0),
     /// §8 rung: request/idle deadline fired → teardown.
     deadline_expired: Value = Value.init(0),
     /// Upstream dial failed (refused/unreachable/canceled-by-teardown).
@@ -49,14 +52,23 @@ pub const Counters = struct {
     l7_shed_relay_buffers: Value = Value.init(0),
     l7_shed_upstream_slots: Value = Value.init(0),
     /// Upstream leg failed before any response byte reached the client:
-    /// answered 502 (§7, §8). A stale parked connection detected at
-    /// checkout lands here too until Phase 2's free replay.
+    /// answered 502 (§7, §8). A spent-replay second failure lands here
+    /// too — the one free §7 replay never loops.
     l7_bad_gateway: Value = Value.init(0),
+    /// The §8 request-deadline verdict: the deadline expired mid-exchange
+    /// with no response byte sent, answered 504. A verdict, not a shed —
+    /// the connection completes normally — but every one rides a
+    /// `deadline_expired`, an inequality `reconcile` asserts.
+    l7_gateway_timeout: Value = Value.init(0),
     /// Completed L7 exchanges: a parsed origin response relayed back.
     l7_responses: Value = Value.init(0),
     /// Exchanges served over a parked upstream connection instead of a
     /// fresh dial — the §3 reuse win, witnessed.
     upstream_reused: Value = Value.init(0),
+    /// A reused connection was stale (dead on arrival, no response byte)
+    /// and its request took the one free §7 replay on a fresh dial.
+    /// Every replay rides a reuse — an inequality `reconcile` asserts.
+    upstream_replayed: Value = Value.init(0),
     /// Parked upstream connections reaped by the idle sweep (§5).
     upstream_idle_reaped: Value = Value.init(0),
     /// §8 rung: ENOBUFS/ENOMEM-class op failures, one per treated op —
@@ -103,6 +115,12 @@ pub const Counters = struct {
             counters.get("shed_draining");
         assert(completed <= admitted);
         assert(admitted <= accepted);
+        // Every 504 verdict rides a deadline expiry (§8) — the verdict
+        // path increments both, the teardown path only the expiry.
+        assert(counters.get("l7_gateway_timeout") <= counters.get("deadline_expired"));
+        // Every §7 replay rides a checkout: only a reused connection's
+        // early failure is blamed on staleness.
+        assert(counters.get("upstream_replayed") <= counters.get("upstream_reused"));
         const flow_holds = admitted == completed + active_count;
         const gate_holds = accepted == admitted + shed;
         return flow_holds and gate_holds;

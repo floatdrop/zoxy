@@ -19,8 +19,9 @@
 //! later request — §3's shared-pool win), and the downstream connection
 //! honors what its rendered response announced (§2), going idle at the
 //! cost of a slot + head buffer only (§5). Pipelining is unsupported
-//! (first response, then an announced close); the stale-checkout free
-//! replay and the §8 504 deadline verdict are Phase 2 (docs/PLANS.md).
+//! (first response, then an announced close). A stale checkout takes one
+//! free replay on a fresh dial (§7), and an expired exchange or dial
+//! that can still be answered gets the §8 request-deadline 504 verdict.
 //!
 //! Buffer ownership rotates, never overlaps: conn.head holds the request
 //! head until it is rendered, then stages the rendered response head;
@@ -30,6 +31,7 @@
 
 const std = @import("std");
 
+const Balancer = @import("../balancer.zig").Balancer;
 const constants = @import("../constants.zig");
 const conn_module = @import("../net/Conn.zig");
 const Io = @import("../io/io.zig");
@@ -288,14 +290,15 @@ pub fn Proxy(comptime IoType: type) type {
 
             // The §3 reuse win: a parked connection to the picked endpoint
             // beats a fresh dial. A close that slipped through while it
-            // was parked surfaces as a failure on first use — answered
-            // 502 until Phase 2's free replay (docs/PLANS.md).
-            const pick = server.balancer.pick(conn.cluster_index);
+            // was parked surfaces as a failure on first use — absorbed by
+            // the §7 free replay (`upstreamFailed`).
+            const pick = server.balancer.pick(conn.cluster_index, &server.upstreams.leased_counts);
             if (server.upstreams.checkout(conn.cluster_index, pick.endpoint_index)) |parked| {
                 server.counters.increment("upstream_reused");
                 conn.upstream = parked;
                 conn.upstream_socket = parked.socket;
                 parked.head_len = 0;
+                conn.l7.upstream_was_reused = true;
                 conn.state = .l7_dialing;
                 // No await happened: this runs in the same callback as the
                 // parse whose result is still live, so the reuse path —
@@ -303,11 +306,27 @@ pub fn Proxy(comptime IoType: type) type {
                 renderRequestAndStartLegs(server, conn, request);
                 return;
             }
-            conn.upstream = server.upstreams.acquire(conn.cluster_index, pick.endpoint_index) orelse {
+            dialUpstream(server, conn, pick);
+        }
+
+        /// Acquire a fresh slot and dial `pick` under the per-try connect
+        /// deadline (§8) — shared by the first try (`routeRequest`) and
+        /// the §7 stale replay (`beginReplay`), so both tries dial
+        /// identically.
+        fn dialUpstream(server: *ServerType, conn: *ConnType, pick: Balancer.Pick) void {
+            assert(conn.state == .l7_reading_head or conn.state == .l7_exchanging);
+            assert(conn.upstream == null);
+            assert(conn.upstream_socket == null);
+            conn.upstream = server.acquireUpstream(conn.cluster_index, pick.endpoint_index) orelse {
                 return respond(server, conn, 503, "l7_shed_upstream_slots");
             };
             conn.state = .l7_dialing;
+            // The head-read/idle timer is already armed; re-base it to the
+            // tighter per-try connect budget so a hung origin fires the §8
+            // 504 at connect_timeout, not idle_timeout (§4: the lazy timer
+            // never moves earlier on its own).
             server.storeDeadline(conn, server.config.connect_timeout_ms);
+            server.rebaseDeadline(conn);
             conn.arm(&conn.op_connect, "connect");
             server.io.connect(
                 pick.address,
@@ -332,6 +351,21 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             }
             assert(conn.state == .l7_dialing);
+            if (conn.l7.pending_verdict != .none) {
+                // The §8 dial-timeout verdict: the deadline canceled this
+                // connect. Whatever the result — the expected Canceled, a
+                // genuine failure, or a success that raced the cancel —
+                // the dial is condemned; a socket that arrived anyway is
+                // attached so respond's upstream disposal closes it.
+                assert(conn.l7.pending_verdict == .gateway_timeout);
+                conn.l7.pending_verdict = .none;
+                if (result) |socket| {
+                    conn.upstream.?.socket = socket;
+                    conn.upstream_socket = socket;
+                } else |_| {}
+                respond(server, conn, 504, "l7_gateway_timeout");
+                return;
+            }
             const socket = result catch {
                 server.counters.increment("upstream_connect_failed");
                 respond(server, conn, 502, "l7_bad_gateway");
@@ -418,6 +452,7 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.l7.request_leg == .sending_head);
             const l7 = &conn.l7;
             assert(l7.request_head_sent < l7.rendered_request_len);
+            l7.request_op_on_client = false; // A send on the upstream socket.
             conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.send(
                 conn.upstream_socket.?,
@@ -438,6 +473,10 @@ pub fn Proxy(comptime IoType: type) type {
             }
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.request_leg == .sending_head);
+            if (conn.l7.pending_verdict != .none) {
+                settlePendingVerdict(server, conn);
+                return;
+            }
             const sent = result catch |err| {
                 server.witnessKernelPressure(err);
                 upstreamFailed(server, conn);
@@ -501,6 +540,7 @@ pub fn Proxy(comptime IoType: type) type {
             const direction = &conn.directions[0];
             assert(direction.sent_len < direction.transfer_len);
             const base = conn.l7.request_head_len;
+            conn.l7.request_op_on_client = false; // A send on the upstream socket.
             conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.send(
                 conn.upstream_socket.?,
@@ -521,6 +561,10 @@ pub fn Proxy(comptime IoType: type) type {
             }
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.request_leg == .sending_body_excess);
+            if (conn.l7.pending_verdict != .none) {
+                settlePendingVerdict(server, conn);
+                return;
+            }
             const sent = result catch |err| {
                 server.witnessKernelPressure(err);
                 upstreamFailed(server, conn);
@@ -558,6 +602,9 @@ pub fn Proxy(comptime IoType: type) type {
                 conn.l7.request_leg = .done;
             } else {
                 conn.l7.request_leg = .pumping_body;
+                // Relay chunks will flow and be overwritten: from here the
+                // try is no longer reconstructible — no replay (§7).
+                conn.l7.request_body_pumped = true;
                 armRequestBodyRecv(server, conn);
             }
         }
@@ -565,6 +612,9 @@ pub fn Proxy(comptime IoType: type) type {
         fn armRequestBodyRecv(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.request_leg == .pumping_body);
+            // A recv on the CLIENT socket: an expiry cannot force it, so
+            // the deadline verdict is unanswerable while this op is armed.
+            conn.l7.request_op_on_client = true;
             conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recv(
                 conn.client_socket,
@@ -585,6 +635,9 @@ pub fn Proxy(comptime IoType: type) type {
             }
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.request_leg == .pumping_body);
+            // A client-side recv is never armed under a pending verdict:
+            // expiry is unanswerable then, and a verdict arms nothing.
+            assert(conn.l7.pending_verdict == .none);
             const received = result catch |err| {
                 // EOF mid-body is a truncated request; any failure here
                 // dooms the exchange in the client's own direction.
@@ -612,6 +665,9 @@ pub fn Proxy(comptime IoType: type) type {
             } else {
                 assert(feed.done);
                 conn.l7.request_leg = .done;
+                // The delivered recv was the flag's referent; keep the
+                // flag self-descriptive now that no request op is armed.
+                conn.l7.request_op_on_client = false;
             }
         }
 
@@ -619,6 +675,7 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_exchanging);
             const direction = &conn.directions[0];
             assert(direction.sent_len < direction.transfer_len);
+            conn.l7.request_op_on_client = false; // A send on the upstream socket.
             conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.send(
                 conn.upstream_socket.?,
@@ -639,6 +696,10 @@ pub fn Proxy(comptime IoType: type) type {
             }
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.request_leg == .pumping_body);
+            if (conn.l7.pending_verdict != .none) {
+                settlePendingVerdict(server, conn);
+                return;
+            }
             const sent = result catch |err| {
                 server.witnessKernelPressure(err);
                 upstreamFailed(server, conn);
@@ -694,6 +755,10 @@ pub fn Proxy(comptime IoType: type) type {
             }
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.response_leg == .awaiting_head);
+            if (conn.l7.pending_verdict != .none) {
+                settlePendingVerdict(server, conn);
+                return;
+            }
             const received = result catch |err| {
                 server.witnessKernelPressure(err);
                 upstreamFailed(server, conn);
@@ -785,13 +850,16 @@ pub fn Proxy(comptime IoType: type) type {
 
             // The §8 persistence decision, made once and honored: honor
             // the client's ask unless pipelining, pressure, or drain says
-            // otherwise — then announce whatever was decided (§2). An
-            // until-close body forces the close unconditionally: the FIN
-            // is the only thing delimiting the relayed body for the
-            // client, exactly as it delimited it for us.
+            // otherwise — then announce whatever was decided (§2).
+            // Downstream pressure — relay buffers or conn slots near their
+            // walls — stops honoring keep-alive so idle capacity returns
+            // (§8 watermarks). An until-close body forces the close
+            // unconditionally: the FIN is the only thing delimiting the
+            // relayed body for the client, exactly as it delimited it
+            // for us.
             const keep_downstream = conn.l7.client_keep_alive and
                 !conn.l7.client_pipelined and !server.draining and
-                !server.relay_pressure and response.framing != .until_close;
+                !server.downstreamPressured() and response.framing != .until_close;
             conn.l7.downstream_close_announced = !keep_downstream;
             conn.l7.upstream_reusable = response.keep_alive;
             const rendered = render.renderResponseHead(
@@ -863,6 +931,9 @@ pub fn Proxy(comptime IoType: type) type {
             }
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.response_leg == .sending_head);
+            // response_started blocks the verdict, so none is pending in
+            // any response-send handler (negative space).
+            assert(conn.l7.pending_verdict == .none);
             const sent = result catch |err| {
                 // The client is gone; nothing to answer anyone.
                 server.witnessKernelPressure(err);
@@ -913,6 +984,7 @@ pub fn Proxy(comptime IoType: type) type {
             }
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.response_leg == .sending_body_excess);
+            assert(conn.l7.pending_verdict == .none); // response_started.
             const sent = result catch |err| {
                 server.witnessKernelPressure(err);
                 server.beginTeardown(conn);
@@ -964,6 +1036,7 @@ pub fn Proxy(comptime IoType: type) type {
             }
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.response_leg == .pumping_body);
+            assert(conn.l7.pending_verdict == .none); // response_started.
             const received = result catch |err| {
                 if (err == error.EndOfStream) {
                     if (conn.l7.response_framing == .until_close) {
@@ -1020,6 +1093,7 @@ pub fn Proxy(comptime IoType: type) type {
             }
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.response_leg == .pumping_body);
+            assert(conn.l7.pending_verdict == .none); // response_started.
             const sent = result catch |err| {
                 server.witnessKernelPressure(err);
                 server.beginTeardown(conn);
@@ -1071,14 +1145,16 @@ pub fn Proxy(comptime IoType: type) type {
         /// Park the leased upstream on its endpoint's idle list (§5): the
         /// socket stays open with no armed op, the stored deadline hands
         /// reaping to the Server's sweep, and the conn detaches so its
-        /// teardown cannot close a connection it no longer owns.
+        /// teardown cannot close a connection it no longer owns. Under
+        /// upstream pressure the parked deadline shortens (§8 watermarks)
+        /// so idle parked sockets free their slots before the 503 wall.
         fn parkUpstream(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
             const upstream = conn.upstream.?;
             assert(!upstream.parked);
             server.upstreams.park(upstream);
             upstream.deadline_ns = server.io.nowNs() +
-                @as(u64, server.idleTimeoutMs()) * std.time.ns_per_ms;
+                @as(u64, server.parkedTimeoutMs()) * std.time.ns_per_ms;
             server.ensureUpstreamSweep();
             conn.upstream = null;
             conn.upstream_socket = null;
@@ -1093,7 +1169,7 @@ pub fn Proxy(comptime IoType: type) type {
             assert(!conn.armed.data_upstream_to_client);
             if (conn.upstream) |leased| {
                 server.io.closeNow(conn.upstream_socket.?);
-                server.upstreams.release(leased);
+                server.releaseUpstream(leased);
                 conn.upstream = null;
                 conn.upstream_socket = null;
             }
@@ -1107,7 +1183,15 @@ pub fn Proxy(comptime IoType: type) type {
         fn resetForNextRequest(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
             assert(conn.upstream == null);
-            assert(conn.armedCount() <= 1); // Only the deadline timer.
+            // The exchange is fully settled: no data or dial ops in flight.
+            // The lazy deadline timer stays armed across the turnaround (§4),
+            // and a dial rebase (§8) cancel may still be draining if the
+            // exchange outran it — both re-establish the next idle deadline.
+            assert(!conn.armed.data_client_to_upstream);
+            assert(!conn.armed.data_upstream_to_client);
+            assert(!conn.armed.connect);
+            assert(!conn.armed.connect_cancel);
+            assert(conn.armed.deadline or conn.armed.deadline_cancel);
             server.releaseRelayBuffer(conn.relay_buffer.?);
             conn.relay_buffer = null;
             conn.head_len = 0;
@@ -1118,7 +1202,149 @@ pub fn Proxy(comptime IoType: type) type {
             armHeadRecv(server, conn);
         }
 
-        /// The upstream leg failed. Answer 502 only when the client has
+        /// Whether an expired exchange can still be answered 504 (§8): no
+        /// response byte sent, and no armed op held on the *client* socket
+        /// — a client-side recv cannot be forced without closing the very
+        /// client the verdict would answer, and a stalled request body is
+        /// the client's own stall anyway. In the deferred-render window an
+        /// origin response may already sit parsed but unsent; it is
+        /// discarded — no byte of it reached the client, and the exchange
+        /// it belonged to could not complete regardless.
+        pub fn expiryAnswerable(conn: *const ConnType) bool {
+            assert(conn.state == .l7_exchanging);
+            if (conn.l7.response_started) {
+                return false;
+            }
+            if (conn.armed.data_client_to_upstream and conn.l7.request_op_on_client) {
+                return false;
+            }
+            return true;
+        }
+
+        /// Begin the §8 request-deadline verdict. Ops are never canceled
+        /// (§5) — they are *forced*: shutting the upstream socket down
+        /// makes each armed op on it complete with an error its handler
+        /// diverts to `settlePendingVerdict`. In `.l7_exchanging` at least
+        /// one data op is always armed (each leg holds its op while it
+        /// waits), so the verdict always settles in a forced completion,
+        /// never inline here.
+        pub fn beginExpiry(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_exchanging);
+            assert(conn.l7.pending_verdict == .none);
+            assert(expiryAnswerable(conn));
+            assert(conn.armed.data_client_to_upstream or
+                conn.armed.data_upstream_to_client);
+            conn.l7.pending_verdict = .gateway_timeout;
+            server.io.shutdown(conn.upstream_socket.?, .both);
+        }
+
+        /// A completion landed with a verdict pending: once the last data
+        /// op settles, act on it. The forced op's result — error or a
+        /// racing data delivery already in flight — is deliberately
+        /// ignored, the exchange is condemned either way; and because the
+        /// divert runs before any error handling, a forced EPIPE never
+        /// pollutes the kernel-pressure witness.
+        fn settlePendingVerdict(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_exchanging);
+            assert(conn.l7.pending_verdict != .none);
+            if (conn.armed.data_client_to_upstream or
+                conn.armed.data_upstream_to_client)
+            {
+                return; // The sibling's forced completion re-enters here.
+            }
+            const verdict = conn.l7.pending_verdict;
+            conn.l7.pending_verdict = .none;
+            switch (verdict) {
+                .none => unreachable,
+                .gateway_timeout => respond(server, conn, 504, "l7_gateway_timeout"),
+                .replay => beginReplay(server, conn),
+            }
+        }
+
+        /// Whether a failed try may take the one free §7 replay: the
+        /// connection was a checkout (only a *reused* connection's early
+        /// failure is blamed on staleness — a fresh dial's failure is the
+        /// origin's own), the replay is unspent, no response byte was
+        /// received, and the request leg never entered the body pump — the
+        /// whole try (head, and any body that arrived coalesced with it)
+        /// then still sits intact in conn.head, byte-for-byte
+        /// reconstructible. Once relay-buffer chunks flowed they were
+        /// overwritten and the origin may have consumed them: no replay.
+        /// This covers the dominant real case — a GET whose head send
+        /// landed in the kernel buffer while the parked origin's FIN was
+        /// already in flight, surfacing as EOF at the response recv with
+        /// the request leg already done.
+        fn replayEligible(conn: *const ConnType) bool {
+            assert(conn.state == .l7_exchanging);
+            if (!conn.l7.upstream_was_reused) {
+                return false;
+            }
+            if (conn.l7.replay_used) {
+                return false;
+            }
+            if (conn.l7.response_started) {
+                return false;
+            }
+            if (conn.upstream.?.head_len != 0) {
+                return false; // A response byte arrived: the origin spoke.
+            }
+            if (conn.l7.request_body_pumped) {
+                return false; // Relay chunks flowed; not reconstructible.
+            }
+            assert(conn.l7.request_leg != .idle);
+            assert(conn.l7.request_leg != .pumping_body); // Implied by the flag.
+            return true;
+        }
+
+        /// Take the one free replay: dispose the stale connection and run
+        /// the fresh-dial try from the same client bytes. The verdict is
+        /// already cleared; the caller (settle) proved both data ops free.
+        fn beginReplay(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_exchanging);
+            assert(conn.l7.pending_verdict == .none);
+            assert(conn.l7.replay_used); // Spent before the try began.
+            assert(!conn.armed.data_client_to_upstream);
+            assert(!conn.armed.data_upstream_to_client);
+            assert(!conn.l7.response_started);
+            assert(conn.relay_buffer != null); // Retained across the replay.
+            const stale = conn.upstream.?;
+            assert(stale.head_len == 0);
+            server.io.closeNow(conn.upstream_socket.?);
+            server.releaseUpstream(stale);
+            conn.upstream = null;
+            conn.upstream_socket = null;
+            server.counters.increment("upstream_replayed");
+            // Rebuild the per-try state from the §7 source of truth — the
+            // client's bytes, intact in conn.head (the eligible legs sent
+            // only from it). The same bytes parsed at routing, so this
+            // cannot fail; the framing tracker MUST re-derive from the
+            // parse — the coalesced excess was already fed once and will
+            // be fed again on the fresh try.
+            var storage: parser.HeaderStorage = undefined;
+            const request = parser.parseRequestHead(
+                conn.head[0..conn.head_len],
+                false,
+                &storage,
+            ) catch unreachable;
+            assert(request.head_len == conn.l7.request_head_len);
+            conn.l7 = .{
+                .request_method = conn.l7.request_method,
+                .request_framing = framingFromParsed(request.framing),
+                .request_head_len = conn.l7.request_head_len,
+                .client_keep_alive = conn.l7.client_keep_alive,
+                .replay_used = true,
+                // upstream_was_reused stays default-false: the replay try
+                // is a fresh dial, and a second early failure answers 502.
+            };
+            conn.directions = .{ .{}, .{} };
+            // A fresh pick and a fresh dial — never another checkout (§7):
+            // the endpoint's whole idle list may be stale the same way.
+            const pick = server.balancer.pick(conn.cluster_index, &server.upstreams.leased_counts);
+            dialUpstream(server, conn, pick);
+        }
+
+        /// The upstream leg failed. A stale checkout takes its one free
+        /// replay (§7); otherwise answer 502 only when the client has
         /// seen no response byte and both data ops are free — the static
         /// response and its lingering drain need them, and ops are never
         /// canceled (§5). Otherwise the only honest outcome is teardown: a
@@ -1126,6 +1352,17 @@ pub fn Proxy(comptime IoType: type) type {
         /// completion the answer would need.
         fn upstreamFailed(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
+            assert(conn.l7.pending_verdict == .none); // Handlers divert first.
+            if (replayEligible(conn)) {
+                conn.l7.pending_verdict = .replay;
+                conn.l7.replay_used = true; // Spent now: a loop is impossible.
+                // Force the sibling op, if armed (the response recv during
+                // an excess send); settle acts immediately when both are
+                // already free (the head-send failure case).
+                server.io.shutdown(conn.upstream_socket.?, .both);
+                settlePendingVerdict(server, conn);
+                return;
+            }
             if (conn.l7.response_started or conn.armed.data_client_to_upstream or
                 conn.armed.data_upstream_to_client)
             {
@@ -1167,7 +1404,7 @@ pub fn Proxy(comptime IoType: type) type {
                 if (conn.upstream_socket) |socket| {
                     server.io.closeNow(socket);
                 }
-                server.upstreams.release(leased);
+                server.releaseUpstream(leased);
                 conn.upstream = null;
                 conn.upstream_socket = null;
             }

@@ -5,10 +5,10 @@
 //! choke point. Admission forks on the listener's protocol: an `l4`
 //! listener runs the strict TCP relay (`net/relay.zig`), an `http`
 //! listener runs the L7 state machine (`http/proxy.zig`); the shared
-//! accept gate, deadline, and teardown machinery serve both. The L7
-//! request path is filling in slice by slice — head ingestion and the
-//! static-response rejects are in; the upstream leg follows — so a valid
-//! L7 request currently tears down once its head is parsed.
+//! accept gate, deadline, and teardown machinery serve both, as do the
+//! §8 pressure watermarks (one rule, three pools) and the deadline's
+//! request-expiry verdict fork (§8: 504 when answerable, teardown
+//! otherwise).
 
 const std = @import("std");
 
@@ -47,11 +47,17 @@ pub fn Server(comptime IoType: type) type {
         balancer: Balancer,
         counters: counters_module.Counters,
         draining: bool,
-        /// §8 watermark state for the relay-buffer pool: set once the pool
-        /// crosses its high watermark, cleared once it drains back below
-        /// the low one (hysteresis). Biases idle timeouts shorter so quiet
-        /// connections return their buffers before the wall is reached.
+        /// §8 watermark state, one flag per pool: set once a pool crosses
+        /// its high watermark, cleared once it drains back below the low
+        /// one (hysteresis, `constants.poolPressureOn/Off`). Relay and
+        /// conn pressure bias downstream capacity — shorter idle timeouts
+        /// and keep-alive no longer honored — so quiet connections return
+        /// their buffers and slots before the wall is reached; upstream
+        /// pressure shortens parked-connection deadlines so idle parked
+        /// sockets free their slots for fresh dials before the 503 wall.
         relay_pressure: bool,
+        conn_pressure: bool,
+        upstream_pressure: bool,
         drain_deadline_completion: IoType.Completion,
         /// The one timer covering every parked upstream (§5): a parked
         /// connection holds no armed op, so this sweep compares stored
@@ -68,12 +74,10 @@ pub fn Server(comptime IoType: type) type {
         const Proxy = proxy.Proxy(IoType);
 
         /// Pool sizes are injectable so tests and the simulator can force
-        /// every exhaustion rung; production uses the §5 defaults.
-        pub const InitOptions = struct {
-            conn_slots: u32 = constants.conn_slots_max,
-            relay_buffers: u32 = constants.relay_buffers_max,
-            upstream_slots: u32 = constants.upstream_slots_max,
-        };
+        /// every exhaustion rung; production passes the config's resolved
+        /// `limits` (§5) — one type, so a new limit cannot silently
+        /// default in a hand-written bridge.
+        pub const InitOptions = config_module.Config.Limits;
 
         const ListenerState = struct {
             server: *Self,
@@ -114,10 +118,12 @@ pub fn Server(comptime IoType: type) type {
             try server.upstreams.init(arena, options.upstream_slots);
             server.listeners = try arena.alloc(ListenerState, config.listeners.len);
             server.listeners_count = @intCast(config.listeners.len);
-            try server.balancer.init(arena, config);
+            server.balancer.init(config);
             server.counters = .{};
             server.draining = false;
             server.relay_pressure = false;
+            server.conn_pressure = false;
+            server.upstream_pressure = false;
             server.drain_deadline_completion = .{};
             server.upstream_sweep_completion = .{};
             server.upstream_sweep_armed = false;
@@ -215,7 +221,7 @@ pub fn Server(comptime IoType: type) type {
                 if (!reap_all and upstream.deadline_ns > now) continue;
                 server.upstreams.unpark(upstream);
                 server.io.closeNow(upstream.socket);
-                server.upstreams.release(upstream);
+                server.releaseUpstream(upstream);
                 if (!reap_all) {
                     server.counters.increment("upstream_idle_reaped");
                 }
@@ -231,7 +237,7 @@ pub fn Server(comptime IoType: type) type {
             if (server.upstream_sweep_armed) return;
             if (server.upstreams.idle_count == 0) return;
             server.upstream_sweep_armed = true;
-            const interval_ms = @max(server.idleTimeoutMs() / 2, 1);
+            const interval_ms = @max(server.parkedTimeoutMs() / 2, 1);
             server.io.timerStart(
                 &server.upstream_sweep_completion,
                 @as(u64, interval_ms) * std.time.ns_per_ms,
@@ -348,11 +354,13 @@ pub fn Server(comptime IoType: type) type {
         /// way when slots run out, so the rung lives in one place.
         fn admitConn(server: *Self, client_socket: IoType.Socket) ?*ConnType {
             assert(!server.draining);
-            return server.conns.acquire() orelse {
+            const conn = server.conns.acquire() orelse {
                 server.counters.increment("shed_conn_slots");
                 shed.closeWithRst(IoType, server.io, client_socket);
                 return null;
             };
+            server.updateConnPressure();
+            return conn;
         }
 
         /// The shared admission tail (§8 single choke point): counting,
@@ -386,6 +394,7 @@ pub fn Server(comptime IoType: type) type {
             const conn = server.admitConn(client_socket) orelse return;
             const buffer = server.relay_buffers.acquire() orelse {
                 server.conns.release(conn);
+                server.updateConnPressure();
                 server.counters.increment("shed_relay_buffers");
                 shed.closeQuietly(IoType, server.io, client_socket);
                 return;
@@ -443,8 +452,11 @@ pub fn Server(comptime IoType: type) type {
         fn armConnect(server: *Self, conn: *ConnType, cluster_index: u16) void {
             assert(conn.state == .connecting);
             conn.arm(&conn.op_connect, "connect");
+            // L4 dials hold no Upstream slot, so the load table reflects
+            // L7 leases only — the P2C draw still spreads L4 dials by the
+            // observed L7 load, and evenly when there is none.
             server.io.connect(
-                server.balancer.pick(cluster_index).address,
+                server.balancer.pick(cluster_index, &server.upstreams.leased_counts).address,
                 &conn.op_connect.completion,
                 ConnType,
                 conn,
@@ -492,17 +504,16 @@ pub fn Server(comptime IoType: type) type {
             if (conn.upstream_socket) |socket| {
                 server.io.shutdown(socket, .both);
             }
-            if (conn.armed.connect) {
-                conn.arm(&conn.op_connect_cancel, "connect_cancel");
-                server.io.connectCancel(
-                    &conn.op_connect.completion,
-                    &conn.op_connect_cancel.completion,
-                    ConnType,
-                    conn,
-                    onConnectCancel,
-                );
+            // A dial-timeout verdict (§8) may already have a cancel in
+            // flight; submitting a second would double-arm the op.
+            if (conn.armed.connect and !conn.armed.connect_cancel) {
+                server.armConnectCancel(conn);
             }
-            if (conn.armed.deadline) {
+            // A dial rebase (§8) may already have this timer's cancel in
+            // flight (onDeadlineRebase); submitting a second would double-arm
+            // the op. Its drain routes to teardown via the isTearingDown
+            // checks, so teardown needs no cancel of its own here.
+            if (conn.armed.deadline and !conn.armed.deadline_cancel) {
                 conn.arm(&conn.op_deadline_cancel, "deadline_cancel");
                 server.io.timerCancel(
                     &conn.op_deadline.completion,
@@ -566,10 +577,11 @@ pub fn Server(comptime IoType: type) type {
             // close_upstream, so the slot is inert by the time the armed
             // set empties (§5). Parking replaces this with reuse later.
             if (conn.upstream) |leased| {
-                server.upstreams.release(leased);
+                server.releaseUpstream(leased);
                 conn.upstream = null;
             }
             server.conns.release(conn);
+            server.updateConnPressure();
             server.counters.increment("completed");
             server.maybeStopAfterDrain();
         }
@@ -587,34 +599,126 @@ pub fn Server(comptime IoType: type) type {
             }
         }
 
-        /// §8 watermarks before walls: recompute the relay-buffer pressure
-        /// flag with hysteresis after every acquire/release. The engage
-        /// crossing is witnessed; the wall (admit-time shed) still backs it
-        /// up if pressure fails to relieve the load in time.
-        fn updateRelayPressure(server: *Self) void {
-            const held = server.relay_buffers.acquired_count;
-            const capacity: u32 = @intCast(server.relay_buffers.slots.len);
-            if (server.relay_pressure) {
-                if (held <= constants.relayPressureOff(capacity)) {
-                    server.relay_pressure = false;
+        /// §8 watermarks before walls: recompute one pool's pressure flag
+        /// with hysteresis after an acquire/release. The engage crossing
+        /// is witnessed by its counter; the wall (the pool's shed rung)
+        /// still backs it up if pressure fails to relieve the load in
+        /// time. One rule for all three pools.
+        fn updatePressureFlag(
+            server: *Self,
+            flag: *bool,
+            held: u32,
+            capacity: u32,
+            comptime counter: []const u8,
+        ) void {
+            assert(held <= capacity);
+            // The comptime block pins the watermark shape at production
+            // size only; these pin it for every injected pool size too.
+            assert(constants.poolPressureOn(capacity) > constants.poolPressureOff(capacity));
+            assert(constants.poolPressureOn(capacity) <= capacity);
+            if (flag.*) {
+                if (held <= constants.poolPressureOff(capacity)) {
+                    flag.* = false;
                 }
-            } else if (held >= constants.relayPressureOn(capacity)) {
-                server.relay_pressure = true;
-                server.counters.increment("relay_pressure_engaged");
+            } else if (held >= constants.poolPressureOn(capacity)) {
+                flag.* = true;
+                server.counters.increment(counter);
             }
         }
 
-        /// The idle timeout to apply now, shortened under relay-buffer
-        /// pressure so quiet connections return their buffers sooner (§8).
-        /// Only the idle deadline is biased — the connect deadline is a
-        /// correctness bound and stays fixed. Because a timer never moves
-        /// *earlier* once armed (§4), this reaches a connection at its next
-        /// deadline store (activity or half-close), not retroactively; the
-        /// admit-time wall covers connections that never transact again.
+        fn updateRelayPressure(server: *Self) void {
+            server.updatePressureFlag(
+                &server.relay_pressure,
+                server.relay_buffers.acquired_count,
+                @intCast(server.relay_buffers.slots.len),
+                "relay_pressure_engaged",
+            );
+        }
+
+        fn updateConnPressure(server: *Self) void {
+            server.updatePressureFlag(
+                &server.conn_pressure,
+                server.conns.acquired_count,
+                @intCast(server.conns.slots.len),
+                "conn_pressure_engaged",
+            );
+        }
+
+        fn updateUpstreamPressure(server: *Self) void {
+            server.updatePressureFlag(
+                &server.upstream_pressure,
+                server.upstreams.slot_pool.acquired_count,
+                @intCast(server.upstreams.slot_pool.slots.len),
+                "upstream_pressure_engaged",
+            );
+        }
+
+        /// Any pressure that downstream keep-alive holds capacity against
+        /// (§8): an idle downstream connection pins a conn slot, and its
+        /// next body relay claims a relay buffer. Public for the L7
+        /// render's persistence decision.
+        pub fn downstreamPressured(server: *const Self) bool {
+            return server.relay_pressure or server.conn_pressure;
+        }
+
+        /// The §8 upstream-pool acquire/release pair: the pressure flag
+        /// recomputes on exactly the transitions that move
+        /// `acquired_count` (park/checkout do not), so the callers can
+        /// never miss a crossing.
+        pub fn acquireUpstream(
+            server: *Self,
+            cluster_index: u16,
+            endpoint_index: u16,
+        ) ?*upstream_module.UpstreamPool(IoType).Upstream {
+            const leased = server.upstreams.acquire(cluster_index, endpoint_index) orelse return null;
+            // The pool honored the request: a freshly leased slot is
+            // unparked and carries the identity the pressure recompute and
+            // the P2C load table now read back.
+            assert(!leased.parked);
+            assert(leased.cluster_index == cluster_index);
+            assert(leased.endpoint_index == endpoint_index);
+            server.updateUpstreamPressure();
+            return leased;
+        }
+
+        pub fn releaseUpstream(
+            server: *Self,
+            leased: *upstream_module.UpstreamPool(IoType).Upstream,
+        ) void {
+            // A parked slot must be unparked before release (its idle-list
+            // links would dangle), and at least this slot is leased.
+            assert(!leased.parked);
+            assert(server.upstreams.leasedCount() >= 1);
+            server.upstreams.release(leased);
+            server.updateUpstreamPressure();
+        }
+
+        /// The idle timeout to apply now, shortened under downstream
+        /// pressure so quiet connections return their buffers and slots
+        /// sooner (§8). Only the idle deadline is biased — the connect
+        /// deadline is a correctness bound and stays fixed. Because a
+        /// timer never moves *earlier* once armed (§4), this reaches a
+        /// connection at its next deadline store (activity or
+        /// half-close), not retroactively; the admit-time wall covers
+        /// connections that never transact again.
         pub fn idleTimeoutMs(server: *const Self) u32 {
             const configured = server.config.idle_timeout_ms;
-            if (!server.relay_pressure) return configured;
-            return @max(configured / constants.relay_pressure_idle_divisor, 1);
+            if (!server.downstreamPressured()) return configured;
+            return @max(configured / constants.pressure_idle_divisor, 1);
+        }
+
+        /// The deadline for a connection parked from now on, further
+        /// shortened under upstream pressure so idle parked sockets free
+        /// their slots for fresh dials before the 503 wall (§8). It
+        /// bases on `idleTimeoutMs`, so downstream pressure alone already
+        /// shortens parked deadlines — a deliberate cross-pool coupling:
+        /// under any pressure, idle capacity of every kind reaps sooner.
+        /// Lazy like the idle bias: it reaches a connection at its next
+        /// park, never retroactively.
+        pub fn parkedTimeoutMs(server: *const Self) u32 {
+            const base = server.idleTimeoutMs();
+            if (!server.upstream_pressure) return base;
+            return @max(base / constants.pressure_idle_divisor, 1);
         }
 
         /// Public for the relay: activity pushes the idle deadline out;
@@ -649,6 +753,35 @@ pub fn Server(comptime IoType: type) type {
             );
         }
 
+        /// Re-base the armed deadline to the freshly stored (earlier) target
+        /// (§8): the single lazy timer never moves *earlier* once armed (§4),
+        /// so an L7 dial needing a tighter per-try connect budget than the
+        /// head-read timer cancels it here — the one deadline cancel outside
+        /// teardown. onDeadlineRebase and onDeadline re-arm at the stored
+        /// target once both the cancel and the timer's Canceled have drained
+        /// (so the cancel cannot match the fresh timer). A path that already
+        /// delivered the timer has no armed op to re-base, so it arms fresh.
+        pub fn rebaseDeadline(server: *Self, conn: *ConnType) void {
+            assert(conn.state == .l7_dialing);
+            // A prior dial's rebase cancel can still be draining if the
+            // exchange outran it across a keep-alive turnaround. It re-arms
+            // the timer at the target this dial just stored (deadline_ns is
+            // shared), so defer — a second cancel would double-arm the op.
+            if (conn.armed.deadline_cancel) return;
+            if (!conn.armed.deadline) {
+                server.armDeadline(conn);
+                return;
+            }
+            conn.arm(&conn.op_deadline_cancel, "deadline_cancel");
+            server.io.timerCancel(
+                &conn.op_deadline.completion,
+                &conn.op_deadline_cancel.completion,
+                ConnType,
+                conn,
+                onDeadlineRebase,
+            );
+        }
+
         /// Lazy tick-and-compare (§4): the stored deadline is the truth;
         /// a fire before it is due re-arms for the remainder.
         fn onDeadline(conn: *ConnType, result: Io.TimerError!void) void {
@@ -662,23 +795,132 @@ pub fn Server(comptime IoType: type) type {
                     return;
                 }
                 if (server.io.nowNs() >= conn.deadline_ns) {
-                    server.counters.increment("deadline_expired");
-                    server.beginTeardown(conn);
-                } else {
+                    server.expireDeadline(conn);
+                } else if (!conn.armed.deadline_cancel) {
                     server.armDeadline(conn);
                 }
+                // else: a rebase cancel (§8) is in flight (an idle timer that
+                // fired as the dial re-based it under pressure); onDeadline-
+                // Rebase re-arms once it drains, so no fresh timer is left for
+                // the cancel to match.
             } else |err| {
                 assert(err == error.Canceled);
-                // The deadline is not a blocking op, so its Canceled
-                // delivery can arrive after closes were submitted (.closing).
-                assert(conn.isTearingDown());
-                server.continueTeardown(conn);
+                if (conn.isTearingDown()) {
+                    // The deadline is not a blocking op, so its Canceled
+                    // delivery can arrive after closes were submitted
+                    // (.closing).
+                    server.continueTeardown(conn);
+                    return;
+                }
+                // A live Canceled means a dialUpstream rebase (§8) shortened
+                // this timer to the per-try connect budget — the one deadline
+                // cancel outside teardown. Re-arm at the stored target, but
+                // only once the cancel op has drained, so the cancel cannot
+                // match the fresh timer; otherwise onDeadlineRebase re-arms.
+                if (!conn.armed.deadline_cancel) {
+                    server.armDeadline(conn);
+                }
             }
+        }
+
+        /// The rebase cancel's completion (§8): dialUpstream canceled the
+        /// armed head-read timer so a dial could re-base the deadline to the
+        /// tighter connect budget. This cancel and the timer's own Canceled
+        /// delivery both land; whichever arrives second (its sibling op now
+        /// free) re-arms at the stored target. Teardown overtakes both via
+        /// the isTearingDown drain, leaving the timer down for the closes.
+        fn onDeadlineRebase(conn: *ConnType) void {
+            const server = conn.server;
+            conn.delivered(&conn.op_deadline_cancel, "deadline_cancel");
+            if (conn.isTearingDown()) {
+                server.continueTeardown(conn);
+                return;
+            }
+            if (!conn.armed.deadline) {
+                server.armDeadline(conn);
+            }
+        }
+
+        /// The stored deadline is due. An L7 exchange that can still be
+        /// answered gets the §8 request-deadline verdict — 504 instead of
+        /// a silent teardown — with the deadline re-armed to bound the
+        /// verdict's own delivery: a second expiry with the verdict still
+        /// pending falls through to teardown, the escape hatch. A timed-
+        /// out L7 dial earns the same verdict (RFC 9110 §15.6.5: no
+        /// timely response from the upstream — a connect that never
+        /// completes is exactly that) via the one connect cancel outside
+        /// teardown; a refused dial keeps its prompt 502. Every other
+        /// state (L4, head read's slowloris, the static-response drain, a
+        /// pending verdict) tears down as before.
+        fn expireDeadline(server: *Self, conn: *ConnType) void {
+            assert(!conn.isTearingDown());
+            assert(!conn.armed.deadline); // Delivered; re-armed only below.
+            server.counters.increment("deadline_expired");
+            if (conn.state == .l7_exchanging and
+                conn.l7.pending_verdict == .none and
+                Proxy.expiryAnswerable(conn))
+            {
+                // The verdict grace bounds the escape hatch, not idle
+                // shedding: use the fixed configured idle timeout, never the
+                // pressure-biased one (which collapses toward 1ms and could
+                // tear the verdict down before its forced completions land).
+                server.storeDeadline(conn, server.config.idle_timeout_ms);
+                server.armDeadline(conn);
+                Proxy.beginExpiry(server, conn);
+                return;
+            }
+            if (conn.state == .l7_dialing and conn.l7.pending_verdict == .none) {
+                // At loop-rest a dialing L7 connection always has its
+                // connect in flight, no data ops, and no response byte.
+                assert(conn.armed.connect);
+                assert(!conn.armed.connect_cancel);
+                assert(!conn.l7.response_started);
+                conn.l7.pending_verdict = .gateway_timeout;
+                // Same fixed grace as the exchange verdict above.
+                server.storeDeadline(conn, server.config.idle_timeout_ms);
+                server.armDeadline(conn);
+                server.armConnectCancel(conn);
+                return;
+            }
+            server.beginTeardown(conn);
+        }
+
+        /// The connect cancel arm+submit shared by teardown and the §8
+        /// dial-timeout verdict — the two paths that abort an in-flight
+        /// dial (§4: the one cancel outside data-op drain). Callers guard
+        /// the double-arm themselves: a verdict cancel may already be in
+        /// flight when teardown starts.
+        fn armConnectCancel(server: *Self, conn: *ConnType) void {
+            assert(conn.armed.connect);
+            assert(!conn.armed.connect_cancel);
+            conn.arm(&conn.op_connect_cancel, "connect_cancel");
+            server.io.connectCancel(
+                &conn.op_connect.completion,
+                &conn.op_connect_cancel.completion,
+                ConnType,
+                conn,
+                onConnectCancel,
+            );
         }
 
         fn onConnectCancel(conn: *ConnType) void {
             conn.delivered(&conn.op_connect_cancel, "connect_cancel");
-            conn.server.continueTeardown(conn);
+            if (conn.isTearingDown()) {
+                conn.server.continueTeardown(conn);
+                return;
+            }
+            // A §8 dial-timeout cancel: the connect completion itself
+            // carries the verdict (it may deliver before or after this
+            // one), so there is nothing to do here. The verdict is still
+            // pending, or the 504 answer is already under way.
+            assert(conn.state == .l7_dialing or conn.state == .l7_responding or
+                conn.state == .l7_draining_request);
+            // Still dialing implies the verdict is still pending: only the
+            // connect completion's divert clears it, and that divert
+            // leaves .l7_dialing in the same callback.
+            if (conn.state == .l7_dialing) {
+                assert(conn.l7.pending_verdict == .gateway_timeout);
+            }
         }
 
         fn onDeadlineCancel(conn: *ConnType) void {

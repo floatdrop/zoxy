@@ -88,14 +88,59 @@ behind all four gates of §9.
     against editing proxy-managed headers; (4) the `rewrite` action
     (forwarded path only, segment-correct join, no re-route); (5) sim +
     adversarial-cross-seed oracles.
-- **Phase 2 — shedding hardening + minimal resilience.** P2C pick,
-  stale-replay (a checkout that fails on first use answers 502 today),
-  per-try deadline and the §8 request-deadline 504 verdict (an expired
-  exchange tears down today), counter reconciliation invariants in
-  the sim, overload benchmark scenario (offered load ≫ capacity: assert
-  flat memory, bounded latency for admitted work, all excess shed with
-  correct status). The relay-buffer pressure watermark shipped early
-  (361213f); the remaining watermarks land here.
+- **Phase 2 — shedding hardening + minimal resilience. Implemented
+  2026-07-20 (branch `feat/resilience`).** Six slices, each behind all
+  four §9 gates:
+  - **Endpoint pick** — per-cluster config `"pick": "rr" | "p2c"`
+    (default p2c, the §7 trajectory; typo fails loudly). P2C draws two
+    distinct uniform candidates from a fixed-seed xorshift64* (the sim
+    replays every seed twice demanding identical traces — pick
+    determinism is a feature) and leases the lower per-endpoint leased
+    count, maintained by the upstream pool as a closed system over its
+    four lease transitions. Deferred: a reuse-aware tie-break (a pick
+    may dial fresh while the other candidate holds a parked conn), and
+    L4 lease tracking (L4 dials hold no Upstream slot, so p2c sees only
+    L7 load; a pure-L4 cluster can opt into `rr`).
+  - **§8 request-deadline 504** — ops are never canceled (§5), so the
+    verdict is *deferred*: mark `pending_verdict`, `shutdown(.both)` the
+    upstream socket (forcing each armed op on it to complete),
+    handler-top diverts funnel the forced completions into a settle that
+    answers the static 504 once both data ops are free. Answerable =
+    no response byte sent and no armed op on the client socket (a
+    client-side body recv cannot be forced without closing the client;
+    that stall stays a teardown). The deadline re-arms around the
+    verdict; a second expiry falls through to teardown. A timed-out L7
+    *dial* earns the same 504 (RFC 9110 §15.6.5 — the one connect
+    cancel outside teardown); a refused dial keeps its prompt 502, the
+    counters orthogonal.
+  - **Stale-replay** — a reused checkout that fails with no response
+    byte and no body-pump entered takes one free replay: dispose the
+    stale slot, re-parse conn.head (§7 bytes-are-truth), re-derive the
+    framing tracker (the coalesced excess feeds again), fresh pick,
+    fresh dial under its own per-try connect deadline — never another
+    checkout. Spent before the try begins; a second early failure is
+    502. Deferred: reaping the endpoint's whole idle list on stale
+    detection (the restarted-origin case burns one replay per parked
+    conn until the sweep).
+  - **Watermarks** — one `poolPressureOn/Off` rule (engage ceil 3/4,
+    release floor 1/2) for all three pools. Relay + conn pressure =
+    downstream pressure: idle timeout divides, keep-alive not honored.
+    Upstream pressure: parked deadlines and the sweep interval shrink.
+    Every engage crossing counted; clean sim seeds keep all watermarks
+    above the client population.
+  - **Config `limits`** — optional `{conn_slots, relay_buffers,
+    upstream_slots}`, validated 1 ≤ n ≤ the comptime ceilings (which
+    stay the budget-asserted truth); `Server.InitOptions` *is*
+    `Config.Limits`.
+  - **Overload benchmark** — a second zoxy shrunk to {64, 4, 8} under
+    256 zrk connections: flat RSS, 2xx served AND 5xx shed witnessed,
+    relay stalls < 1% (accept-RSTs exempt — they are the conn wall
+    working), SIGUSR1 counter dump, clean drain. Merge-time only.
+  - Counter reconciliation grew the verdict inequalities
+    (`l7_gateway_timeout ≤ deadline_expired`,
+    `upstream_replayed ≤ upstream_reused`), asserted by the sim under
+    every seed; the sim's adversary gained blackholed dials and a
+    `stale_reuse` origin mode.
 - **Phase 3 — TLS.** CPU worker pool + job queues for handshakes (§3 seam
   activates). The stack is an **open decision under the Zig-first policy**
   (§4). Leading candidate (surveyed 2026-07-12): **picotls** (h2o/picotls)

@@ -536,9 +536,35 @@ test "server: relay-buffer pressure engages before the wall and drains clean" {
     try bed.expectDrained();
 }
 
+test "server: conn-slot pressure engages before the wall and drains clean" {
+    // Four L4 connections hold all four conn slots (their dials are
+    // black-holed, so each lives to its connect deadline). Crossing the
+    // 3/4 high watermark flips the conn-pressure flag; it clears again
+    // as the pool drains, and every counter still reconciles.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .server = .{ .conn_slots = 4, .relay_buffers = 4 },
+        .sim = .{ .seed = 73 },
+    });
+    defer bed.tearDown();
+
+    bed.sim_io.blackholeAddress(TestBed.originAddress());
+    bed.startClients(4, false);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(@as(u64, 4), bed.server.counters.get("admitted"));
+    try std.testing.expect(bed.server.counters.get("conn_pressure_engaged") >= 1);
+    // Pressure is a transient bias, not a terminal state.
+    try std.testing.expect(!bed.server.conn_pressure);
+    try std.testing.expectEqual(@as(u64, 4), bed.server.counters.get("completed"));
+    try bed.expectDrained();
+}
+
 test "server: idle timeout shortens under pressure, is full otherwise" {
-    // The pure selection rule the pressure flag drives: full timeout when
-    // relaxed, divided (floored at 1 ms) when pressured.
+    // The pure selection rules the pressure flags drive: full timeouts
+    // when relaxed; the idle timeout divides under either downstream
+    // pressure (relay or conn); the parked deadline divides again under
+    // upstream pressure — each floored at 1 ms.
     var bed: TestBed = undefined;
     try bed.setUp(std.testing.allocator, .{
         .sim = .{ .seed = 72 },
@@ -546,14 +572,25 @@ test "server: idle timeout shortens under pressure, is full otherwise" {
     });
     defer bed.tearDown();
 
-    try std.testing.expect(!bed.server.relay_pressure);
+    try std.testing.expect(!bed.server.downstreamPressured());
     try std.testing.expectEqual(@as(u32, 1000), bed.server.idleTimeoutMs());
+    try std.testing.expectEqual(@as(u32, 1000), bed.server.parkedTimeoutMs());
     bed.server.relay_pressure = true;
-    try std.testing.expectEqual(
-        @as(u32, 1000 / 4),
-        bed.server.idleTimeoutMs(),
-    );
+    try std.testing.expectEqual(@as(u32, 1000 / 4), bed.server.idleTimeoutMs());
     bed.server.relay_pressure = false;
+    bed.server.conn_pressure = true;
+    try std.testing.expect(bed.server.downstreamPressured());
+    try std.testing.expectEqual(@as(u32, 1000 / 4), bed.server.idleTimeoutMs());
+    bed.server.conn_pressure = false;
+    // Upstream pressure biases only the parked deadline, not the idle
+    // timeout; under both it compounds.
+    bed.server.upstream_pressure = true;
+    try std.testing.expectEqual(@as(u32, 1000), bed.server.idleTimeoutMs());
+    try std.testing.expectEqual(@as(u32, 1000 / 4), bed.server.parkedTimeoutMs());
+    bed.server.conn_pressure = true;
+    try std.testing.expectEqual(@as(u32, 1000 / 16), bed.server.parkedTimeoutMs());
+    bed.server.conn_pressure = false;
+    bed.server.upstream_pressure = false;
 }
 
 test "server: refused upstream tears the connection down and is counted" {
