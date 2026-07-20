@@ -317,7 +317,7 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_reading_head or conn.state == .l7_exchanging);
             assert(conn.upstream == null);
             assert(conn.upstream_socket == null);
-            conn.upstream = server.upstreams.acquire(conn.cluster_index, pick.endpoint_index) orelse {
+            conn.upstream = server.acquireUpstream(conn.cluster_index, pick.endpoint_index) orelse {
                 return respond(server, conn, 503, "l7_shed_upstream_slots");
             };
             conn.state = .l7_dialing;
@@ -845,13 +845,16 @@ pub fn Proxy(comptime IoType: type) type {
 
             // The §8 persistence decision, made once and honored: honor
             // the client's ask unless pipelining, pressure, or drain says
-            // otherwise — then announce whatever was decided (§2). An
-            // until-close body forces the close unconditionally: the FIN
-            // is the only thing delimiting the relayed body for the
-            // client, exactly as it delimited it for us.
+            // otherwise — then announce whatever was decided (§2).
+            // Downstream pressure — relay buffers or conn slots near their
+            // walls — stops honoring keep-alive so idle capacity returns
+            // (§8 watermarks). An until-close body forces the close
+            // unconditionally: the FIN is the only thing delimiting the
+            // relayed body for the client, exactly as it delimited it
+            // for us.
             const keep_downstream = conn.l7.client_keep_alive and
                 !conn.l7.client_pipelined and !server.draining and
-                !server.relay_pressure and response.framing != .until_close;
+                !server.downstreamPressured() and response.framing != .until_close;
             conn.l7.downstream_close_announced = !keep_downstream;
             conn.l7.upstream_reusable = response.keep_alive;
             const rendered = render.renderResponseHead(
@@ -1137,14 +1140,16 @@ pub fn Proxy(comptime IoType: type) type {
         /// Park the leased upstream on its endpoint's idle list (§5): the
         /// socket stays open with no armed op, the stored deadline hands
         /// reaping to the Server's sweep, and the conn detaches so its
-        /// teardown cannot close a connection it no longer owns.
+        /// teardown cannot close a connection it no longer owns. Under
+        /// upstream pressure the parked deadline shortens (§8 watermarks)
+        /// so idle parked sockets free their slots before the 503 wall.
         fn parkUpstream(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
             const upstream = conn.upstream.?;
             assert(!upstream.parked);
             server.upstreams.park(upstream);
             upstream.deadline_ns = server.io.nowNs() +
-                @as(u64, server.idleTimeoutMs()) * std.time.ns_per_ms;
+                @as(u64, server.parkedTimeoutMs()) * std.time.ns_per_ms;
             server.ensureUpstreamSweep();
             conn.upstream = null;
             conn.upstream_socket = null;
@@ -1159,7 +1164,7 @@ pub fn Proxy(comptime IoType: type) type {
             assert(!conn.armed.data_upstream_to_client);
             if (conn.upstream) |leased| {
                 server.io.closeNow(conn.upstream_socket.?);
-                server.upstreams.release(leased);
+                server.releaseUpstream(leased);
                 conn.upstream = null;
                 conn.upstream_socket = null;
             }
@@ -1292,7 +1297,7 @@ pub fn Proxy(comptime IoType: type) type {
             const stale = conn.upstream.?;
             assert(stale.head_len == 0);
             server.io.closeNow(conn.upstream_socket.?);
-            server.upstreams.release(stale);
+            server.releaseUpstream(stale);
             conn.upstream = null;
             conn.upstream_socket = null;
             server.counters.increment("upstream_replayed");
@@ -1386,7 +1391,7 @@ pub fn Proxy(comptime IoType: type) type {
                 if (conn.upstream_socket) |socket| {
                     server.io.closeNow(socket);
                 }
-                server.upstreams.release(leased);
+                server.releaseUpstream(leased);
                 conn.upstream = null;
                 conn.upstream_socket = null;
             }

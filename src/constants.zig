@@ -39,27 +39,30 @@ pub const relay_buffers_max: u32 = conn_slots_max;
 /// LAN paths this proxy targets.
 pub const relay_buffer_bytes: u32 = 4 * 1024;
 
-/// §8 "watermarks before walls": the relay-buffer pool flips a pressure
-/// flag before it hits the wall so the proxy sheds *idle* capacity —
-/// shorter idle timeouts — before it must shed *work*. Hysteresis keeps
-/// the flag from flapping around a single threshold: engage at the high
+/// §8 "watermarks before walls": each pool flips a pressure flag before
+/// it hits the wall so the proxy sheds *idle* capacity — shorter idle
+/// timeouts, keep-alive no longer honored, parked connections reaped
+/// sooner — before it must shed *work*. One rule for all three pools
+/// (relay buffers, conn slots, upstream slots). Hysteresis keeps a flag
+/// from flapping around a single threshold: engage at the high
 /// watermark, release only after draining back to the low one. Both are
-/// fractions of the *live* pool capacity, so an injected test pool and the
-/// production pool obey one rule. `On` uses ceil so a full pool always
-/// counts as pressured; `Off` uses floor so the gap is non-empty for every
-/// capacity >= 1.
-pub fn relayPressureOn(capacity: u32) u32 {
+/// fractions of the *live* pool capacity, so an injected test pool and
+/// the production pool obey one rule. `On` uses ceil so a full pool
+/// always counts as pressured; `Off` uses floor so the gap is non-empty
+/// for every capacity >= 1.
+pub fn poolPressureOn(capacity: u32) u32 {
     return (capacity * 3 + 3) / 4;
 }
-pub fn relayPressureOff(capacity: u32) u32 {
+pub fn poolPressureOff(capacity: u32) u32 {
     return capacity / 2;
 }
 
-/// Under relay-buffer pressure the idle timeout is divided by this, reaping
-/// quiet connections sooner to return their buffers (§8). The result is
+/// Under pool pressure the idle timeout (and, for upstream pressure, the
+/// parked-connection deadline) is divided by this, reaping quiet
+/// connections sooner to return their resources (§8). The result is
 /// clamped to >= 1 ms so `storeDeadline`'s invariant holds even when the
 /// configured idle timeout is already small.
-pub const relay_pressure_idle_divisor: u32 = 4;
+pub const pressure_idle_divisor: u32 = 4;
 
 /// Upper bound on one L7 request or response head, including the final
 /// CRLF — the size of a connection slot's head buffer (§5). A request
@@ -202,7 +205,7 @@ comptime {
     assert(config_bytes_max >= 1024);
     assert(timeout_ms_max >= 1000);
     assert(accept_retry_delay_ms >= 1);
-    assert(relay_pressure_idle_divisor >= 2);
+    assert(pressure_idle_divisor >= 2);
     assert(head_bytes_max >= 1024);
     assert(headers_max >= 8);
     assert(host_bytes_max >= 1);
@@ -216,8 +219,8 @@ comptime {
     assert(chunked_trailer_bytes_max >= chunked_line_bytes_max);
     // The watermarks must leave a hysteresis gap and never engage above
     // the pool's own capacity, checked at the production size.
-    assert(relayPressureOn(relay_buffers_max) > relayPressureOff(relay_buffers_max));
-    assert(relayPressureOn(relay_buffers_max) <= relay_buffers_max);
+    assert(poolPressureOn(relay_buffers_max) > poolPressureOff(relay_buffers_max));
+    assert(poolPressureOn(relay_buffers_max) <= relay_buffers_max);
     // The conn-slot ceiling is derived, not chosen: the largest slot
     // count whose worst-case ops fit the ¾-CQ budget after the fixed
     // ops and the parked-upstream reservation are carved out (§8).
@@ -259,12 +262,12 @@ test "pressure: relay watermarks have a hysteresis gap at every capacity" {
     // tests inject as well as the production size — no flapping, never a
     // threshold the pool cannot reach.
     for ([_]u32{ 1, 2, 3, 4, 8, relay_buffers_max }) |capacity| {
-        try std.testing.expect(relayPressureOn(capacity) > relayPressureOff(capacity));
-        try std.testing.expect(relayPressureOn(capacity) <= capacity);
+        try std.testing.expect(poolPressureOn(capacity) > poolPressureOff(capacity));
+        try std.testing.expect(poolPressureOn(capacity) <= capacity);
     }
     // A full pool is always pressured; an empty pool never is.
-    try std.testing.expectEqual(@as(u32, 3), relayPressureOn(4));
-    try std.testing.expectEqual(@as(u32, 2), relayPressureOff(4));
+    try std.testing.expectEqual(@as(u32, 3), poolPressureOn(4));
+    try std.testing.expectEqual(@as(u32, 2), poolPressureOff(4));
 }
 
 test "budgets: memory total matches the closed form" {

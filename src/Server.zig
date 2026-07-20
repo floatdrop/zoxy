@@ -47,11 +47,17 @@ pub fn Server(comptime IoType: type) type {
         balancer: Balancer,
         counters: counters_module.Counters,
         draining: bool,
-        /// §8 watermark state for the relay-buffer pool: set once the pool
-        /// crosses its high watermark, cleared once it drains back below
-        /// the low one (hysteresis). Biases idle timeouts shorter so quiet
-        /// connections return their buffers before the wall is reached.
+        /// §8 watermark state, one flag per pool: set once a pool crosses
+        /// its high watermark, cleared once it drains back below the low
+        /// one (hysteresis, `constants.poolPressureOn/Off`). Relay and
+        /// conn pressure bias downstream capacity — shorter idle timeouts
+        /// and keep-alive no longer honored — so quiet connections return
+        /// their buffers and slots before the wall is reached; upstream
+        /// pressure shortens parked-connection deadlines so idle parked
+        /// sockets free their slots for fresh dials before the 503 wall.
         relay_pressure: bool,
+        conn_pressure: bool,
+        upstream_pressure: bool,
         drain_deadline_completion: IoType.Completion,
         /// The one timer covering every parked upstream (§5): a parked
         /// connection holds no armed op, so this sweep compares stored
@@ -118,6 +124,8 @@ pub fn Server(comptime IoType: type) type {
             server.counters = .{};
             server.draining = false;
             server.relay_pressure = false;
+            server.conn_pressure = false;
+            server.upstream_pressure = false;
             server.drain_deadline_completion = .{};
             server.upstream_sweep_completion = .{};
             server.upstream_sweep_armed = false;
@@ -215,7 +223,7 @@ pub fn Server(comptime IoType: type) type {
                 if (!reap_all and upstream.deadline_ns > now) continue;
                 server.upstreams.unpark(upstream);
                 server.io.closeNow(upstream.socket);
-                server.upstreams.release(upstream);
+                server.releaseUpstream(upstream);
                 if (!reap_all) {
                     server.counters.increment("upstream_idle_reaped");
                 }
@@ -231,7 +239,7 @@ pub fn Server(comptime IoType: type) type {
             if (server.upstream_sweep_armed) return;
             if (server.upstreams.idle_count == 0) return;
             server.upstream_sweep_armed = true;
-            const interval_ms = @max(server.idleTimeoutMs() / 2, 1);
+            const interval_ms = @max(server.parkedTimeoutMs() / 2, 1);
             server.io.timerStart(
                 &server.upstream_sweep_completion,
                 @as(u64, interval_ms) * std.time.ns_per_ms,
@@ -348,11 +356,13 @@ pub fn Server(comptime IoType: type) type {
         /// way when slots run out, so the rung lives in one place.
         fn admitConn(server: *Self, client_socket: IoType.Socket) ?*ConnType {
             assert(!server.draining);
-            return server.conns.acquire() orelse {
+            const conn = server.conns.acquire() orelse {
                 server.counters.increment("shed_conn_slots");
                 shed.closeWithRst(IoType, server.io, client_socket);
                 return null;
             };
+            server.updateConnPressure();
+            return conn;
         }
 
         /// The shared admission tail (§8 single choke point): counting,
@@ -386,6 +396,7 @@ pub fn Server(comptime IoType: type) type {
             const conn = server.admitConn(client_socket) orelse return;
             const buffer = server.relay_buffers.acquire() orelse {
                 server.conns.release(conn);
+                server.updateConnPressure();
                 server.counters.increment("shed_relay_buffers");
                 shed.closeQuietly(IoType, server.io, client_socket);
                 return;
@@ -571,10 +582,11 @@ pub fn Server(comptime IoType: type) type {
             // close_upstream, so the slot is inert by the time the armed
             // set empties (§5). Parking replaces this with reuse later.
             if (conn.upstream) |leased| {
-                server.upstreams.release(leased);
+                server.releaseUpstream(leased);
                 conn.upstream = null;
             }
             server.conns.release(conn);
+            server.updateConnPressure();
             server.counters.increment("completed");
             server.maybeStopAfterDrain();
         }
@@ -592,34 +604,116 @@ pub fn Server(comptime IoType: type) type {
             }
         }
 
-        /// §8 watermarks before walls: recompute the relay-buffer pressure
-        /// flag with hysteresis after every acquire/release. The engage
-        /// crossing is witnessed; the wall (admit-time shed) still backs it
-        /// up if pressure fails to relieve the load in time.
-        fn updateRelayPressure(server: *Self) void {
-            const held = server.relay_buffers.acquired_count;
-            const capacity: u32 = @intCast(server.relay_buffers.slots.len);
-            if (server.relay_pressure) {
-                if (held <= constants.relayPressureOff(capacity)) {
-                    server.relay_pressure = false;
+        /// §8 watermarks before walls: recompute one pool's pressure flag
+        /// with hysteresis after an acquire/release. The engage crossing
+        /// is witnessed by its counter; the wall (the pool's shed rung)
+        /// still backs it up if pressure fails to relieve the load in
+        /// time. One rule for all three pools.
+        fn updatePressureFlag(
+            server: *Self,
+            flag: *bool,
+            held: u32,
+            capacity: u32,
+            comptime counter: []const u8,
+        ) void {
+            assert(held <= capacity);
+            // The comptime block pins the watermark shape at production
+            // size only; these pin it for every injected pool size too.
+            assert(constants.poolPressureOn(capacity) > constants.poolPressureOff(capacity));
+            assert(constants.poolPressureOn(capacity) <= capacity);
+            if (flag.*) {
+                if (held <= constants.poolPressureOff(capacity)) {
+                    flag.* = false;
                 }
-            } else if (held >= constants.relayPressureOn(capacity)) {
-                server.relay_pressure = true;
-                server.counters.increment("relay_pressure_engaged");
+            } else if (held >= constants.poolPressureOn(capacity)) {
+                flag.* = true;
+                server.counters.increment(counter);
             }
         }
 
-        /// The idle timeout to apply now, shortened under relay-buffer
-        /// pressure so quiet connections return their buffers sooner (§8).
-        /// Only the idle deadline is biased — the connect deadline is a
-        /// correctness bound and stays fixed. Because a timer never moves
-        /// *earlier* once armed (§4), this reaches a connection at its next
-        /// deadline store (activity or half-close), not retroactively; the
-        /// admit-time wall covers connections that never transact again.
+        fn updateRelayPressure(server: *Self) void {
+            server.updatePressureFlag(
+                &server.relay_pressure,
+                server.relay_buffers.acquired_count,
+                @intCast(server.relay_buffers.slots.len),
+                "relay_pressure_engaged",
+            );
+        }
+
+        fn updateConnPressure(server: *Self) void {
+            server.updatePressureFlag(
+                &server.conn_pressure,
+                server.conns.acquired_count,
+                @intCast(server.conns.slots.len),
+                "conn_pressure_engaged",
+            );
+        }
+
+        fn updateUpstreamPressure(server: *Self) void {
+            server.updatePressureFlag(
+                &server.upstream_pressure,
+                server.upstreams.slot_pool.acquired_count,
+                @intCast(server.upstreams.slot_pool.slots.len),
+                "upstream_pressure_engaged",
+            );
+        }
+
+        /// Any pressure that downstream keep-alive holds capacity against
+        /// (§8): an idle downstream connection pins a conn slot, and its
+        /// next body relay claims a relay buffer. Public for the L7
+        /// render's persistence decision.
+        pub fn downstreamPressured(server: *const Self) bool {
+            return server.relay_pressure or server.conn_pressure;
+        }
+
+        /// The §8 upstream-pool acquire/release pair: the pressure flag
+        /// recomputes on exactly the transitions that move
+        /// `acquired_count` (park/checkout do not), so the callers can
+        /// never miss a crossing.
+        pub fn acquireUpstream(
+            server: *Self,
+            cluster_index: u16,
+            endpoint_index: u16,
+        ) ?*upstream_module.UpstreamPool(IoType).Upstream {
+            const leased = server.upstreams.acquire(cluster_index, endpoint_index) orelse return null;
+            server.updateUpstreamPressure();
+            return leased;
+        }
+
+        pub fn releaseUpstream(
+            server: *Self,
+            leased: *upstream_module.UpstreamPool(IoType).Upstream,
+        ) void {
+            server.upstreams.release(leased);
+            server.updateUpstreamPressure();
+        }
+
+        /// The idle timeout to apply now, shortened under downstream
+        /// pressure so quiet connections return their buffers and slots
+        /// sooner (§8). Only the idle deadline is biased — the connect
+        /// deadline is a correctness bound and stays fixed. Because a
+        /// timer never moves *earlier* once armed (§4), this reaches a
+        /// connection at its next deadline store (activity or
+        /// half-close), not retroactively; the admit-time wall covers
+        /// connections that never transact again.
         pub fn idleTimeoutMs(server: *const Self) u32 {
             const configured = server.config.idle_timeout_ms;
-            if (!server.relay_pressure) return configured;
-            return @max(configured / constants.relay_pressure_idle_divisor, 1);
+            if (!server.downstreamPressured()) return configured;
+            return @max(configured / constants.pressure_idle_divisor, 1);
+        }
+
+        /// The deadline for a connection parked from now on, further
+        /// shortened under upstream pressure so idle parked sockets free
+        /// their slots for fresh dials before the 503 wall (§8). It
+        /// bases on `idleTimeoutMs`, so downstream pressure alone already
+        /// shortens parked deadlines — a deliberate cross-pool coupling:
+        /// under any pressure, idle capacity of every kind reaps sooner.
+        /// Lazy like the idle bias: it reaches a connection at its next
+        /// park, never retroactively.
+        pub fn parkedTimeoutMs(server: *const Self) u32 {
+            const base = server.idleTimeoutMs();
+            if (!server.upstream_pressure) return base;
+            return @max(base / constants.pressure_idle_divisor, 1);
         }
 
         /// Public for the relay: activity pushes the idle deadline out;

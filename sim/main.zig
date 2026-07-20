@@ -270,12 +270,19 @@ const Harness = struct {
             }
         else
             .{
+                // Clean seeds size every pool so its §8 pressure
+                // watermark (ceil of 3/4 capacity: 9 of 12) sits above
+                // the whole client population (6): a golden outcome must
+                // never meet a pressure-announced close or a shortened
+                // parked deadline — correct behavior, but not the
+                // script's exact transcript. All three flags (relay,
+                // conn, upstream) ride this margin; a clean-seed client
+                // bump must re-check it, and the upstream margin also
+                // rides the single-endpoint topology (checkout-before-
+                // dial caps acquired at the live client count — parked
+                // conns per endpoint could accumulate past it under a
+                // multi-endpoint clean topology).
                 .conn_slots = 2 * clients_max,
-                // Clean seeds size the pool so the §8 pressure watermark
-                // (ceil of 3/4 capacity) sits above the whole client
-                // population: a golden outcome must never meet a
-                // pressure-announced close, which is correct behavior
-                // but not the script's exact transcript.
                 .relay_buffers = if (harness.clean) 2 * clients_max else clients_max,
                 .upstream_slots = 2 * clients_max,
             };

@@ -19,10 +19,13 @@ pub const Counters = struct {
     shed_conn_slots: Value = Value.init(0),
     /// §8 rung: relay buffers exhausted at admission → close.
     shed_relay_buffers: Value = Value.init(0),
-    /// §8 "watermarks before walls": relay-buffer pressure engaged
-    /// (false→true crossings of the high watermark). Not a shed — a bias
-    /// that precedes the wall — so it stays out of `reconcile`.
+    /// §8 "watermarks before walls": pool pressure engaged (false→true
+    /// crossings of a pool's high watermark), one counter per pool. Not
+    /// sheds — biases that precede the walls — so they stay out of
+    /// `reconcile`.
     relay_pressure_engaged: Value = Value.init(0),
+    conn_pressure_engaged: Value = Value.init(0),
+    upstream_pressure_engaged: Value = Value.init(0),
     /// §8 rung: request/idle deadline fired → teardown.
     deadline_expired: Value = Value.init(0),
     /// Upstream dial failed (refused/unreachable/canceled-by-teardown).

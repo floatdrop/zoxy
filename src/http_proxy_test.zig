@@ -381,6 +381,10 @@ const Http1Bed = struct {
         /// The origin closes the second accepted connection at accept —
         /// the replayed try fails too, pinning the one-replay budget.
         close_second_at_accept: bool = false,
+        /// Pool sizes, injectable so a test can cross the §8 watermarks.
+        conn_slots: u32 = 4,
+        relay_buffers: u32 = 2,
+        upstream_slots: u32 = 2,
         /// The single route's prefix; "/" is the catch-all. A narrower
         /// prefix lets a test drive the no-route 404 path (§7).
         route_prefix: []const u8 = "/",
@@ -420,9 +424,9 @@ const Http1Bed = struct {
             .max_lifetime_ms = 0,
         };
         try bed.server.init(arena, &bed.sim_io, &bed.config, .{
-            .conn_slots = 4,
-            .relay_buffers = 2,
-            .upstream_slots = 2,
+            .conn_slots = options.conn_slots,
+            .relay_buffers = options.relay_buffers,
+            .upstream_slots = options.upstream_slots,
         });
         try bed.server.start();
         bed.origin = .{
@@ -1447,6 +1451,62 @@ test "l7: a pipelining client gets its first response, then the close" {
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    try bed.expectDrained();
+}
+
+test "l7: keep-alive is not honored under conn-slot pressure" {
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 90,
+        .origin_response = response,
+        .conn_slots = 2,
+    });
+    defer bed.tearDown();
+
+    // Two concurrent clients fill both conn slots — the §8 watermark
+    // engages — so a keep-alive ask is answered with an announced close:
+    // idle downstream connections are exactly the capacity under
+    // pressure.
+    bed.client2.request = "GET /b HTTP/1.1\r\nHost: o\r\n\r\n";
+    bed.client2.start(&bed.sim_io, &bed.server, Http1Bed.bindAddress());
+    try bed.exchange("GET /a HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expect(bed.server.counters.get("conn_pressure_engaged") >= 1);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        bed.client2.response(),
+        "Connection: close",
+    ) != null);
+    try std.testing.expect(!bed.server.conn_pressure); // Cleared on drain.
+    try bed.expectDrained();
+}
+
+test "l7: parked deadlines shorten under upstream pressure" {
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 91,
+        .origin_response = response,
+    });
+    defer bed.tearDown();
+
+    // Two concurrent exchanges lease both upstream slots — the §8
+    // watermark engages — so both connections park under a shortened
+    // deadline (idle/4, or idle/16 while relay pressure transiently
+    // overlaps) and the sweep reaps them well before the drain timer at
+    // the full idle timeout. Without the bias the parked deadline would
+    // be the full idle timeout and the reap count zero.
+    bed.client.drain_on_finish = false;
+    bed.client2.drain_on_finish = false;
+    bed.armDrainTimer(Http1Bed.idle_timeout_ms);
+    bed.client2.request = "GET /b HTTP/1.1\r\nHost: o\r\n\r\n";
+    bed.client2.start(&bed.sim_io, &bed.server, Http1Bed.bindAddress());
+    try bed.exchange("GET /a HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expect(bed.server.counters.get("upstream_pressure_engaged") >= 1);
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("upstream_idle_reaped"));
+    try std.testing.expect(!bed.server.upstream_pressure); // Cleared by the reaps.
     try bed.expectDrained();
 }
 
