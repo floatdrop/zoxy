@@ -886,6 +886,42 @@ fn isUnreservedByte(byte: u8) bool {
         byte == '_' or byte == '~';
 }
 
+/// The §7 canonical routing form of a `Host` header value: lowercased
+/// (RFC 9110 §4.2.3 host equality is case-insensitive) with the
+/// authority's port stripped (a port is not part of the routing name).
+/// `out` receives the lowercased bytes; the returned slice points into
+/// it. Null means "unmatchable" — an empty or oversize host — which
+/// meets only the any-host routes, never a match error: a Host is a
+/// routing key, and a key that fits no config host simply does not match.
+/// The header itself is forwarded verbatim (§7); this is the key alone.
+/// Only case and port are folded; anything else (a trailing-dot FQDN,
+/// say) yields a distinct key, so it can only under-match to any-host —
+/// never over-match a vhost it should not reach.
+pub fn canonicalHost(host: []const u8, out: *[constants.host_bytes_max]u8) ?[]const u8 {
+    if (host.len == 0) {
+        return null;
+    }
+    if (host.len > out.len) {
+        return null; // Oversize: unmatchable, not malformed.
+    }
+    // An IPv6 literal wears brackets and its own colons, so the port (if
+    // any) starts only after the ']'; a plain host has no colon before
+    // its port.
+    const authority_end = if (host[0] == '[')
+        (std.mem.indexOfScalar(u8, host, ']') orelse return null) + 1
+    else
+        std.mem.indexOfScalar(u8, host, ':') orelse host.len;
+    assert(authority_end <= host.len);
+    if (authority_end == 0) {
+        return null; // A host that is only a port (":8080") matches nothing.
+    }
+    for (host[0..authority_end], 0..) |byte, index| {
+        out[index] = std.ascii.toLower(byte);
+    }
+    assert(authority_end >= 1);
+    return out[0..authority_end];
+}
+
 /// A reverse proxy routes origin-form targets (§7 routes host/path);
 /// asterisk-form is legal for OPTIONS. CONNECT's authority-form passes
 /// through so the proxy can answer it with 501 rather than 400.
@@ -1600,4 +1636,67 @@ fn fuzzCanonicalTarget(context: void, smith: *std.testing.Smith) !void {
     const again = try canonicalTarget(canonical.path, &out_again);
     assert(std.mem.eql(u8, again.path, canonical.path));
     assert(again.query.len == 0);
+}
+
+test "canonicalHost: lowercase, strip port, bracket-aware" {
+    const Case = struct { host: []const u8, want: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .host = "api.example.com", .want = "api.example.com" },
+        .{ .host = "API.Example.COM", .want = "api.example.com" },
+        .{ .host = "api.example.com:8080", .want = "api.example.com" },
+        .{ .host = "API.EXAMPLE.COM:443", .want = "api.example.com" },
+        .{ .host = "localhost", .want = "localhost" },
+        // IPv6 literals keep their brackets and inner colons; only a port
+        // past the ']' is stripped, and the hex lowercases.
+        .{ .host = "[::1]", .want = "[::1]" },
+        .{ .host = "[::1]:8080", .want = "[::1]" },
+        .{ .host = "[2001:DB8::1]:443", .want = "[2001:db8::1]" },
+        // Unmatchable (null): empty, port-only, or an unterminated bracket.
+        .{ .host = "", .want = null },
+        .{ .host = ":8080", .want = null },
+        .{ .host = "[::1", .want = null },
+    };
+    for (cases) |case| {
+        var out: [constants.host_bytes_max]u8 = undefined;
+        const got = canonicalHost(case.host, &out);
+        if (case.want) |want| {
+            try std.testing.expectEqualStrings(want, got.?);
+        } else {
+            try std.testing.expectEqual(@as(?[]const u8, null), got);
+        }
+    }
+    // Oversize is unmatchable, not a crash.
+    var big: [constants.host_bytes_max + 1]u8 = undefined;
+    @memset(&big, 'a');
+    var out: [constants.host_bytes_max]u8 = undefined;
+    try std.testing.expectEqual(@as(?[]const u8, null), canonicalHost(&big, &out));
+}
+
+test "fuzz: canonicalHost is idempotent and never uppercases" {
+    try std.testing.fuzz({}, fuzzCanonicalHost, .{ .corpus = &.{
+        "API.Example.com:8080",
+        "[2001:DB8::1]:443",
+        ":onlyport",
+        "a",
+    } });
+}
+
+fn fuzzCanonicalHost(context: void, smith: *std.testing.Smith) !void {
+    _ = context;
+    var input_buffer: [constants.host_bytes_max]u8 = undefined;
+    const input_len = smith.slice(&input_buffer);
+    const input = input_buffer[0..input_len];
+
+    var out: [constants.host_bytes_max]u8 = undefined;
+    const canonical = canonicalHost(input, &out) orelse return; // null is legal.
+    // Never grows, and never yields an uppercase letter.
+    assert(canonical.len >= 1);
+    assert(canonical.len <= input.len);
+    for (canonical) |byte| {
+        assert(!std.ascii.isUpper(byte));
+    }
+    // Idempotent: the canonical form is its own canonical form.
+    var out_again: [constants.host_bytes_max]u8 = undefined;
+    const again = canonicalHost(canonical, &out_again).?;
+    assert(std.mem.eql(u8, again, canonical));
 }
