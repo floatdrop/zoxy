@@ -10,6 +10,7 @@ const std = @import("std");
 
 const config_module = @import("config.zig");
 const router = @import("http/router.zig");
+const filter = @import("http/filter.zig");
 const Io = @import("io/io.zig");
 const parser = @import("http/parser.zig");
 const Server = @import("Server.zig").Server;
@@ -358,6 +359,10 @@ const Http1Bed = struct {
         /// The single route's host scope; null is any-host. A canonical
         /// host lets a test drive host routing and its 404 (§7).
         route_host: ?[]const u8 = null,
+        /// The listener's §7 filter rules; empty by default so existing
+        /// scenarios are unfiltered. A test supplies compiled rules to
+        /// drive the filter reject/edit paths.
+        filters: []const filter.Rule = &.{},
     };
 
     fn setUp(bed: *Http1Bed, gpa: std.mem.Allocator, options: Options) !void {
@@ -372,7 +377,12 @@ const Http1Bed = struct {
         bed.endpoints = .{originAddress()};
         bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints }};
         bed.routes = .{.{ .host = options.route_host, .prefix = options.route_prefix, .cluster_index = 0 }};
-        bed.listeners = .{.{ .bind_address = bindAddress(), .routes = &bed.routes, .protocol = .http }};
+        bed.listeners = .{.{
+            .bind_address = bindAddress(),
+            .routes = &bed.routes,
+            .filters = options.filters,
+            .protocol = .http,
+        }};
         bed.config = .{
             .listeners = &bed.listeners,
             .clusters = &bed.clusters,
@@ -700,6 +710,99 @@ test "l7: a request to a host with no route is answered 404" {
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_no_route"));
     try std.testing.expectEqual(@as(u32, 0), bed.origin.requests_served);
     try bed.expectDrained();
+}
+
+test "l7: a filter reject answers its policy status before the origin is dialed" {
+    // One rule: POST under /admin is 403. The origin would answer 200,
+    // but the filter rejects before any dial, so the client sees 403 and
+    // the origin serves nothing (§7).
+    const rules = [_]filter.Rule{.{
+        .match = .{
+            .methods = blk: {
+                var set = std.EnumSet(parser.Method){};
+                set.insert(.post);
+                break :blk set;
+            },
+            .path_prefix = "/admin",
+        },
+        .actions = &.{.{ .reject = 403 }},
+    }};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 27,
+        .filters = &rules,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("POST /admin/users HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_filtered"));
+    try std.testing.expectEqual(@as(u32, 0), bed.origin.requests_served);
+    try bed.expectDrained();
+}
+
+test "l7: a request the filter does not match is proxied untouched" {
+    // The same /admin rule; a GET to /public matches nothing, so it routes
+    // and reaches the origin normally — the filter is a no-op (§7).
+    const rules = [_]filter.Rule{.{
+        .match = .{ .path_prefix = "/admin", .methods = blk: {
+            var set = std.EnumSet(parser.Method){};
+            set.insert(.post);
+            break :blk set;
+        } },
+        .actions = &.{.{ .reject = 403 }},
+    }};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 28,
+        .filters = &rules,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /public HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_filtered"));
+    try std.testing.expectEqual(@as(u32, 1), bed.origin.requests_served);
+    try bed.expectDrained();
+}
+
+test "l7: a filter reject survives 1-byte adversarial delivery across seeds" {
+    // A header-matched 429 must land whole however the head is chopped up.
+    const rules = [_]filter.Rule{.{
+        .match = .{ .headers = &.{.{ .name = "X-Env", .kind = .equals, .value = "prod" }} },
+        .actions = &.{.{ .reject = 429 }},
+    }};
+    var seed: u64 = 40;
+    while (seed < 44) : (seed += 1) {
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = seed,
+            .partial_io = true,
+            .filters = &rules,
+            .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        });
+        defer bed.tearDown();
+
+        try bed.exchange("GET /x HTTP/1.1\r\nHost: o\r\nX-Env: prod\r\n\r\n");
+
+        try std.testing.expectEqualStrings(
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            bed.client.response(),
+        );
+        try std.testing.expectEqual(@as(u32, 0), bed.origin.requests_served);
+        try bed.expectDrained();
+    }
 }
 
 test "l7: an HTTP/1.0 request with no Host matches only any-host routes" {

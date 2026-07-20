@@ -36,6 +36,7 @@ const Io = @import("../io/io.zig");
 const parser = @import("parser.zig");
 const render = @import("render.zig");
 const router = @import("router.zig");
+const filter = @import("filter.zig");
 const shed = @import("../shed.zig");
 
 const assert = std.debug.assert;
@@ -121,20 +122,20 @@ pub fn Proxy(comptime IoType: type) type {
             routeRequest(server, conn, &request);
         }
 
-        /// The cluster for `request`'s canonical host and path (§7). The
-        /// host is canonicalized (null when absent/unmatchable → any-host
-        /// routes only); origin-form paths are canonicalized and matched
-        /// by longest prefix; OPTIONS asterisk-form names the whole server,
-        /// so it routes as path "/". A target that will not canonicalize
-        /// is BadPath (400); an unmatched host/path is NoRoute (404).
-        fn resolveCluster(
-            conn: *ConnType,
+        /// The §7 canonical routing keys for `request`: the canonical host
+        /// (null when absent/unmatchable → any-host routes only) and the
+        /// canonical path — or "/" for OPTIONS asterisk-form, which names
+        /// the whole server. A target that will not canonicalize is
+        /// BadPath (400). One canonical view, shared by both filter
+        /// matching and routing, so they never disagree.
+        const RequestKeys = struct { host: ?[]const u8, path: []const u8 };
+
+        fn requestKeys(
             request: *const parser.RequestHead,
             scratch: *[constants.head_bytes_max]u8,
             host_scratch: *[constants.host_bytes_max]u8,
-        ) error{ BadPath, NoRoute }!u16 {
+        ) error{BadPath}!RequestKeys {
             assert(request.target.len >= 1);
-            assert(conn.routes.len >= 1);
             const host: ?[]const u8 = if (request.host) |raw|
                 parser.canonicalHost(raw, host_scratch)
             else
@@ -142,12 +143,25 @@ pub fn Proxy(comptime IoType: type) type {
             if (request.target[0] != '/') {
                 // validateTarget admitted only asterisk-form here.
                 assert(request.method == .options);
-                return router.route(conn.routes, host, "/") orelse error.NoRoute;
+                return .{ .host = host, .path = "/" };
             }
             const canonical = parser.canonicalTarget(request.target, scratch) catch {
                 return error.BadPath;
             };
-            return router.route(conn.routes, host, canonical.path) orelse error.NoRoute;
+            return .{ .host = host, .path = canonical.path };
+        }
+
+        /// Answer a §7 filter reject with its runtime policy status — each
+        /// a closed-set static response, all counted as one filter reject.
+        fn respondFilter(server: *ServerType, conn: *ConnType, status: u16) void {
+            assert(filter.isRejectStatus(status));
+            switch (status) {
+                400 => respond(server, conn, 400, "l7_filtered"),
+                403 => respond(server, conn, 403, "l7_filtered"),
+                404 => respond(server, conn, 404, "l7_filtered"),
+                429 => respond(server, conn, 429, "l7_filtered"),
+                else => unreachable,
+            }
         }
 
         /// The canonical bytes to forward for `request` (§7): origin-form
@@ -180,14 +194,27 @@ pub fn Proxy(comptime IoType: type) type {
                 return respond(server, conn, 501, "l7_not_implemented");
             }
 
-            // §7 routing: canonicalize the host and path and match them to
-            // a cluster before acquiring any resource, so a bad path or an
-            // unrouted host/path is rejected cheaply.
+            // §7: canonicalize the host and path once, then apply filters
+            // and routing to that one view before acquiring any resource,
+            // so a bad path, a policy reject, or an unrouted host/path is
+            // answered cheaply.
             var scratch: [constants.head_bytes_max]u8 = undefined;
             var host_scratch: [constants.host_bytes_max]u8 = undefined;
-            conn.cluster_index = resolveCluster(conn, request, &scratch, &host_scratch) catch |err| switch (err) {
-                error.BadPath => return respond(server, conn, 400, "l7_bad_request"),
-                error.NoRoute => return respond(server, conn, 404, "l7_no_route"),
+            const keys = requestKeys(request, &scratch, &host_scratch) catch {
+                return respond(server, conn, 400, "l7_bad_request");
+            };
+            // §7 filters run before routing: a policy reject stops the
+            // request whether or not it would have routed.
+            if (filter.firstReject(conn.filters, .{
+                .method = request.method,
+                .host = keys.host,
+                .path = keys.path,
+                .headers = request.headers,
+            })) |status| {
+                return respondFilter(server, conn, status);
+            }
+            conn.cluster_index = router.route(conn.routes, keys.host, keys.path) orelse {
+                return respond(server, conn, 404, "l7_no_route");
             };
 
             conn.relay_buffer = server.acquireRelayBuffer() orelse {

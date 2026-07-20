@@ -33,7 +33,7 @@ pub fn route(routes: []const Route, host: ?[]const u8, path: []const u8) ?u16 {
     assert(path.len >= 1);
     assert(path[0] == '/');
     for (routes) |candidate| {
-        if (hostMatches(candidate.host, host) and matches(candidate.prefix, path)) {
+        if (hostMatches(candidate.host, host) and prefixMatches(candidate.prefix, path)) {
             return candidate.cluster_index;
         }
     }
@@ -55,7 +55,9 @@ fn hostMatches(route_host: ?[]const u8, req_host: ?[]const u8) bool {
 /// after the prefix is `/`. So `/api` matches `/api` and `/api/v1` but
 /// never `/apihost` — a string prefix that splits a segment is not a
 /// route. `/` is slash-terminated, so the root prefix is the catch-all.
-fn matches(prefix: []const u8, path: []const u8) bool {
+/// Public so filters (§7) share exactly one canonical-path prefix
+/// semantics with routing.
+pub fn prefixMatches(prefix: []const u8, path: []const u8) bool {
     assert(prefix.len >= 1);
     assert(prefix[0] == '/');
     assert(path.len >= 1);

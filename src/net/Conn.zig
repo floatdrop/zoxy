@@ -11,6 +11,7 @@ const std = @import("std");
 const constants = @import("../constants.zig");
 const parser = @import("../http/parser.zig");
 const router = @import("../http/router.zig");
+const filter = @import("../http/filter.zig");
 const relay = @import("relay.zig");
 const upstream_module = @import("upstream.zig");
 
@@ -69,6 +70,9 @@ pub fn Conn(comptime IoType: type) type {
         /// no path to match). Set once at admission and constant for the
         /// connection's life, so it survives keep-alive turnarounds.
         routes: []const router.Route,
+        /// The listener's §7 filter rules, same lifetime as `routes`
+        /// (empty on L4 and when no filters are configured).
+        filters: []const filter.Rule,
         /// The leased upstream slot during an L7 exchange; released at
         /// teardown alongside the conn slot (§5). Null outside exchanges
         /// and on the whole L4 path.
@@ -271,8 +275,10 @@ pub fn Conn(comptime IoType: type) type {
             conn.head_len = 0;
             conn.response_pending = &.{};
             conn.cluster_index = cluster_index;
-            // L4 never routes by path; admitHttp installs the real table.
+            // L4 never routes or filters; admitHttp installs the real
+            // tables.
             conn.routes = &.{};
+            conn.filters = &.{};
             conn.upstream = null;
             conn.l7 = .{};
             conn.op_data_client_to_upstream = .{};
