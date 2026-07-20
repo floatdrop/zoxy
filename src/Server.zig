@@ -507,14 +507,7 @@ pub fn Server(comptime IoType: type) type {
             // A dial-timeout verdict (§8) may already have a cancel in
             // flight; submitting a second would double-arm the op.
             if (conn.armed.connect and !conn.armed.connect_cancel) {
-                conn.arm(&conn.op_connect_cancel, "connect_cancel");
-                server.io.connectCancel(
-                    &conn.op_connect.completion,
-                    &conn.op_connect_cancel.completion,
-                    ConnType,
-                    conn,
-                    onConnectCancel,
-                );
+                server.armConnectCancel(conn);
             }
             if (conn.armed.deadline) {
                 conn.arm(&conn.op_deadline_cancel, "deadline_cancel");
@@ -674,6 +667,12 @@ pub fn Server(comptime IoType: type) type {
             endpoint_index: u16,
         ) ?*upstream_module.UpstreamPool(IoType).Upstream {
             const leased = server.upstreams.acquire(cluster_index, endpoint_index) orelse return null;
+            // The pool honored the request: a freshly leased slot is
+            // unparked and carries the identity the pressure recompute and
+            // the P2C load table now read back.
+            assert(!leased.parked);
+            assert(leased.cluster_index == cluster_index);
+            assert(leased.endpoint_index == endpoint_index);
             server.updateUpstreamPressure();
             return leased;
         }
@@ -682,6 +681,10 @@ pub fn Server(comptime IoType: type) type {
             server: *Self,
             leased: *upstream_module.UpstreamPool(IoType).Upstream,
         ) void {
+            // A parked slot must be unparked before release (its idle-list
+            // links would dangle), and at least this slot is leased.
+            assert(!leased.parked);
+            assert(server.upstreams.leasedCount() >= 1);
             server.upstreams.release(leased);
             server.updateUpstreamPressure();
         }
@@ -791,7 +794,11 @@ pub fn Server(comptime IoType: type) type {
                 conn.l7.pending_verdict == .none and
                 Proxy.expiryAnswerable(conn))
             {
-                server.storeDeadline(conn, server.idleTimeoutMs());
+                // The verdict grace bounds the escape hatch, not idle
+                // shedding: use the fixed configured idle timeout, never the
+                // pressure-biased one (which collapses toward 1ms and could
+                // tear the verdict down before its forced completions land).
+                server.storeDeadline(conn, server.config.idle_timeout_ms);
                 server.armDeadline(conn);
                 Proxy.beginExpiry(server, conn);
                 return;
@@ -803,19 +810,31 @@ pub fn Server(comptime IoType: type) type {
                 assert(!conn.armed.connect_cancel);
                 assert(!conn.l7.response_started);
                 conn.l7.pending_verdict = .gateway_timeout;
-                server.storeDeadline(conn, server.idleTimeoutMs());
+                // Same fixed grace as the exchange verdict above.
+                server.storeDeadline(conn, server.config.idle_timeout_ms);
                 server.armDeadline(conn);
-                conn.arm(&conn.op_connect_cancel, "connect_cancel");
-                server.io.connectCancel(
-                    &conn.op_connect.completion,
-                    &conn.op_connect_cancel.completion,
-                    ConnType,
-                    conn,
-                    onConnectCancel,
-                );
+                server.armConnectCancel(conn);
                 return;
             }
             server.beginTeardown(conn);
+        }
+
+        /// The connect cancel arm+submit shared by teardown and the §8
+        /// dial-timeout verdict — the two paths that abort an in-flight
+        /// dial (§4: the one cancel outside data-op drain). Callers guard
+        /// the double-arm themselves: a verdict cancel may already be in
+        /// flight when teardown starts.
+        fn armConnectCancel(server: *Self, conn: *ConnType) void {
+            assert(conn.armed.connect);
+            assert(!conn.armed.connect_cancel);
+            conn.arm(&conn.op_connect_cancel, "connect_cancel");
+            server.io.connectCancel(
+                &conn.op_connect.completion,
+                &conn.op_connect_cancel.completion,
+                ConnType,
+                conn,
+                onConnectCancel,
+            );
         }
 
         fn onConnectCancel(conn: *ConnType) void {

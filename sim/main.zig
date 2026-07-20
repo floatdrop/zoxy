@@ -201,15 +201,19 @@ const Harness = struct {
     fn deriveTopology(harness: *Harness, random: std.Random) void {
         harness.endpoints_l4 = .{originAddress()};
         harness.endpoints_http = .{httpOriginAddress()};
-        // The pick policy is drawn per seed so both enum values flow
-        // through the balancer under the schedule fuzz. Single-endpoint
-        // clusters short-circuit either policy identically today; the
-        // draw is pre-wired coverage for a multi-endpoint topology.
-        const pick: zoxy.config.Config.Cluster.Pick =
+        // Each cluster draws its pick policy independently so mixed
+        // rr+p2c configs (one cluster each way) flow through the balancer
+        // under the schedule fuzz, not just the two uniform pairings.
+        // Single-endpoint clusters short-circuit either policy identically
+        // today; the draw is pre-wired coverage for a multi-endpoint
+        // topology.
+        const pick_l4: zoxy.config.Config.Cluster.Pick =
+            if (random.boolean()) .p2c else .rr;
+        const pick_http: zoxy.config.Config.Cluster.Pick =
             if (random.boolean()) .p2c else .rr;
         harness.clusters = .{
-            .{ .name = "origin-l4", .endpoints = &harness.endpoints_l4, .pick = pick },
-            .{ .name = "origin-http", .endpoints = &harness.endpoints_http, .pick = pick },
+            .{ .name = "origin-l4", .endpoints = &harness.endpoints_l4, .pick = pick_l4 },
+            .{ .name = "origin-http", .endpoints = &harness.endpoints_http, .pick = pick_http },
         };
         harness.routes_l4 = .{.{ .prefix = "/", .cluster_index = 0 }};
         harness.routes_http = .{.{ .prefix = "/", .cluster_index = 1 }};

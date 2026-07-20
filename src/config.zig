@@ -802,13 +802,8 @@ fn validateRoutePrefix(prefix: []const u8) ParseError!void {
 /// The closed pick-policy vocabulary; anything else is its own error so
 /// a typo ("pc2") fails loudly instead of silently balancing as p2c.
 fn pickOf(literal: []const u8) error{ClusterPickUnknown}!Config.Cluster.Pick {
-    if (std.mem.eql(u8, literal, "rr")) {
-        return .rr;
-    }
-    if (std.mem.eql(u8, literal, "p2c")) {
-        return .p2c;
-    }
-    return error.ClusterPickUnknown;
+    return std.meta.stringToEnum(Config.Cluster.Pick, literal) orelse
+        error.ClusterPickUnknown;
 }
 
 /// The closed protocol vocabulary; anything else is its own error so a

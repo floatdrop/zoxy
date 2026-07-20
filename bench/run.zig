@@ -232,7 +232,7 @@ fn overloadPassed(
     // 5xx sheds alike) landed within zrk's wire timeout, or it would be
     // a timeout below, not a sample.
     const stalls = counters.read_errors + counters.timeouts;
-    const stalls_ok = stalls * 100 <= counters.completed;
+    const stalls_ok = stalls * 100 < counters.completed;
     if (!stalls_ok) {
         std.debug.print(
             "FAIL: overload stall rate too high ({d} of {d} completed)\n",
