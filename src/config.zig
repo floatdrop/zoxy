@@ -12,6 +12,7 @@ const std = @import("std");
 
 const constants = @import("constants.zig");
 const router = @import("http/router.zig");
+const filter = @import("http/filter.zig");
 const parser = @import("http/parser.zig");
 
 const assert = std.debug.assert;
@@ -38,6 +39,10 @@ pub const Config = struct {
         /// listeners always have exactly that one route (no path to
         /// match). Matched by `http/router.zig`.
         routes: []const router.Route,
+        /// The §7 filter rules, in config order (evaluated top-down).
+        /// Empty on the L4 path and whenever no `"filters"` were given.
+        /// Compiled and interpreted by `http/filter.zig`.
+        filters: []const filter.Rule = &.{},
         protocol: Protocol,
 
         /// What the listener speaks (§6, §7): `l4` relays bytes blindly,
@@ -74,6 +79,18 @@ pub const ValidationError = error{
     RoutePrefixNotCanonical,
     RouteHostNotCanonical,
     RouteDuplicate,
+    ListenerL4Filters,
+    FiltersOverLimit,
+    FilterMethodEmpty,
+    FilterMethodUnknown,
+    FilterHeaderMatchesOverLimit,
+    FilterHeaderMatchKind,
+    FilterHeaderNameInvalid,
+    FilterHeaderValueInvalid,
+    FilterActionsEmpty,
+    FilterActionsOverLimit,
+    FilterActionKind,
+    FilterRejectStatus,
     EndpointsEmpty,
     EndpointsOverLimit,
     EndpointInvalid,
@@ -122,8 +139,52 @@ const ListenerJson = struct {
     /// `routes` (an explicit §7 path table) must be present.
     cluster: ?[]const u8 = null,
     routes: ?[]const RouteJson = null,
+    /// Optional §7 filter rules; absent means none. HTTP-only.
+    filters: ?[]const FilterJson = null,
     /// Optional: absent means `l4`, keeping pre-L7 configs valid.
     protocol: []const u8 = "l4",
+};
+
+const FilterJson = struct {
+    match: MatchJson = .{},
+    actions: []const ActionJson,
+};
+
+const MatchJson = struct {
+    /// Registered method tokens (uppercase); absent = any method.
+    method: ?[]const []const u8 = null,
+    host: ?[]const u8 = null,
+    path_prefix: ?[]const u8 = null,
+    headers: ?[]const HeaderMatchJson = null,
+};
+
+const HeaderMatchJson = struct {
+    name: []const u8,
+    /// Exactly one of these selects the predicate kind.
+    present: ?bool = null,
+    equals: ?[]const u8 = null,
+    contains: ?[]const u8 = null,
+};
+
+/// One action object carries exactly one field (the action's kind), the
+/// same "struct of optionals, validate exactly-one" shape the listener's
+/// cluster/routes fork uses — no JSON union parsing.
+const ActionJson = struct {
+    reject: ?u16 = null,
+    header_set: ?HeaderEditJson = null,
+    header_add: ?HeaderEditJson = null,
+    header_remove: ?[]const u8 = null,
+    rewrite_prefix: ?RewriteJson = null,
+};
+
+const HeaderEditJson = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+const RewriteJson = struct {
+    from: []const u8,
+    to: []const u8,
 };
 
 const RouteJson = struct {
@@ -278,11 +339,201 @@ fn resolveListeners(
         listeners[index] = .{
             .bind_address = bind_address,
             .routes = try resolveRoutes(arena, &listener_json, clusters, protocol),
+            .filters = try resolveFilters(arena, &listener_json, protocol),
             .protocol = protocol,
         };
     }
     assert(listeners.len == listeners_json.len);
     return listeners;
+}
+
+/// Compile a listener's §7 filter rules into immutable arena tables.
+/// HTTP-only (an l4 listener has no head to match); absent = none. Match
+/// keys are validated canonical so a filter and the router agree
+/// byte-for-byte, and each action is validated at load, so the request-
+/// time interpreter is bounded loops over trusted data.
+fn resolveFilters(
+    arena: std.mem.Allocator,
+    listener_json: *const ListenerJson,
+    protocol: Config.Listener.Protocol,
+) ParseError![]const filter.Rule {
+    const filters_json = listener_json.filters orelse return &.{};
+    if (filters_json.len == 0) {
+        return &.{};
+    }
+    if (protocol == .l4) {
+        return error.ListenerL4Filters; // No head to match on.
+    }
+    if (filters_json.len > constants.filters_per_listener_max) {
+        return error.FiltersOverLimit;
+    }
+    const rules = try arena.alloc(filter.Rule, filters_json.len);
+    for (filters_json, rules) |rule_json, *rule| {
+        rule.* = .{
+            .match = try resolveMatch(arena, &rule_json.match),
+            .actions = try resolveActions(arena, rule_json.actions),
+        };
+    }
+    assert(rules.len == filters_json.len);
+    assert(rules.len <= constants.filters_per_listener_max);
+    return rules;
+}
+
+fn resolveMatch(
+    arena: std.mem.Allocator,
+    match_json: *const MatchJson,
+) ParseError!filter.Match {
+    var match: filter.Match = .{};
+    if (match_json.host) |host| {
+        match.host = try validateRouteHost(host);
+    }
+    if (match_json.path_prefix) |prefix| {
+        try validateRoutePrefix(prefix);
+        match.path_prefix = prefix;
+    }
+    if (match_json.method) |tokens| {
+        if (tokens.len == 0) {
+            return error.FilterMethodEmpty;
+        }
+        var methods = std.EnumSet(parser.Method){};
+        for (tokens) |token| {
+            const method = parser.methodFromToken(token) orelse return error.FilterMethodUnknown;
+            methods.insert(method);
+        }
+        match.methods = methods;
+    }
+    if (match_json.headers) |headers_json| {
+        match.headers = try resolveHeaderMatches(arena, headers_json);
+    }
+    return match;
+}
+
+fn resolveHeaderMatches(
+    arena: std.mem.Allocator,
+    headers_json: []const HeaderMatchJson,
+) ParseError![]const filter.HeaderMatch {
+    if (headers_json.len > constants.header_matches_per_filter_max) {
+        return error.FilterHeaderMatchesOverLimit;
+    }
+    const matches = try arena.alloc(filter.HeaderMatch, headers_json.len);
+    for (headers_json, matches) |header_json, *match| {
+        try validateHeaderName(header_json.name);
+        // Exactly one predicate kind per header match.
+        const set: u8 = @as(u8, @intFromBool(header_json.present != null)) +
+            @intFromBool(header_json.equals != null) +
+            @intFromBool(header_json.contains != null);
+        assert(set <= 3); // The header match has three kind fields.
+        if (set != 1) {
+            return error.FilterHeaderMatchKind;
+        }
+        if (header_json.present) |present| {
+            if (!present) {
+                return error.FilterHeaderMatchKind; // "present: false" is not a predicate.
+            }
+            match.* = .{ .name = header_json.name, .kind = .present, .value = "" };
+        } else if (header_json.equals) |value| {
+            try validateHeaderValue(value);
+            match.* = .{ .name = header_json.name, .kind = .equals, .value = value };
+        } else {
+            try validateHeaderValue(header_json.contains.?);
+            match.* = .{ .name = header_json.name, .kind = .contains, .value = header_json.contains.? };
+        }
+    }
+    assert(matches.len == headers_json.len);
+    return matches;
+}
+
+fn resolveActions(
+    arena: std.mem.Allocator,
+    actions_json: []const ActionJson,
+) ParseError![]const filter.Action {
+    if (actions_json.len == 0) {
+        return error.FilterActionsEmpty;
+    }
+    if (actions_json.len > constants.actions_per_filter_max) {
+        return error.FilterActionsOverLimit;
+    }
+    const actions = try arena.alloc(filter.Action, actions_json.len);
+    for (actions_json, actions) |action_json, *action| {
+        action.* = try resolveAction(&action_json);
+    }
+    assert(actions.len == actions_json.len);
+    assert(actions.len <= constants.actions_per_filter_max);
+    return actions;
+}
+
+fn resolveAction(action_json: *const ActionJson) ParseError!filter.Action {
+    // Exactly one action field carries the kind.
+    const set: u8 = @as(u8, @intFromBool(action_json.reject != null)) +
+        @intFromBool(action_json.header_set != null) +
+        @intFromBool(action_json.header_add != null) +
+        @intFromBool(action_json.header_remove != null) +
+        @intFromBool(action_json.rewrite_prefix != null);
+    assert(set <= 5); // The action object has five kind fields.
+    if (set != 1) {
+        return error.FilterActionKind;
+    }
+    if (action_json.reject) |status| {
+        if (!filter.isRejectStatus(status)) {
+            return error.FilterRejectStatus;
+        }
+        return .{ .reject = status };
+    }
+    if (action_json.header_set) |edit| {
+        try validateHeaderName(edit.name);
+        try validateHeaderValue(edit.value);
+        return .{ .header_set = .{ .name = edit.name, .value = edit.value } };
+    }
+    if (action_json.header_add) |edit| {
+        try validateHeaderName(edit.name);
+        try validateHeaderValue(edit.value);
+        return .{ .header_add = .{ .name = edit.name, .value = edit.value } };
+    }
+    if (action_json.header_remove) |name| {
+        try validateHeaderName(name);
+        return .{ .header_remove = name };
+    }
+    const rewrite = action_json.rewrite_prefix.?;
+    try validateRoutePrefix(rewrite.from);
+    try validateRoutePrefix(rewrite.to);
+    return .{ .rewrite_prefix = .{ .from = rewrite.from, .to = rewrite.to } };
+}
+
+/// A header name must be a non-empty RFC 9110 token (no separators or
+/// controls), so an edit or match names a real, unambiguous header.
+fn validateHeaderName(name: []const u8) ParseError!void {
+    if (name.len == 0) {
+        return error.FilterHeaderNameInvalid;
+    }
+    for (name) |byte| {
+        if (!isTokenByte(byte)) {
+            return error.FilterHeaderNameInvalid;
+        }
+    }
+}
+
+/// A header value must be an RFC 9110 field-value: VCHAR / SP / HTAB /
+/// obs-text, and never CR, LF, NUL, or another control. A value carrying
+/// CRLF would inject a header when the renderer writes it upstream
+/// (slice 3), so the compiled edit is proven injection-safe at load —
+/// the same "already safe" guarantee the canonical host/path keys carry.
+/// An empty value is legal. Applied to emitted values and, for symmetry,
+/// to the compared match values.
+fn validateHeaderValue(value: []const u8) ParseError!void {
+    for (value) |byte| {
+        const legal = byte == '\t' or (byte >= ' ' and byte != 0x7f);
+        if (!legal) {
+            return error.FilterHeaderValueInvalid;
+        }
+    }
+}
+
+fn isTokenByte(byte: u8) bool {
+    return switch (byte) {
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        '0'...'9', 'a'...'z', 'A'...'Z' => true,
+        else => false,
+    };
 }
 
 /// Resolve a listener's route table (§7). `"cluster": "x"` is sugar for a
@@ -632,6 +883,77 @@ test "config: host routes resolve, host-specific sorted before any-host" {
         @as(?u16, routes[2].cluster_index),
         router.route(routes, "other.example.com", "/v2"),
     );
+}
+
+test "config: filters compile into rules with matches and actions" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const parsed = try parse(arena_state.allocator(),
+        \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","cluster":"a","filters":[
+        \\   {"match":{"method":["GET","POST"],"path_prefix":"/admin",
+        \\             "headers":[{"name":"X-Env","equals":"prod"}]},
+        \\    "actions":[{"reject":403}]},
+        \\   {"match":{"host":"api.example"},
+        \\    "actions":[{"header_set":{"name":"X-Via","value":"zoxy"}},
+        \\               {"rewrite_prefix":{"from":"/old","to":"/new"}}]}]}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+    );
+    const filters = parsed.listeners[0].filters;
+    try std.testing.expectEqual(@as(usize, 2), filters.len);
+
+    // Rule 0: method set + path prefix + one header-equals match, reject 403.
+    const rule0 = filters[0];
+    try std.testing.expect(rule0.match.methods.?.contains(.get));
+    try std.testing.expect(rule0.match.methods.?.contains(.post));
+    try std.testing.expect(!rule0.match.methods.?.contains(.delete));
+    try std.testing.expectEqualStrings("/admin", rule0.match.path_prefix.?);
+    try std.testing.expectEqual(@as(usize, 1), rule0.match.headers.len);
+    try std.testing.expectEqualStrings("X-Env", rule0.match.headers[0].name);
+    try std.testing.expectEqual(filter.HeaderMatch.Kind.equals, rule0.match.headers[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), rule0.actions.len);
+    try std.testing.expectEqual(@as(u16, 403), rule0.actions[0].reject);
+
+    // Rule 1: host match, header_set then rewrite_prefix.
+    const rule1 = filters[1];
+    try std.testing.expectEqualStrings("api.example", rule1.match.host.?);
+    try std.testing.expectEqual(@as(?std.EnumSet(parser.Method), null), rule1.match.methods);
+    try std.testing.expectEqual(@as(usize, 2), rule1.actions.len);
+    try std.testing.expectEqualStrings("X-Via", rule1.actions[0].header_set.name);
+    try std.testing.expectEqualStrings("/new", rule1.actions[1].rewrite_prefix.to);
+}
+
+test "config: filter schema rejects malformed rules" {
+    const tail =
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+    ;
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\",\"cluster\":\"a\",\"filters\":[";
+    // L4 listener may not carry filters.
+    try expectParseError(error.ListenerL4Filters, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"l4\",\"cluster\":\"a\"," ++
+        "\"filters\":[{\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    // A rule with no actions.
+    try expectParseError(error.FilterActionsEmpty, head ++ "{\"actions\":[]}]}]," ++ tail);
+    // An action object with no kind set.
+    try expectParseError(error.FilterActionKind, head ++ "{\"actions\":[{}]}]}]," ++ tail);
+    // An action object with two kinds set.
+    try expectParseError(error.FilterActionKind, head ++ "{\"actions\":[{\"reject\":403,\"header_remove\":\"X\"}]}]}]," ++ tail);
+    // A reject status outside the policy set.
+    try expectParseError(error.FilterRejectStatus, head ++ "{\"actions\":[{\"reject\":503}]}]}]," ++ tail);
+    // An unknown / lowercase method token.
+    try expectParseError(error.FilterMethodUnknown, head ++ "{\"match\":{\"method\":[\"get\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    // A header match with no predicate kind.
+    try expectParseError(error.FilterHeaderMatchKind, head ++ "{\"match\":{\"headers\":[{\"name\":\"X\"}]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    // A non-canonical match path prefix.
+    try expectParseError(error.RoutePrefixNotCanonical, head ++ "{\"match\":{\"path_prefix\":\"/a/../b\"},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    // A header edit with an invalid header name.
+    try expectParseError(error.FilterHeaderNameInvalid, head ++ "{\"actions\":[{\"header_set\":{\"name\":\"Bad Name\",\"value\":\"v\"}}]}]}]," ++ tail);
+    // A header value carrying CRLF — a smuggling vector when rendered.
+    try expectParseError(error.FilterHeaderValueInvalid, head ++ "{\"actions\":[{\"header_set\":{\"name\":\"X\",\"value\":\"a\\r\\nInjected: 1\"}}]}]}]," ++ tail);
+    // "present: false" is not a predicate.
+    try expectParseError(error.FilterHeaderMatchKind, head ++ "{\"match\":{\"headers\":[{\"name\":\"X\",\"present\":false}]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    // A rewrite whose target is not canonical.
+    try expectParseError(error.RoutePrefixNotCanonical, head ++ "{\"actions\":[{\"rewrite_prefix\":{\"from\":\"/a\",\"to\":\"/b/../c\"}}]}]}]," ++ tail);
 }
 
 test "config: unknown listener protocol fails loudly" {

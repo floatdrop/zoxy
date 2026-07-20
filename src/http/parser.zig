@@ -979,6 +979,27 @@ fn oversizeRequestError(head: []const u8) HeadError {
     return error.HeadTooLarge;
 }
 
+/// The registered method for an uppercase token, or null for anything
+/// unregistered. HTTP methods are case-sensitive (RFC 9110 §9.1), so only
+/// the canonical uppercase spelling matches — filters name registered
+/// methods this way; an extension method (`.extension`) is not selectable
+/// by token here (§7).
+pub fn methodFromToken(token: []const u8) ?Method {
+    const table = .{
+        .{ "GET", Method.get },         .{ "POST", Method.post },
+        .{ "HEAD", Method.head },       .{ "PUT", Method.put },
+        .{ "DELETE", Method.delete },   .{ "CONNECT", Method.connect },
+        .{ "OPTIONS", Method.options }, .{ "TRACE", Method.trace },
+        .{ "PATCH", Method.patch },
+    };
+    inline for (table) |entry| {
+        if (std.mem.eql(u8, token, entry[0])) {
+            return entry[1];
+        }
+    }
+    return null;
+}
+
 fn methodFromRaw(raw_method: hparse.Method) Method {
     assert(raw_method != .unknown);
     return switch (raw_method) {
