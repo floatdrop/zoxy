@@ -6,6 +6,7 @@ const std = @import("std");
 
 pub const balancer = @import("balancer.zig");
 pub const config = @import("config.zig");
+pub const config_schema = @import("config_schema.zig");
 pub const constants = @import("constants.zig");
 pub const counters = @import("counters.zig");
 /// L7 HTTP/1.1 modules (§7). `parser` wraps the vendored hparse behind
@@ -33,6 +34,7 @@ pub const testing = struct {
 test {
     _ = balancer;
     _ = config;
+    _ = config_schema;
     _ = constants;
     _ = counters;
     _ = http.parser;
