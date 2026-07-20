@@ -627,12 +627,20 @@ the loop thread.
 - **Watermarks before walls.** Each pool flips a `pressure` flag at its
   high watermark (ceil 3/4, released at floor 1/2 — hysteresis), one
   rule for all three: *relay-buffer* and *conn-slot* pressure are
-  downstream pressure — the idle timeout divides and keep-alive is no
-  longer honored, so idle downstream connections return the buffers and
-  slots they pin; *upstream-pool* pressure shortens parked-connection
-  deadlines (and the sweep interval), reaping idle parked sockets so
-  their slots free for fresh dials. Each bias sheds *idle* capacity
-  before the wall must shed *work*; each engage crossing has a counter.
+  downstream pressure — the idle timeout divides, so idle downstream
+  connections return the buffers and slots they pin. *Relay-buffer*
+  pressure alone also stops honoring keep-alive, because the next
+  request on a kept-alive connection claims a relay buffer. Conn-slot
+  pressure never suppresses keep-alive: a conn pool held by serving
+  connections is the steady state of a keep-alive workload, and closing
+  them churns the whole population into synchronized reconnect waves
+  (measured — IMPLEMENTATION_NOTES.md "Occupancy is not overload");
+  slot scarcity is answered by the idle division and the admit-time
+  RST wall, the same norm nginx and haproxy follow. *Upstream-pool*
+  pressure shortens parked-connection deadlines (and the sweep
+  interval), reaping idle parked sockets so their slots free for fresh
+  dials. Each bias sheds *idle* capacity before the wall must shed
+  *work*; each engage crossing has a counter.
 - **Metrics witness every shed.** Every rung has a counter, written only
   by the loop thread as a relaxed atomic — one writer, any number of
   readers, so a metrics/admin thread can read without a data race and

@@ -50,11 +50,13 @@ pub fn Server(comptime IoType: type) type {
         /// §8 watermark state, one flag per pool: set once a pool crosses
         /// its high watermark, cleared once it drains back below the low
         /// one (hysteresis, `constants.poolPressureOn/Off`). Relay and
-        /// conn pressure bias downstream capacity — shorter idle timeouts
-        /// and keep-alive no longer honored — so quiet connections return
-        /// their buffers and slots before the wall is reached; upstream
-        /// pressure shortens parked-connection deadlines so idle parked
-        /// sockets free their slots for fresh dials before the 503 wall.
+        /// conn pressure shorten the idle timeout so quiet connections
+        /// return their buffers and slots before the wall is reached;
+        /// relay pressure alone also stops honoring keep-alive
+        /// (`keepAliveSuppressed` — conn-slot occupancy stays out, #57);
+        /// upstream pressure shortens parked-connection deadlines so idle
+        /// parked sockets free their slots for fresh dials before the
+        /// 503 wall.
         relay_pressure: bool,
         conn_pressure: bool,
         upstream_pressure: bool,
@@ -653,12 +655,24 @@ pub fn Server(comptime IoType: type) type {
             );
         }
 
-        /// Any pressure that downstream keep-alive holds capacity against
-        /// (§8): an idle downstream connection pins a conn slot, and its
-        /// next body relay claims a relay buffer. Public for the L7
-        /// render's persistence decision.
+        /// Any pressure an *idle* downstream connection holds capacity
+        /// against (§8): it pins a conn slot, and its next body relay
+        /// claims a relay buffer. Drives only the idle-timeout division —
+        /// quiet connections reap sooner; serving ones are untouched.
         pub fn downstreamPressured(server: *const Self) bool {
             return server.relay_pressure or server.conn_pressure;
+        }
+
+        /// The §8 keep-alive suppression signal for the L7 render's
+        /// persistence decision: relay pressure only. Conn-slot occupancy
+        /// deliberately stays out — a conn pool held by *serving*
+        /// connections is the steady state of a keep-alive workload, not
+        /// imminent exhaustion, and closing them churns the population
+        /// into synchronized reconnect waves (#57). Slot scarcity is
+        /// answered by the idle-timeout division and the admit-time wall,
+        /// never by closing connections that are doing work.
+        pub fn keepAliveSuppressed(server: *const Self) bool {
+            return server.relay_pressure;
         }
 
         /// The §8 upstream-pool acquire/release pair: the pressure flag

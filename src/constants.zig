@@ -40,11 +40,13 @@ pub const relay_buffers_max: u32 = conn_slots_max;
 pub const relay_buffer_bytes: u32 = 4 * 1024;
 
 /// §8 "watermarks before walls": each pool flips a pressure flag before
-/// it hits the wall so the proxy sheds *idle* capacity — shorter idle
-/// timeouts, keep-alive no longer honored, parked connections reaped
-/// sooner — before it must shed *work*. One rule for all three pools
-/// (relay buffers, conn slots, upstream slots). Hysteresis keeps a flag
-/// from flapping around a single threshold: engage at the high
+/// it hits the wall so the proxy sheds *idle* capacity before it must
+/// shed *work*: relay or conn pressure shortens idle timeouts, relay
+/// pressure alone stops honoring keep-alive (conn-pool occupancy is the
+/// steady state of a keep-alive workload, not a crisis — #57), upstream
+/// pressure reaps parked connections sooner. One rule for all three
+/// pools (relay buffers, conn slots, upstream slots). Hysteresis keeps
+/// a flag from flapping around a single threshold: engage at the high
 /// watermark, release only after draining back to the low one. Both are
 /// fractions of the *live* pool capacity, so an injected test pool and
 /// the production pool obey one rule. `On` uses ceil so a full pool

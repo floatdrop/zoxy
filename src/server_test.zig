@@ -563,7 +563,8 @@ test "server: conn-slot pressure engages before the wall and drains clean" {
 test "server: idle timeout shortens under pressure, is full otherwise" {
     // The pure selection rules the pressure flags drive: full timeouts
     // when relaxed; the idle timeout divides under either downstream
-    // pressure (relay or conn); the parked deadline divides again under
+    // pressure (relay or conn); keep-alive suppression follows relay
+    // pressure only (#57); the parked deadline divides again under
     // upstream pressure — each floored at 1 ms.
     var bed: TestBed = undefined;
     try bed.setUp(std.testing.allocator, .{
@@ -573,13 +574,19 @@ test "server: idle timeout shortens under pressure, is full otherwise" {
     defer bed.tearDown();
 
     try std.testing.expect(!bed.server.downstreamPressured());
+    try std.testing.expect(!bed.server.keepAliveSuppressed());
     try std.testing.expectEqual(@as(u32, 1000), bed.server.idleTimeoutMs());
     try std.testing.expectEqual(@as(u32, 1000), bed.server.parkedTimeoutMs());
     bed.server.relay_pressure = true;
+    try std.testing.expect(bed.server.keepAliveSuppressed());
     try std.testing.expectEqual(@as(u32, 1000 / 4), bed.server.idleTimeoutMs());
     bed.server.relay_pressure = false;
     bed.server.conn_pressure = true;
     try std.testing.expect(bed.server.downstreamPressured());
+    // Conn pressure divides the idle timeout but never suppresses
+    // keep-alive: slot scarcity reaps quiet connections, not serving
+    // ones (#57).
+    try std.testing.expect(!bed.server.keepAliveSuppressed());
     try std.testing.expectEqual(@as(u32, 1000 / 4), bed.server.idleTimeoutMs());
     bed.server.conn_pressure = false;
     // Upstream pressure biases only the parked deadline, not the idle

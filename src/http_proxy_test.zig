@@ -1465,7 +1465,7 @@ test "l7: a pipelining client gets its first response, then the close" {
     try bed.expectDrained();
 }
 
-test "l7: keep-alive is not honored under conn-slot pressure" {
+test "l7: keep-alive is honored under conn-slot pressure" {
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, .{
@@ -1475,21 +1475,85 @@ test "l7: keep-alive is not honored under conn-slot pressure" {
     });
     defer bed.tearDown();
 
-    // Two concurrent clients fill both conn slots — the §8 watermark
-    // engages — so a keep-alive ask is answered with an announced close:
-    // idle downstream connections are exactly the capacity under
-    // pressure.
+    // The first client exchanges, then idles holding a conn slot but no
+    // relay buffer; a timer starts the second client mid-idle, filling
+    // both slots — the §8 conn watermark engages with the relay pool
+    // never above one of two. Yet both keep-alive asks are honored: a
+    // slot-holding connection that serves requests is the capacity
+    // doing its job, and closing it would churn the population into
+    // reconnect waves (#57). The conn-slot remedy is the shortened idle
+    // timeout, which reaps the connections once they go quiet and
+    // returns their slots.
+    const starter = struct {
+        fn onTimer(started: *Http1Bed, result: Io.TimerError!void) void {
+            result catch unreachable; // Nothing cancels the start timer.
+            started.client2.start(
+                &started.sim_io,
+                &started.server,
+                Http1Bed.bindAddress(),
+            );
+        }
+    };
+    var start_completion: SimIo.Completion = .{};
     bed.client2.request = "GET /b HTTP/1.1\r\nHost: o\r\n\r\n";
-    bed.client2.start(&bed.sim_io, &bed.server, Http1Bed.bindAddress());
+    bed.sim_io.timerStart(
+        &start_completion,
+        100 * std.time.ns_per_ms,
+        Http1Bed,
+        &bed,
+        starter.onTimer,
+    );
     try bed.exchange("GET /a HTTP/1.1\r\nHost: o\r\n\r\n");
 
     try std.testing.expect(bed.server.counters.get("conn_pressure_engaged") >= 1);
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        bed.server.counters.get("relay_pressure_engaged"),
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        bed.client.response(),
+        "Connection: close",
+    ) == null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         bed.client2.response(),
         "Connection: close",
-    ) != null);
+    ) == null);
+    // The divided idle deadline — not a keep-alive kill — returned the
+    // slots.
+    try std.testing.expect(bed.server.counters.get("deadline_expired") >= 1);
     try std.testing.expect(!bed.server.conn_pressure); // Cleared on drain.
+    try bed.expectDrained();
+}
+
+test "l7: keep-alive is not honored under relay pressure" {
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 92,
+        .origin_response = response,
+        .relay_buffers = 1,
+    });
+    defer bed.tearDown();
+
+    // A single relay buffer: the exchange's own claim crosses the §8
+    // high watermark, so the render sees relay pressure and answers the
+    // keep-alive ask with an announced close — the next request on this
+    // connection would claim a buffer the pool is out of.
+    try bed.exchange("GET / HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expect(bed.server.counters.get("relay_pressure_engaged") >= 1);
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        bed.server.counters.get("conn_pressure_engaged"),
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        bed.client.response(),
+        "Connection: close",
+    ) != null);
+    try std.testing.expect(!bed.server.relay_pressure); // Cleared on drain.
     try bed.expectDrained();
 }
 
