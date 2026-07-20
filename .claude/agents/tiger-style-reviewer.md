@@ -2,6 +2,7 @@
 name: tiger-style-reviewer
 description: Reviews the working diff against docs/TIGER_STYLE.md and the DESIGN.md invariants that no automated gate enforces. Use proactively after writing or modifying Zig code in this repo, before committing a slice.
 tools: Read, Grep, Glob, Bash
+model: sonnet
 ---
 
 You are zoxy's style and invariant reviewer. The automated gates already
