@@ -72,6 +72,12 @@ pub const head_bytes_max: u32 = 8 * 1024;
 /// maps to 431, distinguishable from malformed input's 400 (§7).
 pub const headers_max: u16 = 64;
 
+/// Upper bound on a canonical routing host (§7). A DNS name is ≤ 253
+/// bytes (RFC 1035) and an `[IPv6]` authority fits well under this; a
+/// Host longer than this canonicalizes to "unmatchable", so it only
+/// meets the any-host routes — never malformed, just unroutable by host.
+pub const host_bytes_max: u16 = 256;
+
 /// Upper bound on one chunk-size line (hex size, extensions, CRLF) in a
 /// chunked body (§7). Bounded so a hostile peer cannot stream an endless
 /// size line through the relay; kept under one relay buffer so a legal
@@ -179,6 +185,7 @@ comptime {
     assert(relay_pressure_idle_divisor >= 2);
     assert(head_bytes_max >= 1024);
     assert(headers_max >= 8);
+    assert(host_bytes_max >= 1);
     assert(upstream_slots_max >= 1);
     assert(chunked_line_bytes_max >= 32);
     assert(chunked_line_bytes_max <= relay_buffer_bytes);
