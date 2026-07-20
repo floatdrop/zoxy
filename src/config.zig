@@ -72,7 +72,8 @@ pub const ValidationError = error{
     RoutesEmpty,
     RoutesOverLimit,
     RoutePrefixNotCanonical,
-    RoutePrefixDuplicate,
+    RouteHostNotCanonical,
+    RouteDuplicate,
     EndpointsEmpty,
     EndpointsOverLimit,
     EndpointInvalid,
@@ -126,6 +127,8 @@ const ListenerJson = struct {
 };
 
 const RouteJson = struct {
+    /// Optional §7 host scope; absent means the route matches any host.
+    host: ?[]const u8 = null,
     prefix: []const u8,
     cluster: []const u8,
 };
@@ -321,27 +324,63 @@ fn resolveRoutes(
     const routes = try arena.alloc(router.Route, routes_json.len);
     for (routes_json, 0..) |route_json, index| {
         try validateRoutePrefix(route_json.prefix);
+        const host = if (route_json.host) |raw| try validateRouteHost(raw) else null;
         for (routes_json[0..index]) |previous| {
-            if (std.mem.eql(u8, previous.prefix, route_json.prefix)) {
-                return error.RoutePrefixDuplicate;
+            // Earlier routes already passed validateRouteHost, so their raw
+            // host equals its canonical form — a byte compare is sound.
+            if (optionalHostEql(previous.host, host) and
+                std.mem.eql(u8, previous.prefix, route_json.prefix))
+            {
+                return error.RouteDuplicate;
             }
         }
         routes[index] = .{
+            .host = host,
             .prefix = route_json.prefix,
             .cluster_index = try clusterIndexOf(clusters, route_json.cluster),
         };
     }
-    // Longest-prefix-first, so the router's linear scan finds the most
-    // specific match first (§7). Descending by length; ties are already
-    // rejected as duplicates above, so order among equal lengths is moot.
-    std.mem.sort(router.Route, routes, {}, routeLongerFirst);
+    // Host-specific first, then longest-prefix-first (§7): the router's
+    // linear scan then finds the most specific match first — any route
+    // scoped to the request's host before any any-host route, and within a
+    // group the longest prefix. Ties are rejected as duplicates above.
+    std.mem.sort(router.Route, routes, {}, routeMoreSpecific);
     assert(routes.len >= 1);
     assert(routes.len <= constants.routes_max);
     return routes;
 }
 
-fn routeLongerFirst(_: void, left: router.Route, right: router.Route) bool {
+fn routeMoreSpecific(_: void, left: router.Route, right: router.Route) bool {
+    const left_scoped = left.host != null;
+    const right_scoped = right.host != null;
+    if (left_scoped != right_scoped) {
+        return left_scoped; // A host-scoped route sorts before an any-host one.
+    }
     return left.prefix.len > right.prefix.len;
+}
+
+fn optionalHostEql(left: ?[]const u8, right: ?[]const u8) bool {
+    const left_host = left orelse return right == null;
+    const right_host = right orelse return false;
+    return std.mem.eql(u8, left_host, right_host);
+}
+
+/// A route host must already be in §7 canonical form (lowercased,
+/// port-stripped), so a request's canonical host compares byte-for-byte
+/// against it. A host canonicalization would change — mixed case, a port,
+/// oversize — is rejected at load, not silently mismatched at request time.
+fn validateRouteHost(host: []const u8) ParseError![]const u8 {
+    if (host.len == 0 or host.len > constants.host_bytes_max) {
+        return error.RouteHostNotCanonical;
+    }
+    var out: [constants.host_bytes_max]u8 = undefined;
+    const canonical = parser.canonicalHost(host, &out) orelse {
+        return error.RouteHostNotCanonical;
+    };
+    if (!std.mem.eql(u8, canonical, host)) {
+        return error.RouteHostNotCanonical;
+    }
+    return host; // The config slice, already canonical.
 }
 
 /// A route prefix must be an origin-form path already in canonical form,
@@ -518,11 +557,11 @@ test "config: explicit routes resolve, sorted longest-prefix-first" {
     // The cluster the router will hand back for the longest match.
     try std.testing.expectEqual(
         @as(?u16, routes[0].cluster_index),
-        router.route(routes, "/api/v2/x"),
+        router.route(routes, null, "/api/v2/x"),
     );
     try std.testing.expectEqual(
         @as(?u16, routes[2].cluster_index),
-        router.route(routes, "/elsewhere"),
+        router.route(routes, null, "/elsewhere"),
     );
 }
 
@@ -548,13 +587,51 @@ test "config: routing schema rejects malformed tables" {
     // A prefix without a leading slash.
     try expectParseError(error.RoutePrefixNotCanonical, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
         "\"routes\":[{\"prefix\":\"api\",\"cluster\":\"a\"}]}]," ++ base_clusters);
-    // Duplicate prefixes.
-    try expectParseError(error.RoutePrefixDuplicate, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
+    // Duplicate (host, prefix) — same any-host prefix twice.
+    try expectParseError(error.RouteDuplicate, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
         "\"routes\":[{\"prefix\":\"/x\",\"cluster\":\"a\"}," ++
         "{\"prefix\":\"/x\",\"cluster\":\"a\"}]}]," ++ base_clusters);
+    // A non-canonical host (uppercase) — would mismatch at request time.
+    try expectParseError(error.RouteHostNotCanonical, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
+        "\"routes\":[{\"host\":\"API.Example.com\",\"prefix\":\"/\",\"cluster\":\"a\"}]}]," ++ base_clusters);
+    // A host carrying a port — the port is not part of the routing name.
+    try expectParseError(error.RouteHostNotCanonical, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
+        "\"routes\":[{\"host\":\"api.example.com:8080\",\"prefix\":\"/\",\"cluster\":\"a\"}]}]," ++ base_clusters);
     // An unknown cluster named by a route.
     try expectParseError(error.ClusterUnknown, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
         "\"routes\":[{\"prefix\":\"/\",\"cluster\":\"ghost\"}]}]," ++ base_clusters);
+}
+
+test "config: host routes resolve, host-specific sorted before any-host" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const parsed = try parse(arena_state.allocator(),
+        \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","routes":[
+        \\   {"prefix":"/","cluster":"root"},
+        \\   {"host":"api.example.com","prefix":"/","cluster":"api"},
+        \\   {"host":"api.example.com","prefix":"/v2","cluster":"v2"}]}],
+        \\ "clusters":{"root":{"endpoints":["127.0.0.1:2"]},
+        \\   "api":{"endpoints":["127.0.0.1:3"]},
+        \\   "v2":{"endpoints":["127.0.0.1:4"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+    );
+    const routes = parsed.listeners[0].routes;
+    try std.testing.expectEqual(@as(usize, 3), routes.len);
+    // Host-specific first (longest-prefix within), then any-host.
+    try std.testing.expectEqualStrings("api.example.com", routes[0].host.?);
+    try std.testing.expectEqualStrings("/v2", routes[0].prefix);
+    try std.testing.expectEqualStrings("api.example.com", routes[1].host.?);
+    try std.testing.expectEqualStrings("/", routes[1].prefix);
+    try std.testing.expectEqual(@as(?[]const u8, null), routes[2].host);
+    // The router hands host-specificity precedence over prefix length.
+    try std.testing.expectEqual(
+        @as(?u16, routes[1].cluster_index),
+        router.route(routes, "api.example.com", "/other"),
+    );
+    try std.testing.expectEqual(
+        @as(?u16, routes[2].cluster_index),
+        router.route(routes, "other.example.com", "/v2"),
+    );
 }
 
 test "config: unknown listener protocol fails loudly" {
