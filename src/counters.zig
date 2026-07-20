@@ -39,6 +39,9 @@ pub const Counters = struct {
     /// No route matched the request's canonical path (§7), answered 404.
     /// Like the other reject counters the connection completes normally.
     l7_no_route: Value = Value.init(0),
+    /// A §7 filter rule rejected the request with its policy status
+    /// (403/404/429/400). A reject, not a shed — the connection completes.
+    l7_filtered: Value = Value.init(0),
     /// §8 rungs at the L7 request level, answered 503: relay buffers or
     /// upstream slots exhausted when a valid request needed them. Like
     /// the reject counters these connections complete normally, so they
