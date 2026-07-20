@@ -83,6 +83,10 @@ pub const OriginMode = enum(u8) {
     /// Send the oversize-after-edits head at accept time, then drain:
     /// the render-failure race into the deferred-render path.
     instant_oversize,
+    /// Answer the sized keep-alive 200, then close: the proxy parks on
+    /// the head's promise, the FIN lands while parked, and the next
+    /// checkout meets the §5 stale connection — the §7 replay's shape.
+    stale_reuse,
 };
 
 /// What the origin verifies about every byte the proxy forwards (§7):
@@ -393,6 +397,12 @@ pub fn HttpOrigin(comptime IoType: type) type {
                 assert(conn.phase == .head);
                 switch (conn.mode) {
                     .sized, .reset => conn.armRecv(),
+                    .stale_reuse => {
+                        // The keep-alive head parks the proxy's side; the
+                        // close after responding is the staleness itself.
+                        conn.close_after_response = true;
+                        conn.armRecv();
+                    },
                     .chunked => {
                         conn.response_bytes = chunked_response;
                         conn.armRecv();

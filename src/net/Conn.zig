@@ -210,6 +210,17 @@ pub fn Conn(comptime IoType: type) type {
             /// exchange completes and the connection closes, dropping the
             /// early bytes (§2 note; clients recover per RFC).
             client_pipelined: bool = false,
+            /// This try runs over a checked-out parked connection (§5) —
+            /// the precondition for the §7 stale replay: only a *reused*
+            /// connection's early failure is blamed on staleness.
+            upstream_was_reused: bool = false,
+            /// The request leg entered the body pump: relay-buffer chunks
+            /// flowed and were overwritten, so the try is no longer
+            /// reconstructible from conn.head — replay is off the table.
+            request_body_pumped: bool = false,
+            /// The one free replay is spent (§7): a failure on the replay
+            /// try answers 502 like any other, never a second replay.
+            replay_used: bool = false,
 
             pub const Leg = enum(u8) {
                 idle,
@@ -223,11 +234,13 @@ pub fn Conn(comptime IoType: type) type {
                 done,
             };
 
-            /// The deferred §8 verdicts (`gateway_timeout` now; replay in
-            /// Phase 2's stale-replay slice extends this).
+            /// The deferred verdicts: the §8 request-deadline 504 and the
+            /// §7 stale-replay retry, both settled once the last armed
+            /// data op is forced to completion.
             pub const PendingVerdict = enum(u8) {
                 none,
                 gateway_timeout,
+                replay,
             };
         };
 

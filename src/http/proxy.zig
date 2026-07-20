@@ -19,8 +19,9 @@
 //! later request — §3's shared-pool win), and the downstream connection
 //! honors what its rendered response announced (§2), going idle at the
 //! cost of a slot + head buffer only (§5). Pipelining is unsupported
-//! (first response, then an announced close); the stale-checkout free
-//! replay and the §8 504 deadline verdict are Phase 2 (docs/PLANS.md).
+//! (first response, then an announced close). A stale checkout takes one
+//! free replay on a fresh dial (§7), and an expired exchange or dial
+//! that can still be answered gets the §8 request-deadline 504 verdict.
 //!
 //! Buffer ownership rotates, never overlaps: conn.head holds the request
 //! head until it is rendered, then stages the rendered response head;
@@ -30,6 +31,7 @@
 
 const std = @import("std");
 
+const Balancer = @import("../balancer.zig").Balancer;
 const constants = @import("../constants.zig");
 const conn_module = @import("../net/Conn.zig");
 const Io = @import("../io/io.zig");
@@ -288,14 +290,15 @@ pub fn Proxy(comptime IoType: type) type {
 
             // The §3 reuse win: a parked connection to the picked endpoint
             // beats a fresh dial. A close that slipped through while it
-            // was parked surfaces as a failure on first use — answered
-            // 502 until Phase 2's free replay (docs/PLANS.md).
+            // was parked surfaces as a failure on first use — absorbed by
+            // the §7 free replay (`upstreamFailed`).
             const pick = server.balancer.pick(conn.cluster_index, &server.upstreams.leased_counts);
             if (server.upstreams.checkout(conn.cluster_index, pick.endpoint_index)) |parked| {
                 server.counters.increment("upstream_reused");
                 conn.upstream = parked;
                 conn.upstream_socket = parked.socket;
                 parked.head_len = 0;
+                conn.l7.upstream_was_reused = true;
                 conn.state = .l7_dialing;
                 // No await happened: this runs in the same callback as the
                 // parse whose result is still live, so the reuse path —
@@ -303,6 +306,17 @@ pub fn Proxy(comptime IoType: type) type {
                 renderRequestAndStartLegs(server, conn, request);
                 return;
             }
+            dialUpstream(server, conn, pick);
+        }
+
+        /// Acquire a fresh slot and dial `pick` under the per-try connect
+        /// deadline (§8) — shared by the first try (`routeRequest`) and
+        /// the §7 stale replay (`beginReplay`), so both tries dial
+        /// identically.
+        fn dialUpstream(server: *ServerType, conn: *ConnType, pick: Balancer.Pick) void {
+            assert(conn.state == .l7_reading_head or conn.state == .l7_exchanging);
+            assert(conn.upstream == null);
+            assert(conn.upstream_socket == null);
             conn.upstream = server.upstreams.acquire(conn.cluster_index, pick.endpoint_index) orelse {
                 return respond(server, conn, 503, "l7_shed_upstream_slots");
             };
@@ -583,6 +597,9 @@ pub fn Proxy(comptime IoType: type) type {
                 conn.l7.request_leg = .done;
             } else {
                 conn.l7.request_leg = .pumping_body;
+                // Relay chunks will flow and be overwritten: from here the
+                // try is no longer reconstructible — no replay (§7).
+                conn.l7.request_body_pumped = true;
                 armRequestBodyRecv(server, conn);
             }
         }
@@ -1222,10 +1239,94 @@ pub fn Proxy(comptime IoType: type) type {
             switch (verdict) {
                 .none => unreachable,
                 .gateway_timeout => respond(server, conn, 504, "l7_gateway_timeout"),
+                .replay => beginReplay(server, conn),
             }
         }
 
-        /// The upstream leg failed. Answer 502 only when the client has
+        /// Whether a failed try may take the one free §7 replay: the
+        /// connection was a checkout (only a *reused* connection's early
+        /// failure is blamed on staleness — a fresh dial's failure is the
+        /// origin's own), the replay is unspent, no response byte was
+        /// received, and the request leg never entered the body pump — the
+        /// whole try (head, and any body that arrived coalesced with it)
+        /// then still sits intact in conn.head, byte-for-byte
+        /// reconstructible. Once relay-buffer chunks flowed they were
+        /// overwritten and the origin may have consumed them: no replay.
+        /// This covers the dominant real case — a GET whose head send
+        /// landed in the kernel buffer while the parked origin's FIN was
+        /// already in flight, surfacing as EOF at the response recv with
+        /// the request leg already done.
+        fn replayEligible(conn: *const ConnType) bool {
+            assert(conn.state == .l7_exchanging);
+            if (!conn.l7.upstream_was_reused) {
+                return false;
+            }
+            if (conn.l7.replay_used) {
+                return false;
+            }
+            if (conn.l7.response_started) {
+                return false;
+            }
+            if (conn.upstream.?.head_len != 0) {
+                return false; // A response byte arrived: the origin spoke.
+            }
+            if (conn.l7.request_body_pumped) {
+                return false; // Relay chunks flowed; not reconstructible.
+            }
+            assert(conn.l7.request_leg != .idle);
+            assert(conn.l7.request_leg != .pumping_body); // Implied by the flag.
+            return true;
+        }
+
+        /// Take the one free replay: dispose the stale connection and run
+        /// the fresh-dial try from the same client bytes. The verdict is
+        /// already cleared; the caller (settle) proved both data ops free.
+        fn beginReplay(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_exchanging);
+            assert(conn.l7.pending_verdict == .none);
+            assert(conn.l7.replay_used); // Spent before the try began.
+            assert(!conn.armed.data_client_to_upstream);
+            assert(!conn.armed.data_upstream_to_client);
+            assert(!conn.l7.response_started);
+            assert(conn.relay_buffer != null); // Retained across the replay.
+            const stale = conn.upstream.?;
+            assert(stale.head_len == 0);
+            server.io.closeNow(conn.upstream_socket.?);
+            server.upstreams.release(stale);
+            conn.upstream = null;
+            conn.upstream_socket = null;
+            server.counters.increment("upstream_replayed");
+            // Rebuild the per-try state from the §7 source of truth — the
+            // client's bytes, intact in conn.head (the eligible legs sent
+            // only from it). The same bytes parsed at routing, so this
+            // cannot fail; the framing tracker MUST re-derive from the
+            // parse — the coalesced excess was already fed once and will
+            // be fed again on the fresh try.
+            var storage: parser.HeaderStorage = undefined;
+            const request = parser.parseRequestHead(
+                conn.head[0..conn.head_len],
+                false,
+                &storage,
+            ) catch unreachable;
+            assert(request.head_len == conn.l7.request_head_len);
+            conn.l7 = .{
+                .request_method = conn.l7.request_method,
+                .request_framing = framingFromParsed(request.framing),
+                .request_head_len = conn.l7.request_head_len,
+                .client_keep_alive = conn.l7.client_keep_alive,
+                .replay_used = true,
+                // upstream_was_reused stays default-false: the replay try
+                // is a fresh dial, and a second early failure answers 502.
+            };
+            conn.directions = .{ .{}, .{} };
+            // A fresh pick and a fresh dial — never another checkout (§7):
+            // the endpoint's whole idle list may be stale the same way.
+            const pick = server.balancer.pick(conn.cluster_index, &server.upstreams.leased_counts);
+            dialUpstream(server, conn, pick);
+        }
+
+        /// The upstream leg failed. A stale checkout takes its one free
+        /// replay (§7); otherwise answer 502 only when the client has
         /// seen no response byte and both data ops are free — the static
         /// response and its lingering drain need them, and ops are never
         /// canceled (§5). Otherwise the only honest outcome is teardown: a
@@ -1233,6 +1334,17 @@ pub fn Proxy(comptime IoType: type) type {
         /// completion the answer would need.
         fn upstreamFailed(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
+            assert(conn.l7.pending_verdict == .none); // Handlers divert first.
+            if (replayEligible(conn)) {
+                conn.l7.pending_verdict = .replay;
+                conn.l7.replay_used = true; // Spent now: a loop is impossible.
+                // Force the sibling op, if armed (the response recv during
+                // an excess send); settle acts immediately when both are
+                // already free (the head-send failure case).
+                server.io.shutdown(conn.upstream_socket.?, .both);
+                settlePendingVerdict(server, conn);
+                return;
+            }
             if (conn.l7.response_started or conn.armed.data_client_to_upstream or
                 conn.armed.data_upstream_to_client)
             {
