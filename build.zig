@@ -97,6 +97,29 @@ pub fn build(b: *std.Build) void {
     const sim_step = b.step("sim", "Deterministic simulation: -- [seed] [iterations] | fuzz");
     sim_step.dependOn(&sim_run.step);
 
+    // §5 config schema: a standalone tool renders the JSON Schema derived
+    // from the config definitions (constants + the source enums), and
+    // `zig build schema` installs it as zig-out/config.schema.json for the
+    // release workflow to ship as an asset. Deliberately not wired into
+    // `ci`: the emitter's own tests run under `test`; the file itself is a
+    // release-only artifact, so nothing here needs to gate every change.
+    const schema_exe = b.addExecutable(.{
+        .name = "zoxy-schema",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/schema.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zoxy", .module = zoxy_module },
+            },
+        }),
+    });
+    const schema_run = b.addRunArtifact(schema_exe);
+    const schema_output = schema_run.captureStdOut(.{ .basename = "config.schema.json" });
+    const schema_install = b.addInstallFile(schema_output, "config.schema.json");
+    const schema_step = b.step("schema", "Emit the config JSON Schema to zig-out/config.schema.json");
+    schema_step.dependOn(&schema_install.step);
+
     // §9 Tier 1: the loopback band harness embeds zrk (pinned by hash),
     // and the zoxy under test is a ReleaseFast build — matching the
     // shipped binary — whatever -Doptimize says. ReleaseFast selects the

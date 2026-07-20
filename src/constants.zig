@@ -134,6 +134,11 @@ pub const config_bytes_max: u32 = 256 * 1024;
 /// Upper bound on configured clusters.
 pub const clusters_max: u16 = 16;
 
+/// Lower bound on configured clusters: a config with no cluster can route
+/// nowhere, so the loader rejects an empty map and the config JSON Schema
+/// emits it as `minProperties`.
+pub const clusters_min: u16 = 1;
+
 /// Upper bound on endpoints in one cluster.
 pub const endpoints_per_cluster_max: u16 = 64;
 
@@ -194,7 +199,8 @@ comptime {
     assert(in_flight_ops_max <= completion_queue_entries);
     assert(conn_slots_max - 1 <= std.math.maxInt(u16));
     assert(relay_buffer_bytes >= 512);
-    assert(clusters_max >= 1);
+    assert(clusters_min >= 1);
+    assert(clusters_max >= clusters_min);
     assert(endpoints_per_cluster_max >= 1);
     assert(routes_max >= 1);
     assert(filters_per_listener_max >= 1);

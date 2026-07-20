@@ -192,22 +192,67 @@ fn resolveLimits(limits_json: *const LimitsJson) ValidationError!Config.Limits {
     };
 }
 
-const ConfigJson = struct {
+// The strict parser binds JSON to these `*Json` DTOs. Each carries the
+// schema metadata reflection cannot infer — prose (`schema_doc`, per-field
+// `.desc`), closed vocabularies (`.enum_type`, `.int_values`, `.items`),
+// and numeric bounds (`.minimum`/`.maximum`/`.min_items`/…) — co-located
+// with the fields so the two never drift. `assert_meta_matches` (below)
+// cross-checks metadata against the real fields at comptime, and
+// `config_schema.zig` walks the same DTOs to emit the JSON Schema. Public
+// so the emitter and its tests can reflect over the real wire shape.
+pub const ConfigJson = struct {
     listeners: []const ListenerJson,
     clusters: ClustersJson,
     timeouts: TimeoutsJson,
     /// Optional pool shrinks (§5, §8); absent fields keep the comptime
     /// ceilings.
     limits: LimitsJson = .{},
+
+    pub const schema_doc =
+        "Startup config for the zoxy L4/L7 proxy. Encodes structure, enums, " ++
+        "and numeric bounds; semantic checks (canonical route prefixes/hosts, " ++
+        "IP:port literal parsing, reserved header names, endpoint port != 0) " ++
+        "are enforced by the loader and are not expressible in JSON Schema.";
+    pub const schema_fields = .{
+        .listeners = .{
+            .desc = "Sockets the proxy accepts connections on.",
+            .min_items = 1,
+            .max_items = constants.listeners_max,
+        },
+        .clusters = .{ .desc = "Named upstream clusters, keyed by cluster name." },
+        .timeouts = .{ .desc = "Connection lifecycle deadlines (milliseconds)." },
+        .limits = .{ .desc = "Optional pool shrinks; absent keeps the compiled ceilings." },
+    };
 };
 
-const LimitsJson = struct {
+pub const LimitsJson = struct {
     conn_slots: ?u32 = null,
     relay_buffers: ?u32 = null,
     upstream_slots: ?u32 = null,
+
+    pub const schema_doc =
+        "Optional pool shrinks; absent keeps the compiled ceilings. Config " ++
+        "may only shrink a pool below its ceiling, never grow it.";
+    pub const schema_fields = .{
+        .conn_slots = .{
+            .desc = "Concurrent connection slots.",
+            .minimum = 1,
+            .maximum = constants.conn_slots_max,
+        },
+        .relay_buffers = .{
+            .desc = "Relay buffer pairs (bounds concurrent L4 and L7 body relays).",
+            .minimum = 1,
+            .maximum = constants.relay_buffers_max,
+        },
+        .upstream_slots = .{
+            .desc = "Shared upstream connection slots.",
+            .minimum = 1,
+            .maximum = constants.upstream_slots_max,
+        },
+    };
 };
 
-const ListenerJson = struct {
+pub const ListenerJson = struct {
     bind: []const u8,
     /// Exactly one of `cluster` (sugar for a single catch-all route) or
     /// `routes` (an explicit §7 path table) must be present.
@@ -217,71 +262,203 @@ const ListenerJson = struct {
     filters: ?[]const FilterJson = null,
     /// Optional: absent means `l4`, keeping pre-L7 configs valid.
     protocol: []const u8 = "l4",
+
+    pub const schema_doc =
+        "One accepting socket. Exactly one of `cluster` or `routes` selects " ++
+        "the upstream — that fork is enforced by the loader, not this schema.";
+    pub const schema_fields = .{
+        .bind = .{ .desc = "IP:port literal to bind (hostnames are rejected — DNS is a non-goal)." },
+        .cluster = .{ .desc = "Sugar for a single catch-all route to this cluster; mutually exclusive with routes." },
+        .routes = .{
+            .desc = "Explicit longest-prefix route table (http listeners only).",
+            .min_items = 1,
+            .max_items = constants.routes_max,
+        },
+        .filters = .{
+            .desc = "Request filter rules, evaluated top-down (http listeners only).",
+            .max_items = constants.filters_per_listener_max,
+        },
+        .protocol = .{
+            .desc = "What the listener speaks: l4 relays bytes blindly, http runs the reverse-proxy state machine.",
+            .enum_type = Config.Listener.Protocol,
+        },
+    };
 };
 
-const FilterJson = struct {
+pub const FilterJson = struct {
     match: MatchJson = .{},
     actions: []const ActionJson,
+
+    pub const schema_doc = "One filter rule: a match predicate and the actions applied when it matches.";
+    pub const schema_fields = .{
+        .match = .{ .desc = "Match predicate; absent fields match anything." },
+        .actions = .{
+            .desc = "Actions applied in order when the rule matches.",
+            .min_items = 1,
+            .max_items = constants.actions_per_filter_max,
+        },
+    };
 };
 
-const MatchJson = struct {
+pub const MatchJson = struct {
     /// Registered method tokens (uppercase); absent = any method.
     method: ?[]const []const u8 = null,
     host: ?[]const u8 = null,
     path_prefix: ?[]const u8 = null,
     headers: ?[]const HeaderMatchJson = null,
+
+    pub const schema_doc = "Request-match predicate; every absent field matches anything.";
+    pub const schema_fields = .{
+        .method = .{
+            .desc = "Registered request-method tokens; absent matches any method.",
+            .min_items = 1,
+            .items = SchemaItems.http_method,
+        },
+        .host = .{ .desc = "Canonical host to match; absent matches any host." },
+        .path_prefix = .{ .desc = "Canonical origin-form path prefix; must start with a slash." },
+        .headers = .{
+            .desc = "Header predicates; all must match.",
+            .max_items = constants.header_matches_per_filter_max,
+        },
+    };
 };
 
-const HeaderMatchJson = struct {
+pub const HeaderMatchJson = struct {
     name: []const u8,
     /// Exactly one of these selects the predicate kind.
     present: ?bool = null,
     equals: ?[]const u8 = null,
     contains: ?[]const u8 = null,
+
+    pub const schema_doc =
+        "One header predicate. Exactly one of `present`/`equals`/`contains` " ++
+        "selects the kind — that fork is enforced by the loader.";
+    pub const schema_fields = .{
+        .name = .{ .desc = "Header field name (matched case-insensitively)." },
+        .present = .{
+            .desc = "Matches when the header is present (present: false is rejected).",
+            .const_true = true,
+        },
+        .equals = .{ .desc = "Matches when the header value equals this string." },
+        .contains = .{
+            .desc = "Matches when the header value contains this substring.",
+            .min_length = 1,
+        },
+    };
 };
 
 /// One action object carries exactly one field (the action's kind), the
 /// same "struct of optionals, validate exactly-one" shape the listener's
 /// cluster/routes fork uses — no JSON union parsing.
-const ActionJson = struct {
+pub const ActionJson = struct {
     reject: ?u16 = null,
     header_set: ?HeaderEditJson = null,
     header_add: ?HeaderEditJson = null,
     header_remove: ?[]const u8 = null,
     rewrite_prefix: ?RewriteJson = null,
+
+    pub const schema_doc =
+        "One filter action. Exactly one field is set — the action's kind — " ++
+        "and that fork is enforced by the loader.";
+    pub const schema_fields = .{
+        .reject = .{
+            .desc = "Reject the request with this status code.",
+            .int_values = &filter.reject_statuses,
+        },
+        .header_set = .{ .desc = "Set (replace) a request header." },
+        .header_add = .{ .desc = "Append a request header." },
+        .header_remove = .{ .desc = "Remove a request header by name." },
+        .rewrite_prefix = .{ .desc = "Rewrite the request path prefix before proxying." },
+    };
 };
 
-const HeaderEditJson = struct {
+pub const HeaderEditJson = struct {
     name: []const u8,
     value: []const u8,
+
+    pub const schema_doc = "A header name/value pair for header_set / header_add.";
+    pub const schema_fields = .{
+        .name = .{ .desc = "Header field name." },
+        .value = .{ .desc = "Header field value." },
+    };
 };
 
-const RewriteJson = struct {
+pub const RewriteJson = struct {
     from: []const u8,
     to: []const u8,
+
+    pub const schema_doc = "A path-prefix rewrite: strip `from`, prepend `to`.";
+    pub const schema_fields = .{
+        .from = .{ .desc = "Canonical path prefix to strip; must start with a slash." },
+        .to = .{ .desc = "Canonical path prefix to prepend; must start with a slash." },
+    };
 };
 
-const RouteJson = struct {
+pub const RouteJson = struct {
     /// Optional §7 host scope; absent means the route matches any host.
     host: ?[]const u8 = null,
     prefix: []const u8,
     cluster: []const u8,
+
+    pub const schema_doc = "One longest-prefix route entry.";
+    pub const schema_fields = .{
+        .host = .{ .desc = "Canonical host scope; absent matches any host." },
+        .prefix = .{ .desc = "Canonical origin-form path prefix; must start with a slash." },
+        .cluster = .{ .desc = "Name of the cluster matching requests route to." },
+    };
 };
 
-const ClusterJson = struct {
+pub const ClusterJson = struct {
     endpoints: []const []const u8,
     /// Optional §7 pick policy; absent means `p2c` (the design's
     /// trajectory), `rr` opts back into strict rotation.
     pick: []const u8 = "p2c",
+
+    pub const schema_doc = "One upstream cluster: its endpoints and pick policy.";
+    pub const schema_fields = .{
+        .endpoints = .{
+            .desc = "IP:port endpoint literals (port must be non-zero).",
+            .min_items = 1,
+            .max_items = constants.endpoints_per_cluster_max,
+        },
+        .pick = .{
+            .desc = "Endpoint-pick policy: p2c (power-of-two-choices) or rr (strict round-robin).",
+            .enum_type = Config.Cluster.Pick,
+        },
+    };
 };
 
-const TimeoutsJson = struct {
+pub const TimeoutsJson = struct {
     connect_ms: u32,
     idle_ms: u32,
     drain_deadline_ms: u32,
     /// Optional: absent or `0` means "no cap" (§6). The default keeps every
     /// pre-existing config valid and leaves max-lifetime opt-in.
     max_lifetime_ms: u32 = 0,
+
+    pub const schema_doc = "Connection lifecycle deadlines, in milliseconds.";
+    pub const schema_fields = .{
+        .connect_ms = .{
+            .desc = "Per-try upstream connect budget.",
+            .minimum = 1,
+            .maximum = constants.timeout_ms_max,
+        },
+        .idle_ms = .{
+            .desc = "Idle / head-read deadline.",
+            .minimum = 1,
+            .maximum = constants.timeout_ms_max,
+        },
+        .drain_deadline_ms = .{
+            .desc = "Graceful-drain deadline on shutdown.",
+            .minimum = 1,
+            .maximum = constants.timeout_ms_max,
+        },
+        .max_lifetime_ms = .{
+            .desc = "Absolute connection-age cap; 0 disables it.",
+            .minimum = 0,
+            .maximum = constants.timeout_ms_max,
+        },
+    };
 };
 
 /// JSON object map of cluster name → cluster, parsed into a bounded array
@@ -289,7 +466,7 @@ const TimeoutsJson = struct {
 /// silently keep the last duplicate — negative space we refuse to have).
 /// Bodies past the capacity are skipped but counted, so the over-limit
 /// error stays distinct from a syntax error.
-const ClustersJson = struct {
+pub const ClustersJson = struct {
     entries: [constants.clusters_max]Entry,
     seen_count: u32,
 
@@ -337,11 +514,81 @@ const ClustersJson = struct {
     }
 };
 
+/// Marker for array-item vocabularies reflection can't infer from the
+/// element type alone. `http_method` means "the items are the registered
+/// HTTP method tokens", which `config_schema.zig` emits as a token enum.
+pub const SchemaItems = enum { http_method };
+
+/// The attribute keys a `schema_fields` entry may carry beyond `.desc`.
+/// `assert_meta_matches` rejects any other key at comptime, so a typo'd
+/// attribute is a compile error, not silently-ignored data.
+const schema_attributes = [_][]const u8{
+    "desc",       "minimum",    "maximum",   "min_items",  "max_items",
+    "min_length", "const_true", "enum_type", "int_values", "items",
+};
+
+/// Cross-check a DTO's schema metadata against its real fields at comptime:
+/// every field needs an entry (so adding a field without documenting it
+/// fails the build — this is what makes schema coverage *structural* rather
+/// than a runtime test that can silently pass), every entry needs a `.desc`
+/// and must map to a real field, and every attribute must be a known key.
+/// Run on each `dto_types` entry below and again by the schema emitter.
+pub fn assert_meta_matches(comptime T: type) void {
+    @setEvalBranchQuota(50_000);
+    if (!@hasDecl(T, "schema_doc")) {
+        @compileError(@typeName(T) ++ " is missing pub const schema_doc");
+    }
+    if (!@hasDecl(T, "schema_fields")) {
+        @compileError(@typeName(T) ++ " is missing pub const schema_fields");
+    }
+    const Meta = @TypeOf(T.schema_fields);
+    // Every field has a documented, described entry.
+    inline for (@typeInfo(T).@"struct".fields) |field| {
+        if (!@hasField(Meta, field.name)) {
+            @compileError(@typeName(T) ++ "." ++ field.name ++ " has no schema_fields entry");
+        }
+        const entry = @field(T.schema_fields, field.name);
+        if (!@hasField(@TypeOf(entry), "desc")) {
+            @compileError(@typeName(T) ++ "." ++ field.name ++ " schema entry is missing .desc");
+        }
+    }
+    // Every entry maps to a real field and carries only known attributes.
+    inline for (@typeInfo(Meta).@"struct".fields) |entry_field| {
+        if (!@hasField(T, entry_field.name)) {
+            @compileError(@typeName(T) ++ " schema_fields entry '" ++ entry_field.name ++ "' has no matching field");
+        }
+        const entry = @field(T.schema_fields, entry_field.name);
+        inline for (@typeInfo(@TypeOf(entry)).@"struct".fields) |attr| {
+            comptime var known = false;
+            inline for (schema_attributes) |name| {
+                if (comptime std.mem.eql(u8, name, attr.name)) known = true;
+            }
+            if (!known) {
+                @compileError(@typeName(T) ++ "." ++ entry_field.name ++ " has unknown schema attribute '" ++ attr.name ++ "'");
+            }
+        }
+    }
+}
+
+/// Every plain-struct DTO the schema reflects over. `ClustersJson` is a
+/// custom map, handled specially by the emitter, so it is not here. The
+/// block below runs `assert_meta_matches` on each at comptime, so the
+/// metadata cannot drift from the fields whether or not the emitter builds.
+pub const dto_types = .{
+    ConfigJson,  ListenerJson,    RouteJson,    FilterJson,
+    MatchJson,   HeaderMatchJson, ActionJson,   HeaderEditJson,
+    RewriteJson, ClusterJson,     TimeoutsJson, LimitsJson,
+};
+
+comptime {
+    for (dto_types) |T| assert_meta_matches(T);
+}
+
 fn resolveClusters(
     arena: std.mem.Allocator,
     clusters_json: *const ClustersJson,
 ) ParseError![]const Config.Cluster {
-    if (clusters_json.seen_count == 0) {
+    if (clusters_json.seen_count < constants.clusters_min) {
         return error.ClustersEmpty;
     }
     if (clusters_json.seen_count > constants.clusters_max) {
