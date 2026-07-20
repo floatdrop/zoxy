@@ -139,6 +139,14 @@ pub const endpoints_per_cluster_max: u16 = 64;
 /// request-time match is a bounded linear scan over at most this many.
 pub const routes_max: u16 = 32;
 
+/// §7 "filters are data" bounds — one listener's rule table and each
+/// rule's shape. Config data, not pools: rules are immutable arena
+/// slices and evaluation is bounded loops over at most these many, so a
+/// filter set cannot make request handling unbounded.
+pub const filters_per_listener_max: u16 = 32;
+pub const actions_per_filter_max: u16 = 8;
+pub const header_matches_per_filter_max: u16 = 8;
+
 /// Upper bound on every configured timeout — one hour. A timeout above
 /// this is almost certainly a units mistake in the config.
 pub const timeout_ms_max: u32 = 3_600_000;
@@ -178,6 +186,9 @@ comptime {
     assert(clusters_max >= 1);
     assert(endpoints_per_cluster_max >= 1);
     assert(routes_max >= 1);
+    assert(filters_per_listener_max >= 1);
+    assert(actions_per_filter_max >= 1);
+    assert(header_matches_per_filter_max >= 1);
     assert(loop_completions_per_tick_max >= 1);
     assert(config_bytes_max >= 1024);
     assert(timeout_ms_max >= 1000);
