@@ -121,27 +121,33 @@ pub fn Proxy(comptime IoType: type) type {
             routeRequest(server, conn, &request);
         }
 
-        /// The cluster for `request`'s canonical path (§7). Origin-form is
-        /// canonicalized and matched by longest prefix; OPTIONS
-        /// asterisk-form has no path and routes to the catch-all. A target
-        /// that will not canonicalize is BadPath (400); an unmatched path
-        /// is NoRoute (404).
+        /// The cluster for `request`'s canonical host and path (§7). The
+        /// host is canonicalized (null when absent/unmatchable → any-host
+        /// routes only); origin-form paths are canonicalized and matched
+        /// by longest prefix; OPTIONS asterisk-form names the whole server,
+        /// so it routes as path "/". A target that will not canonicalize
+        /// is BadPath (400); an unmatched host/path is NoRoute (404).
         fn resolveCluster(
             conn: *ConnType,
             request: *const parser.RequestHead,
             scratch: *[constants.head_bytes_max]u8,
+            host_scratch: *[constants.host_bytes_max]u8,
         ) error{ BadPath, NoRoute }!u16 {
             assert(request.target.len >= 1);
             assert(conn.routes.len >= 1);
+            const host: ?[]const u8 = if (request.host) |raw|
+                parser.canonicalHost(raw, host_scratch)
+            else
+                null;
             if (request.target[0] != '/') {
                 // validateTarget admitted only asterisk-form here.
                 assert(request.method == .options);
-                return router.catchAll(conn.routes) orelse error.NoRoute;
+                return router.route(conn.routes, host, "/") orelse error.NoRoute;
             }
             const canonical = parser.canonicalTarget(request.target, scratch) catch {
                 return error.BadPath;
             };
-            return router.route(conn.routes, canonical.path) orelse error.NoRoute;
+            return router.route(conn.routes, host, canonical.path) orelse error.NoRoute;
         }
 
         /// The canonical bytes to forward for `request` (§7): origin-form
@@ -174,11 +180,12 @@ pub fn Proxy(comptime IoType: type) type {
                 return respond(server, conn, 501, "l7_not_implemented");
             }
 
-            // §7 path routing: canonicalize the target and match it to a
-            // cluster before acquiring any resource, so a bad path or an
-            // unrouted one is rejected cheaply.
+            // §7 routing: canonicalize the host and path and match them to
+            // a cluster before acquiring any resource, so a bad path or an
+            // unrouted host/path is rejected cheaply.
             var scratch: [constants.head_bytes_max]u8 = undefined;
-            conn.cluster_index = resolveCluster(conn, request, &scratch) catch |err| switch (err) {
+            var host_scratch: [constants.host_bytes_max]u8 = undefined;
+            conn.cluster_index = resolveCluster(conn, request, &scratch, &host_scratch) catch |err| switch (err) {
                 error.BadPath => return respond(server, conn, 400, "l7_bad_request"),
                 error.NoRoute => return respond(server, conn, 404, "l7_no_route"),
             };
