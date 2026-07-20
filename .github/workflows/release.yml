@@ -88,7 +88,7 @@ jobs:
 
       - name: Update Homebrew formula
         env:
-          HOMEBREW_TAP_SSH_KEY: ${{ secrets.HOMEBREW_TAP_SSH_KEY }}
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
         run: |
           set -euo pipefail
           version="${{ steps.ver.outputs.version }}"
@@ -100,7 +100,7 @@ jobs:
           sha_x86_64_linux=$(grep  "zoxy-$version-x86_64-linux.tar.gz"  dist/SHA256SUMS.txt | awk '{print $1}')
 
           mkdir -p ~/.ssh
-          echo "$HOMEBREW_TAP_SSH_KEY" > ~/.ssh/deploy_key
+          echo "$HOMEBREW_TAP_DEPLOY_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan github.com >> ~/.ssh/known_hosts
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes"
