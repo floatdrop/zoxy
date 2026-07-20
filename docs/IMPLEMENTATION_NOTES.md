@@ -116,6 +116,28 @@ the orderly failures (EOF, RST) are peeled off first. SimIo grew a
 one-shot `kernel_pressure` fault and a `kernel_pressure_percent`
 adversary knob to exercise the rung.
 
+## Occupancy is not overload — conn-pressure keep-alive kill reverted (#57)
+
+The v0.0.0 watermark design (#54) suppressed downstream keep-alive under
+*conn-slot* pressure as well as relay pressure. Cloud bench, 2026-07-20,
+CONNECTIONS=1024 against `conn_slots_max` 1020: the population sits
+permanently above the ¾ engage mark (765), the flag limit-cycles between
+765 and the 510 release floor, and every response rendered while engaged
+announces `Connection: close` — ~500-connection synchronized
+close/reconnect waves, proxy-VM accepts at ~1400/s against a ~38/s
+baseline, a seconds-long coordinated-omission latency tail, zero errors
+reported. The same rig at CONNECTIONS=500 (below the release floor) was
+clean, isolating the flag as the cause.
+
+Verdict (settled): conn-pool occupancy cannot distinguish a healthy
+keep-alive population from imminent exhaustion — for a keep-alive
+workload, high occupancy *is* the steady state, and closing serving
+connections converts pressure into churn. Keep-alive suppression is now
+relay-pressure only (`Server.keepAliveSuppressed`); conn-slot scarcity
+is answered by the idle-timeout division plus the accept-time RST wall —
+the nginx/haproxy norm: never close an established keep-alive connection
+to admit a newcomer.
+
 ## Phase 0 baselines (2026-07-10/11)
 
 - Debug-build zoxy over loopback (`zig build bench`, nginx origin, rate
