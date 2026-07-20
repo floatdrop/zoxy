@@ -72,9 +72,10 @@ pub const Config = struct {
         name: []const u8,
         endpoints: []const std.Io.net.IpAddress,
         /// The §7 endpoint-pick policy the balancer runs for this
-        /// cluster. The JSON field is optional and defaults to `p2c` —
-        /// the design's trajectory (§7: round-robin → P2C) — with `rr`
-        /// kept for strict rotation (predictable spread, cache warming).
+        /// cluster. The JSON field is optional and defaults to `p2c`
+        /// (the §7 default), with `rr` kept for strict rotation
+        /// (predictable spread, cache warming, pure-L4 clusters whose
+        /// load p2c cannot see).
         pick: Pick = .p2c,
 
         pub const Pick = enum(u1) {

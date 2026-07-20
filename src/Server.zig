@@ -5,10 +5,10 @@
 //! choke point. Admission forks on the listener's protocol: an `l4`
 //! listener runs the strict TCP relay (`net/relay.zig`), an `http`
 //! listener runs the L7 state machine (`http/proxy.zig`); the shared
-//! accept gate, deadline, and teardown machinery serve both. The L7
-//! request path is filling in slice by slice — head ingestion and the
-//! static-response rejects are in; the upstream leg follows — so a valid
-//! L7 request currently tears down once its head is parsed.
+//! accept gate, deadline, and teardown machinery serve both, as do the
+//! §8 pressure watermarks (one rule, three pools) and the deadline's
+//! request-expiry verdict fork (§8: 504 when answerable, teardown
+//! otherwise).
 
 const std = @import("std");
 

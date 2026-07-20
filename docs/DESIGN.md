@@ -359,7 +359,10 @@ Three shared pools, all owned and touched only by the loop thread:
    active health checks — when they land ([PLANS.md](PLANS.md)) — close
    the parked connections of ejected endpoints.
 
-Sizing shape (illustrative defaults, all tunable):
+Sizing shape (illustrative defaults; the comptime constants are the
+hard, budget-asserted ceilings, and the config `limits` block may only
+shrink the pools below them — for capacity planning, and so the §9
+overload benchmark hits the real shed rungs at loopback-feasible load):
 
 | pool | count | unit size | subtotal |
 |---|---|---|---|
@@ -548,16 +551,27 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   owning phase module at compile time.
 - **Resilience is minimal by design:** per-request and per-try deadlines
   (head-read gets its own deadline, so a slowloris meets the clock or
-  `head_bytes_max`, whichever comes first); one free replay of a request
-  that hit a stale pooled connection — only when the reused connection
-  was dead on arrival or the first write failed immediately, and no
-  response byte was received; a request the origin may have begun
-  processing is never replayed; and round-robin → P2C endpoint pick.
-  Cluster endpoints are static socket addresses resolved once at config
-  load, never on the loop (dynamic DNS is a non-goal, §1). Circuit
-  breakers, outlier ejection, retry budgets, health checks are *deferred*
-  — the previous iteration proved them buildable in this architecture;
-  simplicity says they wait for a demonstrated need.
+  `head_bytes_max`, whichever comes first; each dial — the first try and
+  the replay's — runs under its own connect deadline); one free replay
+  of a request that hit a stale pooled connection — only when the
+  connection was a *reused* checkout, no response byte was received, and
+  the request leg never entered the body pump, so the whole try still
+  sits byte-reconstructible in the head buffer. "May have begun
+  processing" is settled as "a response byte arrived or relay chunks
+  flowed" — the standard replaying-proxy reading (Go/nginx/HAProxy),
+  applied to non-idempotent methods too: a send that landed in the
+  kernel buffer of an already-FIN'd parked connection replays, because
+  the FIN-before-checkout race is overwhelmingly the real cause. The
+  replay is spent before its try begins (no loop) and always dials
+  fresh — the endpoint's whole idle list may be stale the same way. The
+  endpoint pick is per-cluster config: `p2c` (two uniform candidates
+  from a fixed-seed PRNG, the lower leased count wins) by default, `rr`
+  for strict rotation. Cluster endpoints are static socket addresses
+  resolved once at config load, never on the loop (dynamic DNS is a
+  non-goal, §1). Circuit breakers, outlier ejection, retry budgets,
+  health checks are *deferred* — the previous iteration proved them
+  buildable in this architecture; simplicity says they wait for a
+  demonstrated need.
 
 ## 8. Load shedding — the exhaustion ladder
 
@@ -573,7 +587,7 @@ the loop thread.
 | relay buffers (L7) | request admission on a kept-alive conn | static `503` from the head buffer, then keep or close per pressure |
 | upstream slots / dial concurrency | upstream checkout | static `503` (L7) / close (L4) |
 | worker job queue | job enqueue | shed the job's connection (TLS handshake → close) |
-| request deadline | timer completion | `504` if no response byte sent, else teardown |
+| request deadline | timer completion | `504` if no response byte was sent — a timed-out dial included; teardown once a response byte is on the wire or the stall is the client's own body |
 | kernel memory pressure (ENOBUFS/ENOMEM from ring) | any completion | treat as that op's failure → teardown that connection; counter |
 
 - **Static error responses.** `400`/`404`/`414`/`431`/`501`/`503`/`504`
@@ -590,10 +604,15 @@ the loop thread.
   connection stays in the backlog, so an immediate re-arm would complete
   instantly with the same error — a tight spin. That path re-arms after
   a short backoff (`accept_retry_delay_ms`).
-- **Watermarks before walls.** Each pool exposes a high-watermark counter;
-  crossing it flips a `pressure` flag that biases decisions (stop honoring
-  downstream keep-alive, shrink idle timeouts) so the proxy sheds *idle*
-  capacity before it must shed *work*.
+- **Watermarks before walls.** Each pool flips a `pressure` flag at its
+  high watermark (ceil 3/4, released at floor 1/2 — hysteresis), one
+  rule for all three: *relay-buffer* and *conn-slot* pressure are
+  downstream pressure — the idle timeout divides and keep-alive is no
+  longer honored, so idle downstream connections return the buffers and
+  slots they pin; *upstream-pool* pressure shortens parked-connection
+  deadlines (and the sweep interval), reaping idle parked sockets so
+  their slots free for fresh dials. Each bias sheds *idle* capacity
+  before the wall must shed *work*; each engage crossing has a counter.
 - **Metrics witness every shed.** Every rung has a counter, written only
   by the loop thread as a relaxed atomic — one writer, any number of
   readers, so a metrics/admin thread can read without a data race and
@@ -739,7 +758,7 @@ src/
     render.zig        // §7 head rendering: hop-by-hop strip + close injection
     router.zig        // §7 path routing: canonical-path longest-prefix table
     proxy.zig         // L7 state machine over phases
-  balancer.zig        // upstream endpoint pick: round-robin → P2C (§7)
+  balancer.zig        // upstream endpoint pick: per-cluster rr | p2c (§7)
   shed.zig            // exhaustion ladder: decisions + static responses
   counters.zig        // per-rung counters: loop-written, relaxed-atomic reads
   worker.zig          // SPMC job queue + SPSC completion rings (Phase 3)
