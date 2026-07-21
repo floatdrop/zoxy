@@ -181,8 +181,11 @@ behind all four gates of §9.
     block (absent → off, valid literal → resolved, hostname/empty/extra →
     the matching loader error).
   - **Deferred** — single-scrape-at-a-time is by design (a localhost round
-    trip); lift only on evidence. Richer admin surface (push/OTLP export, a
-    control plane) stays out.
+    trip); lift only on evidence. A richer admin surface (a control plane)
+    stays out, and metrics stay **pull-only**: a push exporter (OTLP /
+    remote-write) would drag in a protobuf dependency, an outbound socket
+    with export buffering + retry (against §8's no-unbounded-queue rule),
+    and collector DNS (a §1 non-goal) — all the wrong grain for this proxy.
 - **Phase 3 — TLS.** CPU worker pool + job queues for handshakes (§3 seam
   activates). The stack is an **open decision under the Zig-first policy**
   (§4). Leading candidate (surveyed 2026-07-12): **picotls** (h2o/picotls)
@@ -282,8 +285,10 @@ queue, in rough value order:
   active health checks (§7).
 - Hot restart + drain-to-successor (§1).
 - Config DSL (§1 keeps config parse-once immutable).
-- Metrics/admin plane beyond the Prometheus scrape endpoint + SIGUSR1 dump
-  (Phase 2.5): push/OTLP export, a control surface (§8).
+- Metrics/admin plane beyond the pull-only Prometheus scrape endpoint +
+  SIGUSR1 dump (Phase 2.5): a control surface (§8). Push export (OTLP /
+  remote-write) is ruled out, not deferred — it wants a protobuf dep,
+  outbound export buffering, and collector DNS, all against the grain.
 - Dynamic DNS for upstream endpoints (§1).
 - io_uring op upgrades — the verdict table above.
 - Config JSON Schema — the generator ships (`zig build schema`, reflected
