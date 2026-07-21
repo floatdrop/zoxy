@@ -134,12 +134,12 @@ pub fn Server(comptime IoType: type) type {
             server.drain_deadline_completion = .{};
             server.upstream_sweep_completion = .{};
             server.upstream_sweep_armed = false;
-            server.admin.init(server, null);
+            server.admin.init(server, config.admin_bind);
         }
 
-        /// Enable the admin/metrics listener on `bind_address` (main.zig
-        /// from `ZOXY_ADMIN_BIND`; the simulator sets it directly). Must be
-        /// called before `start`; with no call the admin plane stays off.
+        /// Override the admin/metrics bind before `start` — the simulator
+        /// and tests set it directly; production seeds it from the config's
+        /// `admin` block in `init`. Must be called before `start`.
         pub fn setAdminBind(server: *Self, bind_address: std.Io.net.IpAddress) void {
             server.admin.setBind(bind_address);
         }

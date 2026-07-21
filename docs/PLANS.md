@@ -166,20 +166,23 @@ behind all four gates of §9.
   - **Drain** — the server drain (§8) closes the admin listener and tears
     down any in-flight scrape; `maybeStopAfterDrain` and `isIdle` gate on
     the admin conn's quiescence.
-  - **Enablement** — `ZOXY_ADMIN_BIND` (e.g. `127.0.0.1:9100`), threaded as
-    `setAdminBind` before `start`; off when unset.
+  - **Enablement** — an optional `"admin": { "bind": "127.0.0.1:9100" }`
+    config block resolves to `Config.admin_bind` (a static IP:port literal,
+    hostnames rejected like every bind); absent leaves the plane off. It
+    carries schema metadata (`AdminJson` in `dto_types`), so `zig build
+    schema` emits it and the metadata gate covers it. The simulator and
+    tests override via `setAdminBind` before `start`.
   - **Observability** — `admin_served` / `admin_reaped` counters, pure
     observability outside `reconcile`'s accounting.
   - **Gates** — SimIo scrape scenarios (byte-exact across partial_io seeds,
     reset-prefix robustness, a drain racing an in-flight scrape via the
     raced-accept holder idiom, the deadline reaper), plus the render bound
-    proven tight at `maxInt(u64)`.
-  - **Deferred** — promote the bind to the JSON config (an `admin` block +
-    JSON Schema, clearing the config-schema metadata gate); the env var is
-    the prototype's deliberate shortcut so a bad value fails loudly rather
-    than silently starting with metrics off. Single-scrape-at-a-time is by
-    design (a localhost round trip); lift only on evidence. Richer admin
-    surface (push/OTLP export, per-route stats, a control plane) stays out.
+    proven tight at `maxInt(u64)`, and config parse tests for the `admin`
+    block (absent → off, valid literal → resolved, hostname/empty/extra →
+    the matching loader error).
+  - **Deferred** — single-scrape-at-a-time is by design (a localhost round
+    trip); lift only on evidence. Richer admin surface (push/OTLP export,
+    per-route stats, a control plane) stays out.
 - **Phase 3 — TLS.** CPU worker pool + job queues for handshakes (§3 seam
   activates). The stack is an **open decision under the Zig-first policy**
   (§4). Leading candidate (surveyed 2026-07-12): **picotls** (h2o/picotls)
@@ -280,8 +283,7 @@ queue, in rough value order:
 - Hot restart + drain-to-successor (§1).
 - Config DSL (§1 keeps config parse-once immutable).
 - Metrics/admin plane beyond the Prometheus scrape endpoint + SIGUSR1 dump
-  (Phase 2.5): push/OTLP export, per-route stats, a control surface, and
-  promoting the admin bind from `ZOXY_ADMIN_BIND` to the JSON config (§8).
+  (Phase 2.5): push/OTLP export, per-route stats, a control surface (§8).
 - Dynamic DNS for upstream endpoints (§1).
 - io_uring op upgrades — the verdict table above.
 - Config JSON Schema — the generator ships (`zig build schema`, reflected
