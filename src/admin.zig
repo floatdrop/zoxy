@@ -30,13 +30,13 @@ const assert = std.debug.assert;
 /// Response head sent before the rendered body. `Connection: close` frames
 /// the body by connection close (RFC 9112 §6.3), so no Content-Length is
 /// needed — the renderer's length never has to be known before the head.
-const response_head =
+pub const response_head =
     "HTTP/1.1 200 OK\r\n" ++
     "Content-Type: text/plain; version=0.0.4\r\n" ++
     "Connection: close\r\n\r\n";
 
 /// A full response is the fixed head plus one rendering of every counter.
-const response_bytes_max = response_head.len + counters_module.Counters.render_bytes_max;
+pub const response_bytes_max = response_head.len + counters_module.Counters.render_bytes_max;
 
 pub fn Admin(comptime IoType: type) type {
     const ServerType = @import("Server.zig").Server(IoType);
@@ -274,6 +274,7 @@ pub fn Admin(comptime IoType: type) type {
             }
             // Response fully sent: half-close the write side and drain the
             // client's input to EOF so the close does not RST it away (§2).
+            admin.server.counters.increment("admin_served");
             admin.state = .draining;
             admin.server.io.shutdown(admin.socket, .write);
             admin.armRecv();
@@ -403,6 +404,9 @@ pub fn Admin(comptime IoType: type) type {
                     return;
                 }
                 if (admin.server.io.nowNs() >= admin.deadline_ns) {
+                    // The scrape overran its deadline: reap the client so it
+                    // cannot pin the single reserved slot (§8).
+                    admin.server.counters.increment("admin_reaped");
                     admin.beginTeardown();
                 } else {
                     admin.armDeadline();

@@ -75,6 +75,14 @@ pub const Counters = struct {
     /// across every completion (accept, connect, setNodelay, and the relay
     /// recv/send data path).
     kernel_pressure_errors: Value = Value.init(0),
+    /// Admin/metrics scrapes whose full response was written (§8, PLANS.md
+    /// §243). Pure observability: the admin plane sits entirely outside
+    /// `reconcile`'s accepted/admitted/shed accounting, so these never enter
+    /// the gate identity.
+    admin_served: Value = Value.init(0),
+    /// Admin scrapes reaped by the scrape deadline before completing — a
+    /// stalled or slowloris client freed from the single reserved slot (§8).
+    admin_reaped: Value = Value.init(0),
     /// Accept completions that landed after the drain began (§8).
     shed_draining: Value = Value.init(0),
     /// Drain deadline tore down stragglers (§8).
