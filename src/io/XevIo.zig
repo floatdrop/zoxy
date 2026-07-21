@@ -54,7 +54,10 @@ const ListenerEntry = struct {
     open: bool,
 };
 
-pub fn init(io: *XevIo, arena: std.mem.Allocator) !void {
+/// `cq_entries` is the completion-queue depth to request for this
+/// deployment (`constants.completionQueueDepthFor` of the effective config,
+/// §8) — the io_uring backend sizes its ring to it; other backends ignore it.
+pub fn init(io: *XevIo, arena: std.mem.Allocator, cq_entries: u32) !void {
     if (comptime close_needs_thread_pool) {
         io.thread_pool = xev.ThreadPool.init(.{});
     }
@@ -63,6 +66,7 @@ pub fn init(io: *XevIo, arena: std.mem.Allocator) !void {
         io.thread_pool.deinit();
     };
     io.loop = try initLoop(
+        cq_entries,
         if (comptime close_needs_thread_pool) &io.thread_pool else null,
     );
     errdefer io.loop.deinit();
@@ -84,7 +88,7 @@ pub fn init(io: *XevIo, arena: std.mem.Allocator) !void {
 /// Build the event loop with zoxy's ring discipline (§3, §4, §8). Split
 /// from `init` so the setup — the fast-ring flags, the deep CQ, and the
 /// old-kernel degrade — stays under the function-length limit.
-fn initLoop(thread_pool: ?*xev.ThreadPool) !xev.Loop {
+fn initLoop(cq_entries: u32, thread_pool: ?*xev.ThreadPool) !xev.Loop {
     // SINGLE_ISSUER + COOP_TASKRUN + DEFER_TASKRUN: completion task-work
     // stays on the loop thread and is batched at the GETEVENTS reap point
     // instead of interrupting it (measured 2026-07-12: eliminates the
@@ -101,17 +105,16 @@ fn initLoop(thread_pool: ?*xev.ThreadPool) !xev.Loop {
             std.os.linux.IORING_SETUP_DEFER_TASKRUN
     else
         0;
-    // Request the completion queue we actually budget against
+    // Request the completion queue this deployment needs
     // (IORING_SETUP_CQSIZE via the fork) rather than trusting the kernel's
-    // default CQ = 2 × SQ to coincide: the §8 budgets — and `conn_slots_max`
-    // — are derived from `completion_queue_entries`, so the ring must be
-    // sized to it, not to twice the submission queue. Today the two are
-    // equal (2 × 4096) so this is inert; it is the seam the c10k lift turns
-    // on by raising `completion_queue_entries` past 2 × `ring_entries`.
-    // CQSIZE lands in 5.5, older than the 6.1 the fast flags need, so it
-    // survives the plain-ring degrade below.
+    // default CQ = 2 × SQ to coincide with the budget: the caller passes
+    // `completionQueueDepthFor` of the effective config, so a small
+    // deployment gets a shallow ring and a c10k one the full 65536,
+    // independent of the SQ. CQSIZE lands in 5.5, older than the 6.1 the
+    // fast flags need, so it survives the plain-ring degrade below.
+    assert(cq_entries <= constants.completion_queue_entries_max);
     const completion_queue_depth: u32 = if (comptime xev.backend == .io_uring)
-        constants.completion_queue_entries
+        cq_entries
     else
         0;
     // The fork requires a CQSIZE request to be at least the SQ depth (0

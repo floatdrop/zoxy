@@ -251,14 +251,19 @@ unmerged behind it, so the pin moves only after re-audit.
   in the connection slot; submitting an op writes it in place. Zero
   per-operation allocation — verified property of libxev's io_uring
   backend, and the reason it fits this project at all.
-- **Ring sizing is explicit.** `ring_entries` lives in
+- **Ring sizing is explicit.** `ring_entries` — the SQ — lives in
   `src/constants.zig` (libxev caps entries at 8191, requires a power of
-  two, and fixes the io_uring CQ at 2 × entries — not configurable
-  through libxev). When the kernel SQ is full, libxev parks submissions
-  in an intrusive userspace list bounded by in-flight completions —
-  which live in pool slots — so the no-unbounded-queue rule holds by
-  construction. The in-flight op budget that keeps CQ overflow
-  unreachable is part of the startup printout (§8).
+  two). The completion queue is sized *independently* of the SQ through
+  the audited fork's `IORING_SETUP_CQSIZE` option (`Options.cq_entries`),
+  so it is not tied to the kernel's default 2 × SQ. XevIo requests
+  `completionQueueDepthFor` of the *effective* config — a shallow ring
+  for a small deployment, up to the kernel maximum (65536) at the c10k
+  ceiling — which is exactly what decouples the concurrent-connection
+  ceiling from the submission-queue depth (§5, §8). When the kernel SQ is
+  full, libxev parks submissions in an intrusive userspace list bounded by
+  in-flight completions — which live in pool slots — so the
+  no-unbounded-queue rule holds by construction. The in-flight op budget
+  that keeps CQ overflow unreachable is part of the startup printout (§8).
 - **Ring setup flags.** The ring is created with `SINGLE_ISSUER`,
   `COOP_TASKRUN`, and `DEFER_TASKRUN`: completion task-work stays on
   the loop thread and is batched at the reap point instead of
@@ -366,16 +371,22 @@ Three shared pools, all owned and touched only by the loop thread:
    active health checks — when they land ([PLANS.md](PLANS.md)) — close
    the parked connections of ejected endpoints.
 
-Sizing shape (illustrative defaults; the comptime constants are the
-hard, budget-asserted ceilings, and the config `limits` block may only
-shrink the pools below them — for capacity planning, and so the §9
-overload benchmark hits the real shed rungs at loopback-feasible load):
+Sizing shape. The comptime constants are the hard, budget-asserted
+*ceilings*; the config `limits` block sizes the *effective* pools anywhere
+from 1 up to them. An omitted block takes the lean **defaults**, so the
+out-of-box footprint is small (~32 MiB) and an operator opts into more
+concurrency — up to the c10k ceiling — through `limits`, never a rebuild.
+The fd budget and the requested CQ depth track the effective sizes too
+(§4/§8), so a small deployment neither reserves nor demands the ceiling's
+resources; only a deployment that configures up toward the ceiling needs
+a raised `RLIMIT_NOFILE`:
 
-| pool | count | unit size | subtotal |
+| pool | default | ceiling (c10k) | unit size |
 |---|---|---|---|
-| conn slots | 4096 | ~1 KiB state + 8 KiB head | ~36 MiB |
-| relay buffers | 1225 | 2 × 4 KiB | ~10 MiB |
-| upstream slots | 2048 | ~0.5 KiB + 8 KiB head | ~17 MiB |
+| conn slots | 1386 | 9622 | ~1.7 KiB state + 8 KiB head |
+| relay buffers | 1386 | 9622 | 2 × 4 KiB |
+| upstream slots | 1024 | 1024 | ~40 B state + 8 KiB head |
+| **pool memory** | **~32 MiB** | **~174 MiB** | |
 
 Rules:
 
@@ -649,20 +660,22 @@ the loop thread.
   live in `counters.zig` (§10); Phase 0 exposure is a SIGUSR1-triggered
   dump (through the seam's `signal` primitive, §4) — the admin plane
   stays deferred ([PLANS.md](PLANS.md)).
-- **File descriptors are pre-budgeted, not shed.** Worst-case fd count is
+- **File descriptors are pre-budgeted, not shed.** The fd count is
   closed-form — listeners + connection slots + upstream slots + ring,
-  async and signal fds — computed from `src/constants.zig` and asserted
-  against `RLIMIT_NOFILE` at startup, next to the memory printout, so
-  `EMFILE` is unreachable rather than a ladder rung.
-- **The ring is pre-budgeted, not shed.** Worst-case in-flight op count
-  is closed-form — per-connection ops (bounded by the strict relay
-  discipline) × conn slots + parked upstreams + timers — computed from
-  `src/constants.zig`, printed at startup next to the memory and fd
-  budgets, and comptime-asserted to fit the completion queue
-  (2 × `ring_entries`, §4), so CQ overflow — kernel-side NODROP
-  buffering, an allocating path — is unreachable rather than a ladder
-  rung. libxev surfacing `error.CompletionQueueOvercommitted` is
-  therefore an invariant violation (assert), not load.
+  async and signal fds — evaluated on the *effective* config
+  (`fdsRequired`, so a lean deployment demands only what it uses) and
+  asserted against `RLIMIT_NOFILE` at startup, next to the memory
+  printout, so `EMFILE` is unreachable rather than a ladder rung.
+- **The ring is pre-budgeted, not shed.** The in-flight op count is
+  closed-form — per-connection ops (bounded by the strict relay
+  discipline) × conn slots + parked upstreams + timers — evaluated on the
+  effective config, printed at startup next to the memory and fd budgets,
+  and made to fit the completion queue the ring was set up with
+  (`completionQueueDepthFor` of the same effective config, §4), so CQ
+  overflow — kernel-side NODROP buffering, an allocating path — is
+  unreachable rather than a ladder rung. libxev surfacing
+  `error.CompletionQueueOvercommitted` is therefore an invariant
+  violation (assert), not load.
 
 **Drain, not just death.** SIGTERM (delivered through the seam's
 `signal` primitive, §4) → close listeners (stop accepting),
