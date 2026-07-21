@@ -43,9 +43,9 @@ pub const Config = struct {
     admin_bind: ?std.Io.net.IpAddress = null,
 
     pub const Limits = struct {
-        conn_slots: u32 = constants.conn_slots_max,
-        relay_buffers: u32 = constants.relay_buffers_max,
-        upstream_slots: u32 = constants.upstream_slots_max,
+        conn_slots: u32 = constants.conn_slots_default,
+        relay_buffers: u32 = constants.relay_buffers_default,
+        upstream_slots: u32 = constants.upstream_slots_default,
     };
 
     pub const Listener = struct {
@@ -183,7 +183,11 @@ fn resolveAdminBind(admin_json: ?AdminJson) ValidationError!?std.Io.net.IpAddres
 /// beyond the slot count could never be acquired); a *specified* count
 /// above them is a contradiction and fails loudly.
 fn resolveLimits(limits_json: *const LimitsJson) ValidationError!Config.Limits {
-    const conn_slots = limits_json.conn_slots orelse constants.conn_slots_max;
+    // Omitted limits default to the lean out-of-box sizes, not the
+    // compiled ceilings (§5): a small footprint unless the operator opts
+    // up. relay buffers still follow conn slots when omitted (one buffer
+    // per L4 connection), capped at their own ceiling.
+    const conn_slots = limits_json.conn_slots orelse constants.conn_slots_default;
     if (conn_slots < 1 or conn_slots > constants.conn_slots_max) {
         return error.LimitConnSlotsOutOfRange;
     }
@@ -195,7 +199,7 @@ fn resolveLimits(limits_json: *const LimitsJson) ValidationError!Config.Limits {
     if (relay_buffers > conn_slots) {
         return error.LimitRelayBuffersOverConnSlots;
     }
-    const upstream_slots = limits_json.upstream_slots orelse constants.upstream_slots_max;
+    const upstream_slots = limits_json.upstream_slots orelse constants.upstream_slots_default;
     if (upstream_slots < 1 or upstream_slots > constants.upstream_slots_max) {
         return error.LimitUpstreamSlotsOutOfRange;
     }
@@ -1480,9 +1484,11 @@ test "config: limits shrink pools below the ceilings, never past them" {
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
         );
-        try std.testing.expectEqual(constants.conn_slots_max, parsed.limits.conn_slots);
-        try std.testing.expectEqual(constants.relay_buffers_max, parsed.limits.relay_buffers);
-        try std.testing.expectEqual(constants.upstream_slots_max, parsed.limits.upstream_slots);
+        // An omitted `limits` block yields the lean defaults, not the
+        // ceilings (§5): the out-of-box footprint is small, opt up to scale.
+        try std.testing.expectEqual(constants.conn_slots_default, parsed.limits.conn_slots);
+        try std.testing.expectEqual(constants.relay_buffers_default, parsed.limits.relay_buffers);
+        try std.testing.expectEqual(constants.upstream_slots_default, parsed.limits.upstream_slots);
     }
     const tail =
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},

@@ -210,13 +210,30 @@ test "contract: echo on XevIo over real loopback" {
     defer arena_state.deinit();
 
     var xev_io: XevIo = undefined;
-    try xev_io.init(arena_state.allocator());
+    try xev_io.init(arena_state.allocator(), 0);
     defer xev_io.deinit();
 
     var scenario: EchoScenario(XevIo) = .{ .io = &xev_io };
     try scenario.start(try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"));
     try xev_io.run();
     try scenario.verify();
+}
+
+test "contract: XevIo requests a nonzero IORING_SETUP_CQSIZE depth" {
+    // The CQSIZE passthrough (§8, the c10k lever): a nonzero cq_entries must
+    // be accepted end-to-end. 16384 is deeper than the kernel's default
+    // 2 × 4096, so on io_uring the ring is actually sized to the request;
+    // on kqueue the field is ignored and this is a plain init smoke test.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var xev_io: XevIo = undefined;
+    try xev_io.init(arena_state.allocator(), 16384);
+    defer xev_io.deinit();
+
+    if (comptime xev.backend == .io_uring) {
+        try std.testing.expect(xev_io.loop.ring.cq.cqes.len >= 16384);
+    }
 }
 
 test "xevio: nowNs refreshes a stale clock instead of returning a frozen value" {
@@ -237,7 +254,7 @@ test "xevio: nowNs refreshes a stale clock instead of returning a frozen value" 
     defer arena_state.deinit();
 
     var xev_io: XevIo = undefined;
-    try xev_io.init(arena_state.allocator());
+    try xev_io.init(arena_state.allocator(), 0);
     defer xev_io.deinit();
 
     // Force a coarse refresh for the baseline too — init() seeds cached_now
@@ -265,7 +282,7 @@ test "xevio: bind failures are diagnosed distinctly, not all AddressInUse" {
     defer arena_state.deinit();
 
     var xev_io: XevIo = undefined;
-    try xev_io.init(arena_state.allocator());
+    try xev_io.init(arena_state.allocator(), 0);
     defer xev_io.deinit();
 
     const unavailable = std.Io.net.IpAddress.parseLiteral("203.0.113.1:0") catch unreachable;
@@ -283,7 +300,7 @@ test "xevio: SO_REUSEPORT lets two listeners share one port" {
     defer arena_state.deinit();
 
     var xev_io: XevIo = undefined;
-    try xev_io.init(arena_state.allocator());
+    try xev_io.init(arena_state.allocator(), 0);
     defer xev_io.deinit();
 
     // First listener takes an ephemeral port; read the concrete port back.

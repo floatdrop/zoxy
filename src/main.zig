@@ -41,10 +41,28 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
 
-    try ensureFdBudget();
-    try printBudgets(init.io, &config);
+    // fds and the ring are sized to the *effective* config, not the
+    // compiled ceilings (§5, §8): a lean deployment neither demands the
+    // c10k RLIMIT_NOFILE nor asks the kernel for a 65536-deep ring.
+    const listeners_count: u32 = @intCast(config.listeners.len);
+    const fds_required = zoxy.constants.fdsRequired(
+        config.limits.conn_slots,
+        config.limits.upstream_slots,
+        listeners_count,
+    );
+    const cq_entries = zoxy.constants.completionQueueDepthFor(
+        config.limits.conn_slots,
+        config.limits.upstream_slots,
+        listeners_count,
+    );
+    // The effective config never exceeds the compiled ceilings (§8): the
+    // pools, the ring, and the fd demand all fit what the constants proved.
+    assert(fds_required <= zoxy.constants.fds_max);
+    assert(cq_entries <= zoxy.constants.completion_queue_entries);
+    try ensureFdBudget(fds_required);
+    try printBudgets(init.io, &config, fds_required, cq_entries);
 
-    try global_io.init(arena);
+    try global_io.init(arena, cq_entries);
     var server: ServerXev = undefined;
     try server.init(arena, &global_io, &config, config.limits);
     try server.start();
@@ -59,28 +77,38 @@ pub fn main(init: std.process.Init) !void {
 
 /// fds are pre-budgeted, not shed (§8): raise the soft limit up to the
 /// hard limit, and refuse to start if even that cannot cover the budget.
-fn ensureFdBudget() !void {
-    const fds_max: u64 = zoxy.constants.fds_max;
+fn ensureFdBudget(fds_required: u32) !void {
+    const required: u64 = fds_required;
     var limits = try std.posix.getrlimit(.NOFILE);
-    if (limits.cur >= fds_max) return;
-    if (limits.max < fds_max) {
+    if (limits.cur >= required) return;
+    if (limits.max < required) {
         std.debug.print(
             "zoxy: RLIMIT_NOFILE hard limit {d} is below the fd budget {d} (§8)\n",
-            .{ limits.max, fds_max },
+            .{ limits.max, required },
         );
         return error.FdBudgetUnsatisfiable;
     }
-    limits.cur = fds_max;
+    limits.cur = required;
     try std.posix.setrlimit(.NOFILE, limits);
 }
 
-fn printBudgets(io: std.Io, config: *const zoxy.config.Config) !void {
+fn printBudgets(
+    io: std.Io,
+    config: *const zoxy.config.Config,
+    fds_required: u32,
+    cq_entries: u32,
+) !void {
     const constants = zoxy.constants;
     const UpstreamType = zoxy.UpstreamPool(XevIo).Upstream;
-    // Pool memory reflects the *effective* limits (config may shrink the
-    // pools below the comptime ceilings, §5); fds and ring stay the
-    // comptime worst-case budgets — the asserted ceilings.
+    // Every budget reflects the *effective* config (§5, §8): the config may
+    // shrink the pools, the fd demand, and the requested ring below the
+    // compiled ceilings, and all three are shown as actually sized.
     const limits = config.limits;
+    const in_flight = constants.inFlightOps(
+        limits.conn_slots,
+        limits.upstream_slots,
+        @intCast(config.listeners.len),
+    );
     const memory_total = constants.memoryBytesTotal(
         limits.conn_slots,
         @sizeOf(ServerXev.ConnType),
@@ -96,7 +124,7 @@ fn printBudgets(io: std.Io, config: *const zoxy.config.Config) !void {
         \\zoxy budgets (closed-form, DESIGN.md §5/§8):
         \\  memory  pools {d} KiB = conn slots {d} x {d} B + relay buffers {d} x {d} B
         \\          + upstream slots {d} x {d} B
-        \\  fds     {d} worst case (asserted against RLIMIT_NOFILE)
+        \\  fds     {d} required (asserted against RLIMIT_NOFILE)
         \\  ring    {d} entries, completion queue {d}, in-flight ops <= {d}
         \\  config  {d} listener(s), {d} cluster(s)
         \\
@@ -108,10 +136,10 @@ fn printBudgets(io: std.Io, config: *const zoxy.config.Config) !void {
         @sizeOf(zoxy.RelayBuffer),
         limits.upstream_slots,
         @sizeOf(UpstreamType),
-        constants.fds_max,
+        fds_required,
         constants.ring_entries,
-        constants.completion_queue_entries,
-        constants.in_flight_ops_max,
+        cq_entries,
+        in_flight,
         config.listeners.len,
         config.clusters.len,
     });

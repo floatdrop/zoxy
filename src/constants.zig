@@ -53,16 +53,17 @@ pub const admin_drain_scratch_bytes: u32 = 512;
 /// connection — L4 relaying or L7 in any phase — can hold up to
 /// `conn_ops_max` armed ops whether or not it holds a relay buffer
 /// (an L7 head read is a data op like any other), so every slot claims
-/// its worst-case share of the pre-budgeted ring. With the ring at its
-/// usable maximum (`ring_entries = 4096`, CQ = 8192, ¾ headroom = 6144)
-/// and the parked-upstream and admin reservations carved out first, that
-/// caps this at `(6144 - 23 - upstream_slots_max) / conn_ops_max = 1019` —
-/// comptime-derived below (the 23 is the fixed ops: two per config and
-/// admin listener [18], the admin client's op budget [3], the signal wake
-/// [1], and the drain timer [1]). Keep-alive surplus beyond this ceiling
-/// waits for the deeper-CQ fork lever (`IORING_SETUP_CQSIZE`,
-/// docs/PLANS.md), the same prerequisite as c10k.
-pub const conn_slots_max: u32 = 1019;
+/// its worst-case share of the pre-budgeted ring. The ring now requests
+/// the deepest CQ the kernel allows (`completion_queue_entries`,
+/// IORING_SETUP_CQSIZE) against the 4096 SQ, so with the ¾ headroom
+/// (49152) and the parked-upstream and admin reservations carved out
+/// first, this caps at `(49152 - 23 - upstream_slots_max) / conn_ops_max
+/// = 9621` — comptime-derived below (the 23 is the fixed ops: two per
+/// config and admin listener [18], the admin client's op budget [3], the
+/// signal wake [1], and the drain timer [1]). That is the c10k ceiling on
+/// a single ring; the last stretch to a round 10k needs `conn_ops_max`
+/// cut from 5 to 4 (the teardown-race peak, docs/PLANS.md).
+pub const conn_slots_max: u32 = 9621;
 
 /// Relay buffer pairs (`Pool(RelayBuffer)`) — the bound on concurrent L4
 /// connections plus active L7 body relays (§5, §6). Sized to the
@@ -73,10 +74,11 @@ pub const relay_buffers_max: u32 = conn_slots_max;
 
 /// Bytes per relay direction; a `RelayBuffer` is a pair of these. Held to
 /// 4 KiB: the strict recv→send→recv relay (§6) is correct at any size, so
-/// the smaller buffer cuts relay-pool memory (~32 MiB → ~10 MiB even as
-/// the ceiling rises to 1225) and trades throughput for more round trips
-/// only on high-bandwidth-delay streams — negligible on the loopback and
-/// LAN paths this proxy targets.
+/// the smaller buffer halves relay-pool memory (8 KiB per pair, not 16) —
+/// which matters now the c10k ceiling puts up to `relay_buffers_max` pairs
+/// in the pool — and trades throughput for more round trips only on
+/// high-bandwidth-delay streams, negligible on the loopback and LAN paths
+/// this proxy targets.
 pub const relay_buffer_bytes: u32 = 4 * 1024;
 
 /// §8 "watermarks before walls": each pool flips a pressure flag before
@@ -217,28 +219,109 @@ pub const timeout_ms_max: u32 = 3_600_000;
 /// draining listener holds its armed accept — or the accept-retry backoff
 /// timer — plus the async cancel that reaps it), `admin_conn_ops_max` ops
 /// per admin client (its send/deadline/teardown peak), the single async
-/// wakeup op for signals, and the server's one drain-deadline timer.
+/// wakeup op for signals, and the server's one drain-deadline timer. Closed
+/// form so it can be evaluated on the *effective* pool sizes too (XevIo's
+/// per-deployment CQ), not only the ceilings; the admin reservation is
+/// fixed — always covered even when a config leaves the plane unbound;
+/// `in_flight_ops_max` is it at the ceilings.
+pub fn inFlightOps(conn_slots: u32, upstream_slots: u32, listeners: u32) u32 {
+    assert(conn_slots <= conn_slots_max);
+    assert(upstream_slots <= upstream_slots_max);
+    assert(listeners <= listeners_max);
+    return conn_slots * conn_ops_max + upstream_slots +
+        2 * (listeners + admin_listeners) +
+        admin_conns * admin_conn_ops_max + 1 + 1;
+}
 pub const in_flight_ops_max: u32 =
-    conn_slots_max * conn_ops_max + upstream_slots_max +
-    2 * (@as(u32, listeners_max) + admin_listeners) +
-    admin_conns * admin_conn_ops_max + 1 + 1;
+    inFlightOps(conn_slots_max, upstream_slots_max, listeners_max);
 
-/// Kernel completion queue capacity (io_uring fixes CQ at 2 × SQ).
-pub const completion_queue_entries: u32 = 2 * @as(u32, ring_entries);
+/// Kernel maximum for an IORING_SETUP_CQSIZE completion queue
+/// (IORING_MAX_CQ_ENTRIES = 2 × IORING_MAX_ENTRIES) on current kernels.
+/// The upper wall on any requested CQ depth — a request past this fails
+/// `Loop.init` at runtime, so the comptime assert below (and `completionQueueDepthFor`'s
+/// clamp) keep it out of reach.
+pub const completion_queue_entries_max: u32 = 65536;
 
-/// Worst-case fd count (§8: fds are pre-budgeted, not shed): stdio + ring
-/// + async eventfd + listeners (configured + admin) + two sockets per
-/// admitted connection (client plus the exchange's upstream) + the one
+/// The CQ depth a deployment needs: its worst-case in-flight ops with the
+/// same ¾ headroom the ceiling reserves (invert `in_flight <= cq × 3/4`),
+/// rounded up to a power of two and clamped to the kernel range. XevIo
+/// requests this via IORING_SETUP_CQSIZE, so a small deployment gets a
+/// shallow ring and only a c10k one asks for the full 65536.
+pub fn completionQueueDepthFor(conn_slots: u32, upstream_slots: u32, listeners: u32) u32 {
+    const in_flight = inFlightOps(conn_slots, upstream_slots, listeners);
+    const with_headroom = (in_flight * 4 + 2) / 3; // ceil(in_flight × 4/3)
+    const depth = std.math.ceilPowerOfTwo(u32, @max(with_headroom, ring_entries)) catch
+        completion_queue_entries_max;
+    // Explicit u32: `@min` with a comptime bound would otherwise narrow the
+    // type to u17, overflowing the `* 3` in the headroom check below.
+    const clamped: u32 = @min(depth, completion_queue_entries_max);
+    // In-domain (inFlightOps asserts the args), `with_headroom` never
+    // exceeds the cap, so the clamp cannot truncate below the requirement:
+    // the ring holds every in-flight op with the ¾ headroom, is a power of
+    // two, and is at least the SQ depth.
+    assert(in_flight <= clamped * 3 / 4);
+    assert(std.math.isPowerOfTwo(clamped));
+    assert(clamped >= ring_entries);
+    return clamped;
+}
+
+/// The CQ capacity the §8 ceiling budgets are derived against: the depth a
+/// deployment at the compiled ceilings would request. This is the kernel
+/// maximum (65536), which is exactly what makes `conn_slots_max` the c10k
+/// ceiling — as deep as one ring allows, independent of `ring_entries`.
+pub const completion_queue_entries: u32 =
+    completionQueueDepthFor(conn_slots_max, upstream_slots_max, listeners_max);
+
+/// The fds a deployment needs (§8: fds are pre-budgeted, not shed): stdio
+/// + ring + async eventfd + listeners (configured + admin) + two sockets
+/// per admitted connection (client plus the exchange's upstream) + the one
 /// transient just-accepted fd an admission decision is pending on + one
 /// socket per in-flight admin scrape + one socket per parked upstream,
-/// which belongs to no connection.
+/// which belongs to no connection. Closed form so `ensureFdBudget` can
+/// check the *effective* size against RLIMIT_NOFILE; the admin reservation
+/// is fixed; `fds_max` is it at the ceilings.
+pub fn fdsRequired(conn_slots: u32, upstream_slots: u32, listeners: u32) u32 {
+    assert(conn_slots <= conn_slots_max);
+    assert(upstream_slots <= upstream_slots_max);
+    assert(listeners <= listeners_max);
+    return 3 + 1 + 1 + (listeners + admin_listeners) +
+        2 * conn_slots + 1 + admin_conns + upstream_slots;
+}
 pub const fds_max: u32 =
-    3 + 1 + 1 + (listeners_max + admin_listeners) +
-    2 * conn_slots_max + 1 + admin_conns + upstream_slots_max;
+    fdsRequired(conn_slots_max, upstream_slots_max, listeners_max);
+
+/// Default effective pool sizes when the config omits a `limits` block: a
+/// lean out-of-box footprint (~32 MiB of pools, well under a routine 4096
+/// RLIMIT_NOFILE, a shallow ring) rather than the c10k worst case. An
+/// operator opts into more concurrency — up to the compiled ceilings —
+/// through the config `limits` block, and the fd budget (`fdsRequired`,
+/// `ensureFdBudget`) and requested CQ depth (`completionQueueDepthFor`,
+/// XevIo) then track the *effective* sizes, so a small deployment neither
+/// reserves nor demands the ceiling's resources (§5, §8).
+///
+/// `conn_slots_default` is tuned to that ~32 MiB target against the current
+/// per-slot sizes (a conn slot + its relay buffer is ~17.7 KiB, plus the
+/// fixed upstream pool); it is not derived because `@sizeOf(Conn)` is not
+/// available here (Conn is generic over the Io backend). main.zig prints
+/// the resulting footprint at startup.
+pub const conn_slots_default: u32 = 1386;
+pub const relay_buffers_default: u32 = conn_slots_default;
+pub const upstream_slots_default: u32 = upstream_slots_max;
 
 comptime {
     assert(std.math.isPowerOfTwo(ring_entries));
     assert(ring_entries <= 4096);
+    // The CQ depth is now a real kernel argument (XevIo requests it via
+    // IORING_SETUP_CQSIZE), so it must be a value the kernel accepts: a
+    // power of two, at least the SQ depth, and within the kernel cap.
+    assert(std.math.isPowerOfTwo(completion_queue_entries));
+    assert(completion_queue_entries >= ring_entries);
+    assert(completion_queue_entries <= completion_queue_entries_max);
+    // The defaults are a lean, valid subset of the ceilings.
+    assert(conn_slots_default >= 1 and conn_slots_default <= conn_slots_max);
+    assert(relay_buffers_default >= 1 and relay_buffers_default <= relay_buffers_max);
+    assert(relay_buffers_default <= conn_slots_default);
+    assert(upstream_slots_default >= 1 and upstream_slots_default <= upstream_slots_max);
     assert(relay_buffers_max <= conn_slots_max);
     assert(relay_buffers_max >= 1);
     assert(listeners_max >= 1);
@@ -362,12 +445,28 @@ test "budgets: memory total matches the closed form" {
     );
 }
 
-test "budgets: fd count stays under a typical hard limit" {
-    // 4096 is the common RLIMIT_NOFILE hard ceiling for unprivileged
-    // processes; startup asserts against the real limit (§8), this test
-    // guards the defaults against drifting past the common case.
-    try std.testing.expect(fds_max <= 4096);
-    try std.testing.expectEqual(@as(u32, 3078), fds_max);
+test "budgets: c10k ceiling fd count needs a raised NOFILE" {
+    // At the c10k ceiling the fd budget is ~20k — well past the common
+    // 4096 unprivileged hard limit, so a deployment that configures up to
+    // the ceiling must raise RLIMIT_NOFILE (systemd LimitNOFILE / ulimit).
+    // `ensureFdBudget` checks the *effective* size against the real limit
+    // at startup (§8); this pins the ceiling closed form.
+    try std.testing.expectEqual(@as(u32, 20282), fds_max);
+    try std.testing.expect(fds_max <= 65536);
+}
+
+test "budgets: the default deployment is lean" {
+    // The out-of-box config (no `limits` block) starts under a routine
+    // 4096 NOFILE and asks the kernel for a shallow ring, not the c10k
+    // ceiling — operators opt up through `limits` (§5). One listener.
+    try std.testing.expect(fdsRequired(conn_slots_default, upstream_slots_default, 1) < 4096);
+    try std.testing.expect(
+        completionQueueDepthFor(conn_slots_default, upstream_slots_default, 1) < completion_queue_entries,
+    );
+    // The effective CQ still covers the default's in-flight ops with the
+    // ¾ headroom, exactly as the ceiling does for its own.
+    const depth = completionQueueDepthFor(conn_slots_default, upstream_slots_default, 1);
+    try std.testing.expect(inFlightOps(conn_slots_default, upstream_slots_default, 1) <= depth * 3 / 4);
 }
 
 test "budgets: conn slots sit at the completion-queue ceiling" {
