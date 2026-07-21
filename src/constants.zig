@@ -53,17 +53,18 @@ pub const admin_drain_scratch_bytes: u32 = 512;
 /// connection — L4 relaying or L7 in any phase — can hold up to
 /// `conn_ops_max` armed ops whether or not it holds a relay buffer
 /// (an L7 head read is a data op like any other), so every slot claims
-/// its worst-case share of the pre-budgeted ring. The ring now requests
-/// the deepest CQ the kernel allows (`completion_queue_entries`,
-/// IORING_SETUP_CQSIZE) against the 4096 SQ, so with the ¾ headroom
-/// (49152) and the parked-upstream and admin reservations carved out
-/// first, this caps at `(49152 - 23 - upstream_slots_max) / conn_ops_max
-/// = 9621` — comptime-derived below (the 23 is the fixed ops: two per
-/// config and admin listener [18], the admin client's op budget [3], the
-/// signal wake [1], and the drain timer [1]). That is the c10k ceiling on
-/// a single ring; the last stretch to a round 10k needs `conn_ops_max`
-/// cut from 5 to 4 (the teardown-race peak, docs/PLANS.md).
-pub const conn_slots_max: u32 = 9621;
+/// its worst-case share of the pre-budgeted ring. The ring requests the
+/// deepest CQ the kernel allows (`completion_queue_entries`,
+/// IORING_SETUP_CQSIZE) against the 4096 SQ, so at the largest fill a
+/// config may pick (`cq_fill_eighths_default` = ⅞, 57344) with the
+/// parked-upstream and admin reservations carved out first, this caps at
+/// `(57344 - 23 - upstream_slots_max) / conn_ops_max = 11259` —
+/// comptime-derived below (the 23 is the fixed ops: two per config and
+/// admin listener [18], the admin client's op budget [3], the signal
+/// wake [1], and the drain timer [1]). That clears a round 10k on a
+/// single ring; a deployment trades the ceiling back down for more burst
+/// headroom via `limits.cq_fill_eighths` (§8).
+pub const conn_slots_max: u32 = 11259;
 
 /// Relay buffer pairs (`Pool(RelayBuffer)`) — the bound on concurrent L4
 /// connections plus active L7 body relays (§5, §6). Sized to the
@@ -242,27 +243,75 @@ pub const in_flight_ops_max: u32 =
 /// clamp) keep it out of reach.
 pub const completion_queue_entries_max: u32 = 65536;
 
-/// The CQ depth a deployment needs: its worst-case in-flight ops with the
-/// same ¾ headroom the ceiling reserves (invert `in_flight <= cq × 3/4`),
-/// rounded up to a power of two and clamped to the kernel range. XevIo
-/// requests this via IORING_SETUP_CQSIZE, so a small deployment gets a
-/// shallow ring and only a c10k one asks for the full 65536.
-pub fn completionQueueDepthFor(conn_slots: u32, upstream_slots: u32, listeners: u32) u32 {
+/// §8 CQ fill: in-flight ring ops may occupy at most this many eighths of
+/// the completion queue; the rest stays free to absorb completion bursts.
+/// ⅞ is both the default and the largest fill a config may request — it is
+/// the fill the `conn_slots_max` ceiling is derived at, so no deployment
+/// can demand a CQ deeper than the pools were sized for. An operator
+/// trades the ceiling down for more burst headroom by lowering
+/// `limits.cq_fill_eighths` toward `cq_fill_eighths_min`. ⅞ replaced the
+/// original ¾ (= 6/8) once the CQSIZE lever (#61) made the CQ a real
+/// kernel argument.
+pub const cq_fill_eighths_default: u32 = 7;
+/// The largest fill (least burst headroom) any config may request: equal to
+/// the default, because the compiled ceiling reserves exactly this much —
+/// asking for more would demand a ring past the c10k budget.
+pub const cq_fill_eighths_max: u32 = cq_fill_eighths_default;
+/// The smallest fill (most burst headroom) any config may request. At the
+/// floor in-flight ops fill only ⅛ of the CQ — the most burst slack a
+/// deployment can reserve, at the cost of the lowest connection ceiling.
+pub const cq_fill_eighths_min: u32 = 1;
+
+/// The CQ depth a deployment needs: its worst-case in-flight ops fit
+/// within `cq_fill_eighths`/8 of the ring (invert `in_flight <= cq ×
+/// eighths/8`), rounded up to a power of two and clamped to the kernel
+/// range. XevIo requests this via IORING_SETUP_CQSIZE, so a small
+/// deployment gets a shallow ring and only a c10k one asks for the full
+/// 65536. The caller must have validated feasibility (`cqFillFits`): at
+/// the max fill an in-domain conn count always fits, and a tighter fill
+/// only ever asks for a *deeper* ring, so the fill postcondition holds.
+pub fn completionQueueDepthFor(
+    conn_slots: u32,
+    upstream_slots: u32,
+    listeners: u32,
+    cq_fill_eighths: u32,
+) u32 {
+    assert(cq_fill_eighths >= cq_fill_eighths_min);
+    assert(cq_fill_eighths <= cq_fill_eighths_max);
     const in_flight = inFlightOps(conn_slots, upstream_slots, listeners);
-    const with_headroom = (in_flight * 4 + 2) / 3; // ceil(in_flight × 4/3)
+    // The shallowest ring whose fill budget covers every in-flight op;
+    // eighths >= 1 is asserted above, so the divide never faults.
+    const with_headroom = std.math.divCeil(u32, in_flight * 8, cq_fill_eighths) catch unreachable;
     const depth = std.math.ceilPowerOfTwo(u32, @max(with_headroom, ring_entries)) catch
         completion_queue_entries_max;
     // Explicit u32: `@min` with a comptime bound would otherwise narrow the
-    // type to u17, overflowing the `* 3` in the headroom check below.
+    // type to u17, overflowing the fill check below.
     const clamped: u32 = @min(depth, completion_queue_entries_max);
-    // In-domain (inFlightOps asserts the args), `with_headroom` never
-    // exceeds the cap, so the clamp cannot truncate below the requirement:
-    // the ring holds every in-flight op with the ¾ headroom, is a power of
-    // two, and is at least the SQ depth.
-    assert(in_flight <= clamped * 3 / 4);
+    // A power-of-two ring is a multiple of 8 (>= ring_entries), so the fill
+    // budget is exact — `@divExact` pins that structurally. A feasible
+    // in-domain caller keeps in_flight within it; the ring is >= the SQ.
+    assert(in_flight <= @divExact(clamped, 8) * cq_fill_eighths);
     assert(std.math.isPowerOfTwo(clamped));
     assert(clamped >= ring_entries);
     return clamped;
+}
+
+/// Whether a deployment's worst-case in-flight ops fit the deepest kernel
+/// CQ at the requested fill (§8) — the loader's guard before it accepts a
+/// `limits.cq_fill_eighths` that asks for more headroom than the conn-slot
+/// count leaves room for. The kernel CQ is a power of two, so the fill
+/// budget `completion_queue_entries_max / 8 * eighths` is exact.
+pub fn cqFillFits(
+    conn_slots: u32,
+    upstream_slots: u32,
+    listeners: u32,
+    cq_fill_eighths: u32,
+) bool {
+    assert(cq_fill_eighths >= cq_fill_eighths_min);
+    assert(cq_fill_eighths <= cq_fill_eighths_max);
+    const in_flight = inFlightOps(conn_slots, upstream_slots, listeners);
+    // The kernel CQ max is a power of two, so its fill budget is exact.
+    return in_flight <= @divExact(completion_queue_entries_max, 8) * cq_fill_eighths;
 }
 
 /// The CQ capacity the §8 ceiling budgets are derived against: the depth a
@@ -270,7 +319,7 @@ pub fn completionQueueDepthFor(conn_slots: u32, upstream_slots: u32, listeners: 
 /// maximum (65536), which is exactly what makes `conn_slots_max` the c10k
 /// ceiling — as deep as one ring allows, independent of `ring_entries`.
 pub const completion_queue_entries: u32 =
-    completionQueueDepthFor(conn_slots_max, upstream_slots_max, listeners_max);
+    completionQueueDepthFor(conn_slots_max, upstream_slots_max, listeners_max, cq_fill_eighths_default);
 
 /// The fds a deployment needs (§8: fds are pre-budgeted, not shed): stdio
 /// + ring + async eventfd + listeners (configured + admin) + two sockets
@@ -317,6 +366,14 @@ comptime {
     assert(std.math.isPowerOfTwo(completion_queue_entries));
     assert(completion_queue_entries >= ring_entries);
     assert(completion_queue_entries <= completion_queue_entries_max);
+    // The CQ fill bounds: at least one eighth of the ring always stays free
+    // for completion bursts (max <= 7), the floor packs at least one eighth
+    // (min >= 1), and the default is a value in that range. The ceiling is
+    // derived at the default, so the default must equal the max.
+    assert(cq_fill_eighths_min >= 1);
+    assert(cq_fill_eighths_max <= 7);
+    assert(cq_fill_eighths_min <= cq_fill_eighths_default);
+    assert(cq_fill_eighths_default == cq_fill_eighths_max);
     // The defaults are a lean, valid subset of the ceilings.
     assert(conn_slots_default >= 1 and conn_slots_default <= conn_slots_max);
     assert(relay_buffers_default >= 1 and relay_buffers_default <= relay_buffers_max);
@@ -357,11 +414,11 @@ comptime {
     assert(poolPressureOn(relay_buffers_max) > poolPressureOff(relay_buffers_max));
     assert(poolPressureOn(relay_buffers_max) <= relay_buffers_max);
     // The conn-slot ceiling is derived, not chosen: the largest slot
-    // count whose worst-case ops fit the ¾-CQ budget after the fixed
-    // ops — the parked-upstream reservation and the admin listener plus
-    // its one client op — are carved out (§8).
+    // count whose worst-case ops fit the ⅞-CQ budget (at the default =
+    // loosest fill) after the fixed ops — the parked-upstream reservation
+    // and the admin listener plus its one client op — are carved out (§8).
     assert(conn_slots_max == @divFloor(
-        completion_queue_entries * 3 / 4 -
+        @divExact(completion_queue_entries, 8) * cq_fill_eighths_default -
             2 * (@as(u32, listeners_max) + admin_listeners) -
             admin_conns * admin_conn_ops_max - 1 - 1 - upstream_slots_max,
         conn_ops_max,
@@ -404,9 +461,10 @@ pub fn memoryBytesTotal(
 
 test "budgets: in-flight ops fit the completion queue with headroom" {
     try std.testing.expect(in_flight_ops_max <= completion_queue_entries);
-    // Headroom is deliberate: at least a quarter of the CQ stays free for
-    // completion bursts even at the worst-case armed-op count.
-    try std.testing.expect(in_flight_ops_max <= completion_queue_entries * 3 / 4);
+    // Headroom is deliberate: at least an eighth of the CQ stays free for
+    // completion bursts even at the worst-case armed-op count (the default
+    // = loosest fill the ceiling is derived at).
+    try std.testing.expect(in_flight_ops_max <= @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
 }
 
 test "pressure: relay watermarks have a hysteresis gap at every capacity" {
@@ -446,12 +504,12 @@ test "budgets: memory total matches the closed form" {
 }
 
 test "budgets: c10k ceiling fd count needs a raised NOFILE" {
-    // At the c10k ceiling the fd budget is ~20k — well past the common
+    // At the c10k ceiling the fd budget is ~24k — well past the common
     // 4096 unprivileged hard limit, so a deployment that configures up to
     // the ceiling must raise RLIMIT_NOFILE (systemd LimitNOFILE / ulimit).
     // `ensureFdBudget` checks the *effective* size against the real limit
     // at startup (§8); this pins the ceiling closed form.
-    try std.testing.expectEqual(@as(u32, 20282), fds_max);
+    try std.testing.expectEqual(@as(u32, 23558), fds_max);
     try std.testing.expect(fds_max <= 65536);
 }
 
@@ -461,22 +519,40 @@ test "budgets: the default deployment is lean" {
     // ceiling — operators opt up through `limits` (§5). One listener.
     try std.testing.expect(fdsRequired(conn_slots_default, upstream_slots_default, 1) < 4096);
     try std.testing.expect(
-        completionQueueDepthFor(conn_slots_default, upstream_slots_default, 1) < completion_queue_entries,
+        completionQueueDepthFor(conn_slots_default, upstream_slots_default, 1, cq_fill_eighths_default) <
+            completion_queue_entries,
     );
     // The effective CQ still covers the default's in-flight ops with the
-    // ¾ headroom, exactly as the ceiling does for its own.
-    const depth = completionQueueDepthFor(conn_slots_default, upstream_slots_default, 1);
-    try std.testing.expect(inFlightOps(conn_slots_default, upstream_slots_default, 1) <= depth * 3 / 4);
+    // ⅞ headroom, exactly as the ceiling does for its own.
+    const depth = completionQueueDepthFor(conn_slots_default, upstream_slots_default, 1, cq_fill_eighths_default);
+    try std.testing.expect(inFlightOps(conn_slots_default, upstream_slots_default, 1) <= @divExact(depth, 8) * cq_fill_eighths_default);
 }
 
 test "budgets: conn slots sit at the completion-queue ceiling" {
-    // The ¾-CQ headroom rule is what actually caps concurrent
-    // connections; conn_slots_max is the largest value that still
-    // satisfies it after the parked-upstream reservation, so one more
-    // slot would break the budget.
-    try std.testing.expect(in_flight_ops_max <= completion_queue_entries * 3 / 4);
+    // The ⅞-CQ fill rule (at the default = loosest fill) is what actually
+    // caps concurrent connections; conn_slots_max is the largest value
+    // that still satisfies it after the parked-upstream reservation, so
+    // one more slot would break the budget.
+    try std.testing.expect(in_flight_ops_max <= @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
     const one_more = (conn_slots_max + 1) * conn_ops_max + upstream_slots_max +
         2 * (@as(u32, listeners_max) + admin_listeners) +
         admin_conns * admin_conn_ops_max + 1 + 1;
-    try std.testing.expect(one_more > completion_queue_entries * 3 / 4);
+    try std.testing.expect(one_more > @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
+}
+
+test "budgets: a tighter cq fill trades ceiling for burst headroom" {
+    // More headroom (fewer eighths) never asks for a shallower ring: at a
+    // fixed conn count the requested CQ is monotonic in the fill.
+    const loose = completionQueueDepthFor(conn_slots_default, upstream_slots_default, 1, cq_fill_eighths_max);
+    const tight = completionQueueDepthFor(conn_slots_default, upstream_slots_default, 1, cq_fill_eighths_min);
+    try std.testing.expect(tight >= loose);
+    // The conn-slot ceiling fits only at the max fill; one eighth tighter
+    // overflows even the deepest kernel CQ — the loader must reject that
+    // pairing (`cqFillFits` is the guard).
+    try std.testing.expect(cqFillFits(conn_slots_max, upstream_slots_max, listeners_max, cq_fill_eighths_max));
+    try std.testing.expect(!cqFillFits(conn_slots_max, upstream_slots_max, listeners_max, cq_fill_eighths_max - 1));
+    // The lean default still fits with plenty of room to spare, even at the
+    // old ¾ (= 6/8) fill and at the tightest floor.
+    try std.testing.expect(cqFillFits(conn_slots_default, upstream_slots_default, 1, 6));
+    try std.testing.expect(cqFillFits(conn_slots_default, upstream_slots_default, 1, cq_fill_eighths_min));
 }
