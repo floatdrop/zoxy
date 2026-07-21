@@ -54,6 +54,7 @@ pub fn main(init: std.process.Init) !void {
         config.limits.conn_slots,
         config.limits.upstream_slots,
         listeners_count,
+        config.limits.cq_fill_eighths,
     );
     // The effective config never exceeds the compiled ceilings (§8): the
     // pools, the ring, and the fd demand all fit what the constants proved.

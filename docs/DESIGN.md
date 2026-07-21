@@ -264,6 +264,10 @@ unmerged behind it, so the pin moves only after re-audit.
   in-flight completions — which live in pool slots — so the
   no-unbounded-queue rule holds by construction. The in-flight op budget
   that keeps CQ overflow unreachable is part of the startup printout (§8).
+  How much of that CQ the in-flight ops may fill is ⅞ by default
+  (`cq_fill_eighths_default` — the fill the c10k ceiling is derived at);
+  `limits.cq_fill_eighths` lowers it per deployment toward ⅛ to reserve
+  more burst headroom, at a lower feasible connection ceiling (§5).
 - **Ring setup flags.** The ring is created with `SINGLE_ISSUER`,
   `COOP_TASKRUN`, and `DEFER_TASKRUN`: completion task-work stays on
   the loop thread and is batched at the reap point instead of
@@ -383,10 +387,10 @@ a raised `RLIMIT_NOFILE`:
 
 | pool | default | ceiling (c10k) | unit size |
 |---|---|---|---|
-| conn slots | 1386 | 9622 | ~1.7 KiB state + 8 KiB head |
-| relay buffers | 1386 | 9622 | 2 × 4 KiB |
+| conn slots | 1386 | 11259 | ~1.7 KiB state + 8 KiB head |
+| relay buffers | 1386 | 11259 | 2 × 4 KiB |
 | upstream slots | 1024 | 1024 | ~40 B state + 8 KiB head |
-| **pool memory** | **~32 MiB** | **~174 MiB** | |
+| **pool memory** | **~32 MiB** | **~203 MiB** | |
 
 Rules:
 
@@ -396,6 +400,15 @@ Rules:
   `worker_jobs_max ≤ conn_slots`. Note that `relay_buffers` — not conn
   slots — is the true bound on concurrent L4 connections plus active L7
   relays (§6).
+- **The CQ fill is a headroom knob, not a pool shrink.**
+  `limits.cq_fill_eighths` sets how many eighths of the completion queue
+  the worst-case in-flight ops may fill: ⅞ (the default, the fill the c10k
+  ceiling is derived at) packs the ring tightest, and lowering it toward ⅛
+  reserves more burst headroom at the cost of a lower feasible conn-slot
+  ceiling. Unlike the pool sizes it is the one `limits` field that does not
+  shrink a pool; a fill whose ring would exceed the compiled one
+  (`cqFillFits` false for the chosen conn/upstream slots and listeners) is
+  rejected at load, not clamped (§4/§8).
 - **The config arena is the only allocating region** — parse-once,
   immutable, shared read-only. (Carried verbatim; it worked.)
 - **The config surface has a generated JSON Schema.** `zig build schema`

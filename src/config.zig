@@ -46,6 +46,13 @@ pub const Config = struct {
         conn_slots: u32 = constants.conn_slots_default,
         relay_buffers: u32 = constants.relay_buffers_default,
         upstream_slots: u32 = constants.upstream_slots_default,
+        /// How many eighths of the io_uring completion queue the worst-case
+        /// in-flight ops may fill (§8). Unlike the pool sizes this is not a
+        /// shrink: ⅞ (the compiled default, the fill the ceiling is derived
+        /// at) packs the ring tightest, and lowering it reserves more burst
+        /// headroom at the cost of a lower feasible conn-slot count. A value
+        /// whose ring would exceed the compiled one is rejected at load.
+        cq_fill_eighths: u32 = constants.cq_fill_eighths_default,
     };
 
     pub const Listener = struct {
@@ -133,6 +140,8 @@ pub const ValidationError = error{
     LimitRelayBuffersOutOfRange,
     LimitRelayBuffersOverConnSlots,
     LimitUpstreamSlotsOutOfRange,
+    LimitCqFillOutOfRange,
+    LimitConnSlotsOverCqFill,
     AdminBindInvalid,
 };
 
@@ -151,7 +160,7 @@ pub fn parse(arena: std.mem.Allocator, json_bytes: []const u8) ParseError!Config
     const clusters = try resolveClusters(arena, &parsed.clusters);
     const listeners = try resolveListeners(arena, parsed.listeners, clusters);
     try validateTimeouts(&parsed.timeouts);
-    const limits = try resolveLimits(&parsed.limits);
+    const limits = try resolveLimits(&parsed.limits, @intCast(listeners.len));
     const admin_bind = try resolveAdminBind(parsed.admin);
 
     assert(listeners.len >= 1);
@@ -182,7 +191,8 @@ fn resolveAdminBind(admin_json: ?AdminJson) ValidationError!?std.Io.net.IpAddres
 /// relay-buffer count derives from the effective conn slots (a buffer
 /// beyond the slot count could never be acquired); a *specified* count
 /// above them is a contradiction and fails loudly.
-fn resolveLimits(limits_json: *const LimitsJson) ValidationError!Config.Limits {
+fn resolveLimits(limits_json: *const LimitsJson, listeners_count: u32) ValidationError!Config.Limits {
+    assert(listeners_count >= 1);
     // Omitted limits default to the lean out-of-box sizes, not the
     // compiled ceilings (§5): a small footprint unless the operator opts
     // up. relay buffers still follow conn slots when omitted (one buffer
@@ -203,11 +213,24 @@ fn resolveLimits(limits_json: *const LimitsJson) ValidationError!Config.Limits {
     if (upstream_slots < 1 or upstream_slots > constants.upstream_slots_max) {
         return error.LimitUpstreamSlotsOutOfRange;
     }
+    // The CQ fill is the one limit an operator tightens for headroom, not a
+    // pool shrink (§8): a smaller fill demands a deeper ring for the same
+    // conn slots. Range-check first, then reject a fill that — with these
+    // conn/upstream slots and listeners — would need a completion queue past
+    // the compiled ring, so main.zig's completionQueueDepthFor never clamps.
+    const cq_fill_eighths = limits_json.cq_fill_eighths orelse constants.cq_fill_eighths_default;
+    if (cq_fill_eighths < constants.cq_fill_eighths_min or cq_fill_eighths > constants.cq_fill_eighths_max) {
+        return error.LimitCqFillOutOfRange;
+    }
+    if (!constants.cqFillFits(conn_slots, upstream_slots, listeners_count, cq_fill_eighths)) {
+        return error.LimitConnSlotsOverCqFill;
+    }
     assert(relay_buffers <= conn_slots);
     return .{
         .conn_slots = conn_slots,
         .relay_buffers = relay_buffers,
         .upstream_slots = upstream_slots,
+        .cq_fill_eighths = cq_fill_eighths,
     };
 }
 
@@ -223,8 +246,8 @@ pub const ConfigJson = struct {
     listeners: []const ListenerJson,
     clusters: ClustersJson,
     timeouts: TimeoutsJson,
-    /// Optional pool shrinks (§5, §8); absent fields keep the comptime
-    /// ceilings.
+    /// Optional pool sizes and the CQ-fill headroom knob (§5, §8); absent
+    /// fields take the lean defaults, not the compiled ceilings.
     limits: LimitsJson = .{},
     /// Optional admin/metrics listener (§8, PLANS.md Phase 2.5); absent
     /// leaves the plane off.
@@ -243,7 +266,7 @@ pub const ConfigJson = struct {
         },
         .clusters = .{ .desc = "Named upstream clusters, keyed by cluster name." },
         .timeouts = .{ .desc = "Connection lifecycle deadlines (milliseconds)." },
-        .limits = .{ .desc = "Optional pool shrinks; absent keeps the compiled ceilings." },
+        .limits = .{ .desc = "Optional pool sizes and the CQ-fill headroom knob; absent fields take the lean defaults." },
         .admin = .{ .desc = "Optional admin/metrics listener; absent leaves it off." },
     };
 };
@@ -263,10 +286,12 @@ pub const LimitsJson = struct {
     conn_slots: ?u32 = null,
     relay_buffers: ?u32 = null,
     upstream_slots: ?u32 = null,
+    cq_fill_eighths: ?u32 = null,
 
     pub const schema_doc =
-        "Optional pool shrinks; absent keeps the compiled ceilings. Config " ++
-        "may only shrink a pool below its ceiling, never grow it.";
+        "Optional pool sizes and the CQ-fill headroom knob; absent fields " ++
+        "take the lean defaults. Pools may only shrink below their ceilings; " ++
+        "cq_fill_eighths trades ceiling for burst headroom, never a pool size.";
     pub const schema_fields = .{
         .conn_slots = .{
             .desc = "Concurrent connection slots.",
@@ -282,6 +307,13 @@ pub const LimitsJson = struct {
             .desc = "Shared upstream connection slots.",
             .minimum = 1,
             .maximum = constants.upstream_slots_max,
+        },
+        .cq_fill_eighths = .{
+            .desc = "Eighths of the io_uring completion queue the worst-case " ++
+                "in-flight ops may fill; lower reserves more burst headroom " ++
+                "but lowers the feasible connection-slot ceiling.",
+            .minimum = constants.cq_fill_eighths_min,
+            .maximum = constants.cq_fill_eighths_max,
         },
     };
 };
@@ -1461,6 +1493,8 @@ test "config: limits shrink pools below the ceilings, never past them" {
         try std.testing.expectEqual(@as(u32, 64), parsed.limits.conn_slots);
         try std.testing.expectEqual(@as(u32, 64), parsed.limits.relay_buffers);
         try std.testing.expectEqual(constants.upstream_slots_max, parsed.limits.upstream_slots);
+        // The CQ fill defaults to ⅞ when the block omits it.
+        try std.testing.expectEqual(constants.cq_fill_eighths_default, parsed.limits.cq_fill_eighths);
     }
     // Full limits resolve verbatim; absent block keeps the ceilings.
     {
@@ -1470,11 +1504,13 @@ test "config: limits shrink pools below the ceilings, never past them" {
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1},
-            \\ "limits":{"conn_slots":64,"relay_buffers":8,"upstream_slots":8}}
+            \\ "limits":{"conn_slots":64,"relay_buffers":8,"upstream_slots":8,"cq_fill_eighths":4}}
         );
         try std.testing.expectEqual(@as(u32, 64), parsed.limits.conn_slots);
         try std.testing.expectEqual(@as(u32, 8), parsed.limits.relay_buffers);
         try std.testing.expectEqual(@as(u32, 8), parsed.limits.upstream_slots);
+        // A tighter fill resolves verbatim when the pools leave room for it.
+        try std.testing.expectEqual(@as(u32, 4), parsed.limits.cq_fill_eighths);
     }
     {
         var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1489,6 +1525,7 @@ test "config: limits shrink pools below the ceilings, never past them" {
         try std.testing.expectEqual(constants.conn_slots_default, parsed.limits.conn_slots);
         try std.testing.expectEqual(constants.relay_buffers_default, parsed.limits.relay_buffers);
         try std.testing.expectEqual(constants.upstream_slots_default, parsed.limits.upstream_slots);
+        try std.testing.expectEqual(constants.cq_fill_eighths_default, parsed.limits.cq_fill_eighths);
     }
     const tail =
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
@@ -1508,6 +1545,23 @@ test "config: limits shrink pools below the ceilings, never past them" {
     // contradiction, not a derivable default.
     try expectParseError(error.LimitRelayBuffersOverConnSlots, head ++ tail ++
         "\"limits\":{\"conn_slots\":4,\"relay_buffers\":8}}");
+    // The CQ fill has its own range [min, max] in eighths; below or above
+    // fails loudly, each distinct from the pool-size errors.
+    try expectParseError(error.LimitCqFillOutOfRange, head ++ tail ++ "\"limits\":{\"cq_fill_eighths\":0}}");
+    try expectParseError(error.LimitCqFillOutOfRange, head ++ tail ++ "\"limits\":{\"cq_fill_eighths\":8}}");
+    // A fill tighter than the ceiling was derived at cannot serve the full
+    // conn-slot ceiling — the completion queue it would need exceeds the
+    // compiled ring, so the combination is rejected (§8).
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const json = try std.fmt.allocPrint(
+            arena_state.allocator(),
+            "{s}{s}\"limits\":{{\"conn_slots\":{d},\"cq_fill_eighths\":{d}}}}}",
+            .{ head, tail, constants.conn_slots_max, constants.cq_fill_eighths_max - 1 },
+        );
+        try std.testing.expectError(error.LimitConnSlotsOverCqFill, parse(arena_state.allocator(), json));
+    }
 }
 
 test "config: admin block resolves a bind literal, absent leaves it off" {
