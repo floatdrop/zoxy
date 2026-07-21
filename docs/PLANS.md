@@ -242,40 +242,44 @@ Verdicts, so they are not re-litigated:
   with c10k below; TLS and chunked L7 bodies fall back to copy
   regardless.
 
-## c10k — lifting the 1225-connection ceiling
+## c10k — the CQSIZE ceiling (lever #1 landed)
 
-Concurrent L4 connections are CQ-bound, not memory- or fd-bound:
-`relay_buffers_max = (6144 − 18) / 5 = 1225` (derivation in
-`constants.zig`). Two levers, both fork work:
+Concurrent L4 connections were CQ-bound, not memory- or fd-bound: before
+the CQSIZE lever the CQ was fixed at 2 × SQ, capping `relay_buffers_max`
+at `(6144 − 18) / 5 = 1225`. Two levers were on the table:
 
-1. **Deeper CQ** — `IORING_SETUP_CQSIZE`; libxev fixes the CQ at 2 × SQ
-   today, and exposing it needs `IoUring.init_params` plumbing in the
-   fork, not just a flag OR. This directly lifts the ceiling. Past it,
-   fds bind next: `fds_max = 14 + 2·relay_buffers`, so true c10k (~10 k
-   buffers → ~20 k fds) also raises the documented `RLIMIT_NOFILE`
-   assumption.
-2. **`splice`** (above) — an independent win at saturation, same
-   fork/re-audit cost.
+1. **Deeper CQ** — `IORING_SETUP_CQSIZE`. **Landed (#61):** the audited
+   fork exposes `Options.cq_entries`, XevIo requests the kernel maximum
+   (65536) at the ceiling, and `conn_slots_max` / `relay_buffers_max`
+   rose to 11259 on a single ring. How full the in-flight ops may pack
+   that CQ is a configurable ⅞ default (`limits.cq_fill_eighths`);
+   lowering it toward ⅛ trades the ceiling back down for burst headroom,
+   and a fill that cannot fit the compiled ring is rejected at load, not
+   clamped (§4/§5). Past the ceiling, fds bind next: `fds_max` scales with
+   `2·relay_buffers`, so a deployment configured toward c10k raises the
+   documented `RLIMIT_NOFILE` assumption (handled at startup, §8).
+2. **`splice`** (above) — an independent win at saturation, still fork
+   work; same re-audit cost.
 
-Entry gate: demonstrate a workload that actually hits the 1225 wall
-before spending a fork re-audit on it.
+Entry gate for further ceiling work: demonstrate a workload that actually
+saturates the 11259 ceiling before spending another fork re-audit on it.
 
 ## libxev fork queue
 
 The §4 pin policy (audited commit, moves only after re-audit) makes fork
 changes deliberate, batched work. Landed so far: `Options.io_uring_flags`
-(branch `zoxy-ring-flags`, c369817 — the §4 ring setup flags). Known
-queue, in rough value order:
+(branch `zoxy-ring-flags`, c369817 — the §4 ring setup flags) and
+`Options.cq_entries` (branch `zoxy-cqsize`, pin 6bd950d — the
+`IORING_SETUP_CQSIZE` c10k lever, #61). Known queue, in rough value order:
 
-1. `IORING_SETUP_CQSIZE` exposure (c10k lever #1).
-2. Per-errno surfacing on data ops: the backend collapses ENOBUFS/ENOMEM
+1. Per-errno surfacing on data ops: the backend collapses ENOBUFS/ENOMEM
    — and every uncommon errno — into `error.Unexpected`
    (IMPLEMENTATION_NOTES.md), so zoxy ships a categorical
    kernel-pressure witness instead. Fork change: map
    `.NOBUFS`/`.NOMEM => error.SystemResources` and widen
    ReadError/WriteError.
-3. `IORING_OP_SPLICE` (the op union is closed today).
-4. Multishot accept/recv ops — only behind the workloads in the verdict
+2. `IORING_OP_SPLICE` (the op union is closed today).
+3. Multishot accept/recv ops — only behind the workloads in the verdict
    table above.
 
 ## Deferred, revisit on evidence
